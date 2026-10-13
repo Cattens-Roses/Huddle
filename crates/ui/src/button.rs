@@ -299,7 +299,7 @@ impl RenderOnce for Button {
         }
 
         let selected_background = theme.secondary_active;
-        let radius = theme.radius;
+        let radius = theme.radius.min(px(12.));
         let interactive = !disabled;
         // The white hover tint follows `frosted` whatever the setting says, since it is
         // there for a button floating over artwork; only the blur itself is optional.
@@ -309,8 +309,8 @@ impl RenderOnce for Button {
             false => tint.unwrap_or(palette.foreground),
         };
         let (height, padding, gap) = match small {
-            true => (theme.metrics.control_small, px(8.), px(4.)),
-            false => (theme.metrics.control, px(12.), px(6.)),
+            true => (theme.metrics.control_small + px(2.), px(10.), px(5.)),
+            false => (theme.metrics.control + px(4.), px(16.), px(8.)),
         };
         let (hover, active) = match interactive {
             true => (palette.hover, palette.active),

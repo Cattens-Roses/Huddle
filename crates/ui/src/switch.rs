@@ -6,9 +6,9 @@ use gpui::{
 use crate::motion::{Motion, Motioned as _, Movement};
 use crate::theme::ActiveTheme as _;
 
-const SCALE: f32 = 0.85;
+const SCALE: f32 = 1.0;
 const INSET: f32 = 2.;
-const WIDTH: f32 = 1.75;
+const WIDTH: f32 = 1.9;
 const BORDER: f32 = 1.;
 
 type Click = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
@@ -105,7 +105,10 @@ impl RenderOnce for Switch {
 
         let movement = window.use_keyed_state((id, "movement"), cx, |_, _| Movement::new(checked));
         let animates = movement.update(cx, |movement, _| movement.turning(checked));
-        let knob = div().size(thumb).flex_none().rounded(thumb / 2.);
+        let knob = div()
+            .size(thumb)
+            .flex_none()
+            .rounded(theme.radius.min(px(5.)));
 
         let mut switch = base
             .flex()
@@ -114,7 +117,7 @@ impl RenderOnce for Switch {
             .w(width)
             .h(height)
             .p(px(INSET))
-            .rounded(height / 2.)
+            .rounded(theme.radius.min(px(7.)))
             .bg(background)
             .border_1()
             .border_color(match checked {

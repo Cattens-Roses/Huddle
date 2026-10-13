@@ -1,7 +1,8 @@
 use gpui::prelude::*;
 use gpui::{
-    App, Bounds, Context, Entity, FocusHandle, Hsla, Render, Rgba, ScrollHandle, SharedString,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, canvas, div, point, px,
+    App, Bounds, Context, Entity, FocusHandle, FontWeight, Hsla, Render, Rgba, ScrollHandle,
+    SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions, canvas, div, point, px,
+    svg,
 };
 use std::cell::Cell;
 use std::f32::consts::TAU;
@@ -10,9 +11,11 @@ use std::rc::Rc;
 use std::time::Instant;
 use ui::{
     ActiveTheme as _, Button, Look, MenuItem, Motion, Motioned, Pace, Picker, Popovers, Rounding,
-    Scrollbar, Scroller, Scrubber, ScrubberState, Separator, Stillness, Switch, TabBar, Theme,
-    ThemeKind, ThemeOverrides, WindowControls,
+    Scrollbar, Scroller, Scrubber, ScrubberState, Stillness, Switch, Theme, ThemeKind,
+    ThemeOverrides, WindowControls,
 };
+
+mod showcase;
 
 const FIRST_SIZE: gpui::Size<gpui::Pixels> = gpui::size(px(920.), px(640.));
 const AMBIENT_DOWNSCALE: f32 = 3.;
@@ -151,6 +154,7 @@ struct BaseApp {
     focus: FocusHandle,
     scrollbar: Entity<Scrollbar>,
     appearance_observer: Option<gpui::Subscription>,
+    demo: showcase::Showcase,
 }
 
 #[derive(Clone, Copy)]
@@ -299,6 +303,7 @@ impl BaseApp {
             focus: cx.focus_handle(),
             scrollbar: cx.new(|_| Scrollbar::new(ScrollHandle::new()).watching(owner)),
             appearance_observer: None,
+            demo: showcase::Showcase::new(cx),
         }
     }
 
@@ -356,6 +361,32 @@ impl BaseApp {
         self.preferences().save();
     }
 
+    fn settings_card(
+        &self,
+        title: &'static str,
+        content: Vec<gpui::AnyElement>,
+        cx: &App,
+    ) -> impl IntoElement {
+        let theme = *cx.theme();
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .w_full()
+            .p_5()
+            .rounded(theme.radius)
+            .border_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .pb_2()
+                    .text_color(theme.foreground)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(title),
+            )
+            .children(content)
+    }
+
     fn row(
         &self,
         title: impl Into<SharedString>,
@@ -368,6 +399,7 @@ impl BaseApp {
             .flex()
             .items_center()
             .justify_between()
+            .flex_wrap()
             .gap_4()
             .w_full()
             .py_3()
@@ -392,73 +424,132 @@ impl Render for BaseApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.theme();
         let sidebar_open = self.sidebar_open;
+        let nav = |page, id: &'static str, icon: &'static str| {
+            Button::new(id)
+                .ghost()
+                .icon(icons::path(icon))
+                .tooltip(if page == Page::Home {
+                    "nav-home"
+                } else {
+                    "nav-settings"
+                })
+                .size(px(44.))
+                .rounded(px(12.))
+                .when(self.page == page, |button| {
+                    button
+                        .bg(theme.sidebar_accent)
+                        .border_l_2()
+                        .border_color(theme.primary)
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.page = page;
+                    cx.notify();
+                }))
+        };
         let sidebar = div()
             .flex()
             .flex_col()
-            .gap_1()
-            .w(px(208.))
+            .items_center()
+            .gap_4()
+            .w(px(72.))
             .h_full()
-            .p_3()
+            .py_4()
             .when(!theme.transparent && !self.ambient, |sidebar| {
                 sidebar.bg(theme.sidebar)
             })
             .border_r_1()
             .border_color(theme.sidebar_border)
-            .children(
-                [
-                    (Page::Home, "nav-home", "icons/house.svg"),
-                    (Page::Appearance, "nav-settings", "icons/settings.svg"),
-                ]
-                .into_iter()
-                .map(|(page, label, icon)| {
-                    let selected = self.page == page;
-                    let tint = if selected {
-                        theme.foreground
-                    } else {
-                        theme.muted_foreground
-                    };
-                    Button::new(format!("nav-{label}"))
-                        .ghost()
-                        .label(i18n::lookup(label, None))
-                        .icon(icons::path(icon))
-                        .tint(tint)
-                        .gap_2p5()
-                        .justify_start()
-                        .hover(move |style| style.bg(theme.sidebar_accent))
-                        .active(move |style| style.bg(theme.sidebar_accent))
-                        .when(selected, |button| button.bg(theme.sidebar_accent))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.page = page;
-                            cx.notify();
-                        }))
-                }),
-            );
+            .child(
+                svg()
+                    .path(icons::path("icons/baseapp.svg"))
+                    .size(px(30.))
+                    .text_color(theme.foreground),
+            )
+            .child(nav(Page::Home, "nav-home", "icons/house.svg"))
+            .child(div().flex_1())
+            .child(nav(Page::Appearance, "nav-settings", "icons/settings.svg"));
 
         let content = match self.page {
-            Page::Home => div()
-                .flex()
-                .flex_1()
-                .items_center()
-                .justify_center()
-                .text_color(theme.foreground)
-                .text_size(theme.text(ui::Text::Large))
-                .child("hi")
-                .into_any_element(),
+            Page::Home => self.render_showcase(cx).into_any_element(),
             Page::Appearance => {
                 let packs = icons::packs().collect::<Vec<_>>();
                 let pack = packs.get(self.icon_pack % packs.len().max(1));
                 let pack_label = pack.map_or_else(|| SharedString::from("Lucide"), |p| p.title());
                 let theme_values = ThemeKind::ALL;
                 let rounding_values = Rounding::ALL;
-                let themes = Picker::new("themes", &self.popovers, self.theme.label())
-                    .width(Picker::REGULAR)
-                    .items(theme_values.into_iter().map(|kind| {
-                        MenuItem::new(kind.id(), kind.label())
-                            .selected(kind == self.theme)
+                let themes = div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_3()
+                    .children(theme_values.into_iter().map(|kind| {
+                        let preview = Theme::for_kind(kind);
+                        div()
+                            .id(format!("theme-preview-{}", kind.id()))
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .w(px(156.))
+                            .p_3()
+                            .rounded(theme.radius)
+                            .border_2()
+                            .border_color(if self.theme == kind {
+                                theme.primary
+                            } else {
+                                theme.border
+                            })
+                            .cursor_pointer()
+                            .hover(|style| style.border_color(theme.primary))
+                            .child(
+                                div()
+                                    .flex()
+                                    .h(px(64.))
+                                    .rounded(px(6.))
+                                    .overflow_hidden()
+                                    .bg(preview.background)
+                                    .child(div().w(px(18.)).h_full().bg(preview.sidebar))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .flex_1()
+                                            .gap_2()
+                                            .p_3()
+                                            .child(
+                                                div()
+                                                    .h(px(6.))
+                                                    .w(px(38.))
+                                                    .rounded(px(2.))
+                                                    .bg(preview.foreground),
+                                            )
+                                            .child(
+                                                div()
+                                                    .h(px(14.))
+                                                    .w_full()
+                                                    .rounded(px(3.))
+                                                    .bg(preview.secondary),
+                                            )
+                                            .child(
+                                                div()
+                                                    .h(px(5.))
+                                                    .w(px(28.))
+                                                    .rounded(px(2.))
+                                                    .bg(preview.primary),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .justify_between()
+                                    .text_color(theme.foreground)
+                                    .child(kind.label())
+                                    .when(self.theme == kind, |label| label.child("•")),
+                            )
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.theme = kind;
                                 this.apply(cx);
                                 this.save();
+                                cx.notify();
                             }))
                     }))
                     .into_any_element();
@@ -643,154 +734,132 @@ impl Render for BaseApp {
                     )
                     .into_any_element();
 
-                div()
-                    .flex()
-                    .flex_col()
+                Scroller::new("appearance-settings", &self.scrollbar)
                     .flex_1()
+                    .min_h_0()
                     .min_w_0()
+                    .flex_col()
+                    .items_center()
                     .child(
                         div()
                             .flex()
-                            .flex_none()
-                            .justify_center()
-                            .w_full()
-                            .px_6()
-                            .py_3()
-                            .border_b_1()
-                            .border_color(theme.title_bar_border)
-                            .child(
-                                TabBar::new("settings-categories")
-                                    .blurred()
-                                    .items([Button::new("appearance-category")
-                                        .label(i18n::lookup("settings-tab-appearance", None))
-                                        .icon(icons::path("icons/palette.svg"))
-                                        .small()
-                                        .ghost()
-                                        .selected(true)]),
-                            ),
-                    )
-                    .child(
-                        Scroller::new("appearance-settings", &self.scrollbar)
-                            .flex_1()
-                            .min_h_0()
                             .flex_col()
-                            .items_center()
+                            .gap_5()
+                            .w_full()
+                            .max_w(px(860.))
+                            .p_6()
                             .child(
                                 div()
                                     .flex()
                                     .flex_col()
-                                    .w_full()
-                                    .max_w(px(640.))
-                                    .px_6()
-                                    .py_5()
+                                    .gap_2()
                                     .child(
                                         div()
-                                            .pb_2()
-                                            .text_color(theme.muted_foreground)
-                                            .text_size(theme.text(ui::Text::Small))
-                                            .child("Ambient"),
+                                            .text_size(theme.text(ui::Text::Title))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(theme.foreground)
+                                            .child("Appearance"),
                                     )
-                                    .child(self.row(
-                                        "Ambient",
-                                        "Show a soft color field behind the app",
-                                        ambient,
-                                        cx,
-                                    ))
-                                    .child(Separator::horizontal().w_full())
-                                    .child(self.row(
-                                        "Ambient style",
-                                        "Choose the colors for the ambient field",
-                                        ambient_style,
-                                        cx,
-                                    ))
-                                    .child(Separator::horizontal().w_full())
-                                    .child(self.row(
-                                        "Ambient motion",
-                                        "Let the color field drift slowly",
-                                        ambient_motion,
-                                        cx,
-                                    ))
-                                    .child(Separator::horizontal().w_full())
                                     .child(
                                         div()
-                                            .pb_2()
                                             .text_color(theme.muted_foreground)
-                                            .text_size(theme.text(ui::Text::Small))
-                                            .child(i18n::lookup("settings-tab-general", None)),
-                                    )
-                                    .child(self.row(
-                                        i18n::lookup("settings-theme", None),
-                                        i18n::lookup("settings-theme-detail", None),
-                                        themes,
-                                        cx,
-                                    ))
-                                    .child(Separator::horizontal().w_full())
-                                    .child(self.row(
-                                        i18n::lookup("settings-icons", None),
-                                        i18n::lookup("settings-icons-detail", None),
-                                        icons_picker,
-                                        cx,
-                                    ))
-                                    .child(Separator::horizontal().w_full())
-                                    .child(self.row(
-                                        i18n::lookup("settings-opacity", None),
-                                        i18n::lookup("settings-opacity-detail", None),
-                                        opacity,
-                                        cx,
-                                    ))
-                                    .child(Separator::horizontal().w_full())
-                                    .child(self.row(
-                                        i18n::lookup("settings-blur", None),
-                                        i18n::lookup("settings-blur-detail", None),
-                                        blur,
-                                        cx,
-                                    ))
-                                    .child(Separator::horizontal().w_full())
-                                    .when(ui::WINDOW_BLUR, |this| {
-                                        this.child(self.row(
-                                            i18n::lookup("settings-blur-window", None),
-                                            i18n::lookup("settings-blur-window-detail", None),
-                                            blur_window,
+                                            .child("Make this space yours."),
+                                    ),
+                            )
+                            .child(self.settings_card("Color & theme", vec![themes], cx))
+                            .child(self.settings_card(
+                                "Interface",
+                                vec![
+                                        self.row(
+                                            "Icons",
+                                            "Choose your icon family",
+                                            icons_picker,
                                             cx,
-                                        ))
-                                        .child(Separator::horizontal().w_full())
-                                    })
-                                    .child(self.row(
-                                        i18n::lookup("settings-corners", None),
-                                        i18n::lookup("settings-corners-detail", None),
-                                        corners,
-                                        cx,
-                                    ))
-                                    .child(Separator::horizontal().w_full())
-                                    .child(self.row(
-                                        i18n::lookup("settings-font", None),
-                                        i18n::lookup("settings-font-detail", None),
-                                        font,
-                                        cx,
-                                    ))
-                                    .child(Separator::horizontal().w_full())
-                                    .child(
+                                        )
+                                        .into_any_element(),
+                                        self.row(
+                                            "Corners",
+                                            "Adjust the shape of controls",
+                                            corners,
+                                            cx,
+                                        )
+                                        .into_any_element(),
+                                        self.row(
+                                            "Text size",
+                                            "Set a comfortable reading size",
+                                            font,
+                                            cx,
+                                        )
+                                        .into_any_element(),
+                                    ],
+                                cx,
+                            ))
+                            .child(self.settings_card(
+                                "Transparency & ambient",
+                                vec![
+                                        self.row(
+                                            "Opacity",
+                                            "Control the window opacity",
+                                            opacity,
+                                            cx,
+                                        )
+                                        .into_any_element(),
+                                        self.row(
+                                            "Interface blur",
+                                            "Soften translucent controls",
+                                            blur,
+                                            cx,
+                                        )
+                                        .into_any_element(),
                                         div()
-                                            .pt_4()
-                                            .pb_2()
-                                            .text_color(theme.muted_foreground)
-                                            .text_size(theme.text(ui::Text::Small))
-                                            .child(i18n::lookup("settings-group-motion", None)),
-                                    )
-                                    .child(self.row(
-                                        i18n::lookup("settings-motion", None),
-                                        i18n::lookup("settings-motion-detail", None),
-                                        stillness,
-                                        cx,
-                                    ))
-                                    .child(Separator::horizontal().w_full())
-                                    .child(self.row(
-                                        i18n::lookup("settings-pace", None),
-                                        i18n::lookup("settings-pace-detail", None),
-                                        pace,
-                                        cx,
-                                    )),
-                            ),
+                                            .when(ui::WINDOW_BLUR, |row| {
+                                                row.child(self.row(
+                                                    "Window blur",
+                                                    "Blur the desktop behind the window",
+                                                    blur_window,
+                                                    cx,
+                                                ))
+                                            })
+                                            .into_any_element(),
+                                        self.row(
+                                            "Ambient",
+                                            "Show a soft color field behind the app",
+                                            ambient,
+                                            cx,
+                                        )
+                                        .into_any_element(),
+                                        self.row(
+                                            "Ambient style",
+                                            "Choose the colors for the ambient field",
+                                            ambient_style,
+                                            cx,
+                                        )
+                                        .into_any_element(),
+                                        self.row(
+                                            "Ambient motion",
+                                            "Let the color field drift slowly",
+                                            ambient_motion,
+                                            cx,
+                                        )
+                                        .into_any_element(),
+                                    ],
+                                cx,
+                            ))
+                            .child(self.settings_card(
+                                "Motion",
+                                vec![
+                                        self.row(
+                                            "Animations",
+                                            "Choose how the interface moves",
+                                            stillness,
+                                            cx,
+                                        )
+                                        .into_any_element(),
+                                        self.row("Pace", "Set the animation speed", pace, cx)
+                                            .into_any_element(),
+                                    ],
+                                cx,
+                            )),
                     )
                     .into_any_element()
             }
@@ -824,6 +893,12 @@ impl Render for BaseApp {
                 div()
                     .flex_1()
                     .h_full()
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .text_color(theme.muted_foreground)
+                    .text_size(theme.text(ui::Text::Small))
+                    .child("baseapp")
                     .window_control_area(gpui::WindowControlArea::Drag),
             )
             .child(WindowControls::new(false));
@@ -856,6 +931,13 @@ impl Render for BaseApp {
         };
         div()
             .relative()
+            .font_family(if cfg!(target_os = "windows") {
+                "Segoe UI"
+            } else if cfg!(target_os = "macos") {
+                "Helvetica Neue"
+            } else {
+                "Noto Sans"
+            })
             .flex()
             .flex_col()
             .size_full()
@@ -934,9 +1016,9 @@ impl Render for BaseApp {
                             Motion::Slow,
                             move |sidebar, progress| {
                                 let width = if sidebar_open {
-                                    208. * progress
+                                    72. * progress
                                 } else {
-                                    208. * (1. - progress)
+                                    72. * (1. - progress)
                                 };
                                 sidebar.w(px(width.max(0.)))
                             },
@@ -944,7 +1026,7 @@ impl Render for BaseApp {
                         .into_any_element()
                 } else {
                     sidebar
-                        .w(px(if sidebar_open { 208. } else { 0. }))
+                        .w(px(if sidebar_open { 72. } else { 0. }))
                         .into_any_element()
                 };
 

@@ -10,8 +10,8 @@ use gpui::{
     div, px, relative,
 };
 
-const TRACK: f32 = 0.5;
-const THUMB: f32 = 1.5;
+const TRACK: f32 = 0.75;
+const THUMB: f32 = 1.75;
 const HIT: f32 = 3.;
 const BUBBLE: f32 = 7.;
 
