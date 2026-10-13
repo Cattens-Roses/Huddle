@@ -45,7 +45,6 @@ mod tooltip;
 mod traffic_light_controls;
 mod vacancy;
 mod view;
-mod visualizer;
 
 pub use artwork::{Artwork, Avatar, artwork_usage, cover_palette};
 pub use button::Button;
@@ -119,4 +118,3 @@ pub use tooltip::{Perch, Tipped, Tooltip};
 pub use traffic_light_controls::TrafficLightControls;
 pub use vacancy::Vacancy;
 pub use view::Mode;
-pub use visualizer::{Levels, Visualizer, VisualizerStyle};

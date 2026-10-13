@@ -1,11 +1,16 @@
 use super::*;
 use ui::{Modal, Toast};
 
+const NOTIFICATION_DURATION: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub(super) struct Showcase {
     scroll: Entity<Scrollbar>,
     enabled: bool,
     modal: bool,
     toast: Option<String>,
+    toast_generation: usize,
+    toast_closing: bool,
+    toast_timer: Option<gpui::Task<()>>,
     selection: &'static str,
     amount: f32,
     slider: ScrubberState,
@@ -19,6 +24,9 @@ impl Showcase {
             enabled: true,
             modal: false,
             toast: None,
+            toast_generation: 0,
+            toast_closing: false,
+            toast_timer: None,
             selection: "Balanced",
             amount: 0.65,
             slider: ScrubberState::new("demo-slider"),
@@ -27,6 +35,50 @@ impl Showcase {
 }
 
 impl BaseApp {
+    fn show_notification(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        self.demo.toast_generation = self.demo.toast_generation.wrapping_add(1);
+        self.demo.toast_closing = false;
+        self.demo.toast = Some(message.into());
+        let generation = self.demo.toast_generation;
+        self.demo.toast_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(NOTIFICATION_DURATION).await;
+            this.update(cx, |this, cx| {
+                if this.demo.toast_generation == generation {
+                    this.dismiss_notification(cx);
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn dismiss_notification(&mut self, cx: &mut Context<Self>) {
+        if self.demo.toast_closing || self.demo.toast.is_none() {
+            return;
+        }
+        if !ui::motion::animates(cx) {
+            self.demo.toast_timer = None;
+            self.demo.toast = None;
+            cx.notify();
+            return;
+        }
+        self.demo.toast_closing = true;
+        let generation = self.demo.toast_generation;
+        let duration = Motion::Base.span();
+        self.demo.toast_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(duration).await;
+            this.update(cx, |this, cx| {
+                if this.demo.toast_generation == generation {
+                    this.demo.toast = None;
+                    this.demo.toast_closing = false;
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
     pub(super) fn render_showcase(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.theme();
         let buttons = div()
@@ -38,8 +90,7 @@ impl BaseApp {
                     .primary()
                     .label("Primary")
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.demo.toast = Some("Primary action clicked".into());
-                        cx.notify();
+                        this.show_notification("Primary action clicked", cx);
                     })),
             )
             .child(
@@ -47,8 +98,7 @@ impl BaseApp {
                     .secondary()
                     .label("Secondary")
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.demo.toast = Some("Secondary action clicked".into());
-                        cx.notify();
+                        this.show_notification("Secondary action clicked", cx);
                     })),
             )
             .child(
@@ -56,8 +106,7 @@ impl BaseApp {
                     .outline()
                     .label("Outline")
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.demo.toast = Some("Outline action clicked".into());
-                        cx.notify();
+                        this.show_notification("Outline action clicked", cx);
                     })),
             )
             .child(
@@ -77,8 +126,7 @@ impl BaseApp {
                             .selected(self.demo.selection == choice)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.demo.selection = choice;
-                                this.demo.toast = Some(format!("Selected: {choice}"));
-                                cx.notify();
+                                this.show_notification(format!("Selected: {choice}"), cx);
                             }))
                     }),
             )
@@ -194,13 +242,20 @@ impl BaseApp {
                                 .on_click(cx.listener(|this, _, _, cx| { this.demo.modal = true; cx.notify(); })))
                             .child(Button::new("demo-show-toast").outline().label("Show notification")
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.demo.toast = Some("Your notification is ready".into()); cx.notify();
+                                    this.show_notification("Your notification is ready", cx);
                                 }))).into_any_element(),
                     ], cx))))
             .when_some(self.demo.toast.clone(), |root, message| root.child(
                 div().absolute().bottom_4().right_4().max_w_full()
-                    .child(Toast::new("demo-toast", message)
-                        .on_dismiss(cx.listener(|this, _, _, cx| { this.demo.toast = None; cx.notify(); })))
+                    .child({
+                        let surface = div().child(Toast::new(format!("demo-toast-{}", self.demo.toast_generation), message)
+                            .on_dismiss(cx.listener(|this, _, _, cx| this.dismiss_notification(cx))));
+                        if self.demo.toast_closing {
+                            surface.motion(format!("toast-exit-{}", self.demo.toast_generation), Motion::Base,
+                                |surface, progress| surface.opacity(1. - progress).layer_scale(1. - 0.03 * progress))
+                                .into_any_element()
+                        } else { surface.into_any_element() }
+                    })
             ))
             .when(self.demo.modal, |root| root.child(
                 Modal::new("demo-modal", "Example dialog").close_button()
@@ -212,7 +267,7 @@ impl BaseApp {
                         .on_click(cx.listener(|this, _, _, cx| { this.demo.modal = false; cx.notify(); })))
                     .action(Button::new("demo-confirm").primary().label("Confirm")
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.demo.modal = false; this.demo.toast = Some("Action confirmed".into()); cx.notify();
+                            this.demo.modal = false; this.show_notification("Action confirmed", cx);
                         })))
             ))
     }
