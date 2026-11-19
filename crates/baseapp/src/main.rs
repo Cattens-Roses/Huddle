@@ -1,4 +1,5 @@
 #![recursion_limit = "256"]
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use gpui::prelude::*;
 use gpui::{
@@ -18,6 +19,7 @@ use ui::{
 };
 
 mod matrix;
+mod presence;
 
 use matrix::PhotoSize;
 
@@ -160,6 +162,7 @@ struct BaseApp {
     focus: FocusHandle,
     scrollbar: Entity<Scrollbar>,
     appearance_observer: Option<gpui::Subscription>,
+    activation_observer: Option<gpui::Subscription>,
     matrix: Entity<matrix::MatrixClient>,
 }
 
@@ -320,6 +323,7 @@ impl BaseApp {
             focus: cx.focus_handle(),
             scrollbar: cx.new(|_| Scrollbar::new(ScrollHandle::new()).watching(owner)),
             appearance_observer: None,
+            activation_observer: None,
             matrix: {
                 let matrix = cx.new(|cx| {
                     let mut client = matrix::MatrixClient::new(cx);
@@ -1208,45 +1212,80 @@ fn main() {
             Theme::init(look, &ThemeOverrides::default(), cx);
             ui::motion::apply(prefs.stillness, prefs.pace, cx);
             bind_input_keys(cx);
+            cx.set_app_identity("app.huddle.desktop", "Huddle");
             let bounds = WindowBounds::Windowed(Bounds::centered(None, FIRST_SIZE, cx));
-            cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(bounds),
-                    window_background: ui::backdrop(prefs.blur_window, prefs.transparent),
-                    titlebar: Some(TitlebarOptions {
-                        title: Some("Huddle".into()),
-                        appears_transparent: true,
+            let parked = Rc::new(Cell::new(false));
+            let window = cx
+                .open_window(
+                    WindowOptions {
+                        window_bounds: Some(bounds),
+                        window_background: ui::backdrop(prefs.blur_window, prefs.transparent),
+                        titlebar: Some(TitlebarOptions {
+                            title: Some("Huddle".into()),
+                            appears_transparent: true,
+                            ..Default::default()
+                        }),
+                        app_owns_titlebar_drag: true,
+                        window_min_size: Some(gpui::size(px(480.), px(400.))),
+                        app_id: Some("baseapp".into()),
                         ..Default::default()
-                    }),
-                    app_owns_titlebar_drag: true,
-                    window_min_size: Some(gpui::size(px(480.), px(400.))),
-                    app_id: Some("baseapp".into()),
-                    ..Default::default()
-                },
-                |window, cx| {
-                    window.set_rem_size(cx.theme().font_size);
-                    let view = cx.new(|cx| BaseApp::new(prefs, cx));
-                    view.update(cx, |this, cx| {
-                        this.appearance_observer =
-                            Some(cx.observe_window_appearance(window, |this, window, cx| {
-                                let reported = ThemeKind::reported(cx);
-                                let changed = ThemeKind::assumed() != Some(reported);
-                                if changed {
-                                    ThemeKind::assume(reported);
+                    },
+                    {
+                        let parked = parked.clone();
+                        move |window, cx| {
+                            window.on_window_should_close(cx, move |window, _| {
+                                if parked.get() {
+                                    presence::allow_close(window)
+                                } else {
+                                    true
                                 }
-                                if this.theme == ThemeKind::System && changed {
-                                    Theme::fade(this.look(), &ThemeOverrides::default(), cx);
-                                }
-                                window.set_background_appearance(ui::backdrop(
-                                    this.blur_window,
-                                    this.transparent,
+                            });
+                            window.set_rem_size(cx.theme().font_size);
+                            let view = cx.new(|cx| BaseApp::new(prefs, cx));
+                            view.update(cx, |this, cx| {
+                                this.appearance_observer = Some(cx.observe_window_appearance(
+                                    window,
+                                    |this, window, cx| {
+                                        let reported = ThemeKind::reported(cx);
+                                        let changed = ThemeKind::assumed() != Some(reported);
+                                        if changed {
+                                            ThemeKind::assume(reported);
+                                        }
+                                        if this.theme == ThemeKind::System && changed {
+                                            Theme::fade(
+                                                this.look(),
+                                                &ThemeOverrides::default(),
+                                                cx,
+                                            );
+                                        }
+                                        window.set_background_appearance(ui::backdrop(
+                                            this.blur_window,
+                                            this.transparent,
+                                        ));
+                                    },
                                 ));
-                            }));
-                    });
-                    view
-                },
-            )
-            .expect("failed to open window");
+                                this.matrix.update(cx, |client, _| {
+                                    client.set_focused(window.is_window_active());
+                                });
+                                this.activation_observer = Some(cx.observe_window_activation(
+                                    window,
+                                    |this, window, cx| {
+                                        let focused = window.is_window_active();
+                                        this.matrix.update(cx, |client, cx| {
+                                            client.set_focused(focused);
+                                            if focused {
+                                                client.dismiss_alert(cx);
+                                            }
+                                        });
+                                    },
+                                ));
+                            });
+                            view
+                        }
+                    },
+                )
+                .expect("failed to open window");
+            parked.set(presence::install(window, cx));
             cx.activate(true);
         });
 }

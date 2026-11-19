@@ -389,6 +389,7 @@ pub struct MatrixClient {
     rooms: Vec<RoomSummary>,
     space: Option<OwnedRoomId>,
     room: Option<OwnedRoomId>,
+    focused: bool,
     timelines: HashMap<OwnedRoomId, Timeline>,
     members: HashMap<OwnedRoomId, Vec<Member>>,
     show_members: bool,
@@ -472,6 +473,7 @@ impl MatrixClient {
             rooms: Vec::new(),
             space: None,
             room: None,
+            focused: true,
             timelines: HashMap::new(),
             members: HashMap::new(),
             show_members: true,
@@ -699,7 +701,12 @@ impl MatrixClient {
             Update::Members { room, members } => {
                 self.members.insert(room, members);
             }
-            Update::Live { room, event } => self.live(room, event),
+            Update::Live { room, event } => {
+                let tag = room.to_string();
+                if let Some((title, body)) = self.live(room, event) {
+                    crate::presence::announce(cx, &title, &body, &tag);
+                }
+            }
             Update::Sent { room, local, event } => self.sent(room, local, event),
             Update::Opened(room) => {
                 self.dialog = None;
@@ -886,15 +893,24 @@ impl MatrixClient {
         }
     }
 
-    fn live(&mut self, room: OwnedRoomId, event: Event) {
+    fn live(&mut self, room: OwnedRoomId, event: Event) -> Option<(String, String)> {
+        let preview = match &event {
+            Event::Message(message) if self.my_id().as_ref() != Some(&message.sender) => {
+                Some((self.alert(&room, message), message.thread.clone()))
+            }
+            _ => None,
+        };
         let current = self.room.as_ref() == Some(&room);
         let me = self.my_id();
         let open_thread = self.thread.clone();
         let Some(timeline) = self.timelines.get_mut(&room).filter(|t| t.loaded) else {
-            return;
+            return preview.and_then(|(text, thread)| {
+                self.wants_alert(&room, thread.as_ref()).then_some(text)
+            });
         };
         let mut changes = Vec::new();
         let mut read = None;
+        let mut fresh = false;
         match event {
             Event::Message(message) => {
                 let mine = me.as_ref() == Some(&message.sender);
@@ -918,6 +934,7 @@ impl MatrixClient {
                         },
                         None => true,
                     };
+                    fresh = counted;
                     if counted && let Some(Place::Main(index)) = timeline.locate(&root) {
                         timeline.messages[index].replies += 1;
                         changes.push(Change::Updated(Place::Main(index)));
@@ -925,6 +942,7 @@ impl MatrixClient {
                 } else {
                     match insert(&mut timeline.messages, message, mine) {
                         Insert::Appended(index) => {
+                            fresh = true;
                             if current {
                                 self.list.splice(index..index, 1);
                                 if !mine {
@@ -952,8 +970,60 @@ impl MatrixClient {
             self.changed(&room, change);
         }
         if let Some(event) = read {
-            self.command(Command::Read { room, event });
+            self.command(Command::Read {
+                room: room.clone(),
+                event,
+            });
         }
+        preview.and_then(|(text, thread)| {
+            (fresh && self.wants_alert(&room, thread.as_ref())).then_some(text)
+        })
+    }
+
+    pub fn set_focused(&mut self, focused: bool) {
+        self.focused = focused;
+    }
+
+    pub fn dismiss_alert(&self, cx: &mut Context<Self>) {
+        if let Some(room) = &self.room {
+            cx.dismiss_system_notification(room.as_str());
+        }
+    }
+
+    pub fn focus_room(&mut self, room: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Ok(room) = OwnedRoomId::try_from(room) else {
+            return;
+        };
+        self.open(room, window, cx);
+    }
+
+    fn wants_alert(&self, room: &OwnedRoomId, thread: Option<&OwnedEventId>) -> bool {
+        !(self.focused && self.room.as_ref() == Some(room) && self.thread.as_ref() == thread)
+    }
+
+    fn alert(&self, room: &OwnedRoomId, message: &Message) -> (String, String) {
+        let body = match message.kind {
+            MessageKind::Image => "Sent an image".to_owned(),
+            MessageKind::Attachment if message.body.is_empty() => "Sent a file".to_owned(),
+            MessageKind::Encrypted => "New message".to_owned(),
+            MessageKind::Emote => format!("* {}", one_line(&message.body)),
+            _ => one_line(&message.body),
+        };
+        let direct = self
+            .summary(room)
+            .is_some_and(|room| room.kind == RoomKind::Direct);
+        if direct {
+            return (message.sender_name.clone(), body);
+        }
+        let title = self
+            .summary(room)
+            .map(|room| room.name.clone())
+            .unwrap_or_else(|| "Huddle".to_owned());
+        let body = match message.sender_name.is_empty() {
+            true => body,
+            false => format!("{}: {body}", message.sender_name),
+        };
+        (title, body)
     }
 
     fn changed(&mut self, room: &OwnedRoomId, change: Change) {
@@ -2039,6 +2109,15 @@ fn measure(bytes: &[u8]) -> (u32, u32) {
         .or_else(|| webp_size(bytes))
         .or_else(|| jpeg_size(bytes))
         .unwrap_or((0, 0))
+}
+
+fn one_line(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut short = flat.chars().take(140).collect::<String>();
+    if flat.chars().count() > 140 {
+        short.push('…');
+    }
+    short
 }
 
 fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
