@@ -887,3 +887,32 @@ toast-tray-unavailable = There is no system tray to put the icon in
 
 # power
 wake-reason = Music is playing
+
+# huddle
+huddle-username-hint = Username or @you:server
+huddle-password-hint = Password
+huddle-server-hint = matrix.org
+huddle-composer-hint = Write a message…
+huddle-join-hint = #room:matrix.org
+huddle-create-hint = Room name
+huddle-talk-hint = @friend:matrix.org
+huddle-members = Show or hide members
+huddle-leave = Leave room
+huddle-settings = Appearance settings
+huddle-sign-out = Sign out
+huddle-confirm-hint = Type the password again
+huddle-code-hint = Invite code
+huddle-email-hint = you@example.com
+huddle-recovery-hint = Recovery key or passphrase
+huddle-thread-hint = Reply in thread…
+huddle-react = Add reaction
+huddle-reply = Reply
+huddle-thread = Start or open thread
+huddle-edit = Edit
+huddle-delete = Delete
+huddle-security = Encryption and devices
+huddle-close-thread = Close thread
+huddle-copy = Copy
+huddle-upload = Upload an image
+huddle-profile = Edit profile
+huddle-profile-hint = Display name

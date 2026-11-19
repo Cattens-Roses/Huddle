@@ -57,10 +57,69 @@ jobs:
       - name: Build baseapp
         run: cargo build --release --locked -p baseapp --target ${{ matrix.target }}
 
+      - name: Build the Debian package
+        if: runner.os == 'Linux'
+        env:
+          TARGET: ${{ matrix.target }}
+          DEB_ARCH: amd64
+        run: bash packaging/linux/build-deb.sh
+
+      - name: Upload the Debian package
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: huddle-linux-deb
+          path: dist/*.deb
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Stage the Windows executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/baseapp.exe" dist/Huddle.exe
+
+      - name: Install Inno Setup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/jrsoftware/issrc/releases/download/is-6_7_4/innosetup-6.7.4.exe" -OutFile innosetup.exe
+          Start-Process .\innosetup.exe -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-" -Wait
+
+      - name: Build the Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          $env:HUDDLE_VERSION = $version
+          $env:HUDDLE_EXE = (Resolve-Path "dist/Huddle.exe").Path
+          $env:HUDDLE_DIST = (Resolve-Path "dist").Path
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" packaging\windows\huddle.iss
+
+      - name: Upload the Windows executable
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: huddle-windows-exe
+          path: dist/Huddle.exe
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload the Windows installer
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: huddle-windows-setup
+          path: dist/Huddle-Setup.exe
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Upload build artifact
+        if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
         with:
           name: baseapp-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/baseapp${{ runner.os == 'Windows' && '.exe' || '' }}
+          path: target/${{ matrix.target }}/release/baseapp
           if-no-files-found: error
           retention-days: 14

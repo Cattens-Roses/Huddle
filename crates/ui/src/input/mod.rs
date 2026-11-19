@@ -1,11 +1,20 @@
 use std::ops::Range;
+use std::path::Path;
+use std::rc::Rc;
 
 use gpui::actions;
 use gpui::{
-    App, Bounds, ClipboardItem, Context, EntityInputHandler, FocusHandle, Focusable, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ShapedLine, SharedString,
-    UTF16Selection, Window, point, px,
+    App, Bounds, ClipboardEntry, ClipboardItem, Context, EntityInputHandler, FocusHandle,
+    Focusable, Image, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    ShapedLine, SharedString, UTF16Selection, Window, WrappedLine, point, px, size,
 };
+
+/// An image taken from the clipboard, either the bitmap itself or a copied file.
+#[derive(Clone)]
+pub enum PastedPicture {
+    Image(Image),
+    File(std::path::PathBuf),
+}
 use unicode_segmentation::UnicodeSegmentation;
 
 mod element;
@@ -37,6 +46,11 @@ actions!(
         Cut,
         Copy,
         Space,
+        Newline,
+        Up,
+        Down,
+        SelectUp,
+        SelectDown,
         ShowCharacterPalette
     ]
 );
@@ -45,6 +59,8 @@ pub const INPUT_CONTEXT: &str = "Input";
 
 const CARET: Pixels = px(2.);
 const CARET_LINES: f32 = 1.25;
+/// How many lines a growing field shows before it scrolls.
+pub(crate) const GROWING_ROWS: usize = 8;
 
 type Motion = fn(&str, usize) -> usize;
 
@@ -189,6 +205,12 @@ pub struct Input {
     blurred: bool,
     clearable: bool,
     masked: bool,
+    growing: bool,
+    rows: usize,
+    scroll: usize,
+    line_height: Pixels,
+    preferred_x: Option<Pixels>,
+    last_lines: Vec<WrappedLine>,
     content: SharedString,
     selected_range: Range<usize>,
     selection_reversed: bool,
@@ -198,6 +220,8 @@ pub struct Input {
     selecting: bool,
     selected_word: Option<Range<usize>>,
     context_menu: Option<Point<Pixels>>,
+    paste_image: Option<Rc<dyn Fn(PastedPicture, &mut Window, &mut App)>>,
+    activity: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
 }
 
 impl Input {
@@ -211,6 +235,12 @@ impl Input {
             blurred: false,
             clearable: false,
             masked: false,
+            growing: false,
+            rows: 1,
+            scroll: 0,
+            line_height: px(0.),
+            preferred_x: None,
+            last_lines: Vec::new(),
             content: SharedString::default(),
             selected_range: 0..0,
             selection_reversed: false,
@@ -220,6 +250,8 @@ impl Input {
             selecting: false,
             selected_word: None,
             context_menu: None,
+            paste_image: None,
+            activity: None,
         }
     }
 
@@ -257,6 +289,51 @@ impl Input {
         self
     }
 
+    /// Lets the field wrap and grow with its text, up to a few lines, then scroll.
+    /// Shift+Enter inserts a line break. Enter still submits.
+    pub fn growing(mut self) -> Self {
+        self.growing = true;
+        self
+    }
+
+    /// Receives an image pasted into a growing field. Text pastes are unchanged.
+    pub fn on_paste_image(
+        &mut self,
+        listener: impl Fn(PastedPicture, &mut Window, &mut App) + 'static,
+    ) {
+        self.paste_image = Some(Rc::new(listener));
+    }
+
+    pub fn pastes_images(&self) -> bool {
+        self.paste_image.is_some()
+    }
+
+    /// Fires when the field is clicked or its text changes, so a selection elsewhere can step aside.
+    pub fn on_activity(&mut self, listener: impl Fn(&mut Window, &mut App) + 'static) {
+        self.activity = Some(Rc::new(listener));
+    }
+
+    pub fn has_selection(&self) -> bool {
+        !clamp_range(&self.content, &self.selected_range).is_empty()
+    }
+
+    /// Drops the highlight and leaves the caret where it is.
+    pub fn collapse(&mut self, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            return;
+        }
+        let cursor = self.cursor();
+        self.selected_range = cursor..cursor;
+        self.selection_reversed = false;
+        cx.notify();
+    }
+
+    fn activity(&self, window: &mut Window, cx: &mut App) {
+        if let Some(listener) = self.activity.clone() {
+            listener(window, cx);
+        }
+    }
+
     pub fn text(&self) -> &str {
         &self.content
     }
@@ -285,6 +362,11 @@ impl Input {
         self.selected_range = self.content.len()..self.content.len();
         self.selection_reversed = false;
         self.marked_range = None;
+        self.preferred_x = None;
+        self.scroll = 0;
+        if self.growing {
+            self.rows = self.content.split('\n').count().max(1);
+        }
         cx.notify();
     }
 
@@ -380,19 +462,35 @@ impl Input {
     }
 
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_to(0, cx);
+        let offset = self
+            .row_bounds(self.cursor())
+            .map(|(start, _)| start)
+            .unwrap_or(0);
+        self.move_to(offset, cx);
     }
 
     fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_to(self.content.len(), cx);
+        let offset = self
+            .row_bounds(self.cursor())
+            .map(|(_, end)| end)
+            .unwrap_or(self.content.len());
+        self.move_to(offset, cx);
     }
 
     fn select_home(&mut self, _: &SelectHome, _: &mut Window, cx: &mut Context<Self>) {
-        self.select_to(0, cx);
+        let offset = self
+            .row_bounds(self.cursor())
+            .map(|(start, _)| start)
+            .unwrap_or(0);
+        self.select_to(offset, cx);
     }
 
     fn select_end(&mut self, _: &SelectEnd, _: &mut Window, cx: &mut Context<Self>) {
-        self.select_to(self.content.len(), cx);
+        let offset = self
+            .row_bounds(self.cursor())
+            .map(|(_, end)| end)
+            .unwrap_or(self.content.len());
+        self.select_to(offset, cx);
     }
 
     fn space(&mut self, _: &Space, window: &mut Window, cx: &mut Context<Self>) {
@@ -454,7 +552,9 @@ impl Input {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        self.write_selection(cx);
+        if !self.write_selection(cx) {
+            cx.propagate();
+        }
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
@@ -464,11 +564,46 @@ impl Input {
     }
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(pasted) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+        let Some(item) = cx.read_from_clipboard() else {
             return;
         };
-        let single_line = pasted.replace('\n', " ");
-        self.replace_text_in_range(None, &single_line, window, cx);
+        if self.growing
+            && let Some(listener) = self.paste_image.clone()
+            && let Some(picture) = pasted_picture(&item)
+        {
+            listener(picture, window, cx);
+            return;
+        }
+        let Some(pasted) = item.text() else {
+            return;
+        };
+        let text = match self.growing {
+            true => pasted.replace("\r\n", "\n").replace('\r', "\n"),
+            false => pasted.replace(['\n', '\r'], " "),
+        };
+        self.replace_text_in_range(None, &text, window, cx);
+    }
+
+    fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
+        if self.growing {
+            self.replace_text_in_range(None, "\n", window, cx);
+        }
+    }
+
+    fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+        self.vertical(false, false, cx);
+    }
+
+    fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+        self.vertical(true, false, cx);
+    }
+
+    fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.vertical(false, true, cx);
+    }
+
+    fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.vertical(true, true, cx);
     }
 
     fn show_character_palette(
@@ -502,6 +637,7 @@ impl Input {
     ) {
         cx.stop_propagation();
         self.focus(window, cx);
+        self.activity(window, cx);
         if event.button == MouseButton::Right {
             self.context_menu = Some(event.position);
             window.prevent_default();
@@ -545,6 +681,13 @@ impl Input {
     }
 
     fn offset_for(&self, position: Point<Pixels>) -> usize {
+        if self.growing {
+            let Some(bounds) = self.last_bounds else {
+                return 0;
+            };
+            let y = position.y - bounds.top() + self.line_height * self.scroll as f32;
+            return self.offset_at(point(position.x - bounds.left(), y));
+        }
         let Some((bounds, line)) = self.last_bounds.as_ref().zip(self.last_layout.as_ref()) else {
             return 0;
         };
@@ -562,11 +705,13 @@ impl Input {
         let offset = clamp_offset(&self.content, offset);
         self.selected_range = offset..offset;
         self.selection_reversed = false;
+        self.preferred_x = None;
         cx.notify();
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         let offset = clamp_offset(&self.content, offset);
+        self.preferred_x = None;
         match self.selection_reversed {
             true => self.selected_range.start = offset,
             false => self.selected_range.end = offset,
@@ -599,6 +744,135 @@ impl Input {
     fn splice(&mut self, range: &Range<usize>, text: &str) {
         self.content =
             (self.content[..range.start].to_owned() + text + &self.content[range.end..]).into();
+    }
+
+    fn note_growth(&mut self) {
+        if !self.growing {
+            return;
+        }
+        let hard = self.content.split('\n').count().max(1);
+        if hard > self.rows {
+            self.rows = hard;
+        }
+    }
+
+    /// One paragraph of the last wrapped layout, in content coordinates.
+    fn paragraphs(&self) -> Vec<(usize, usize, Pixels, Pixels)> {
+        let mut paragraphs = Vec::new();
+        let mut at = 0usize;
+        let mut top = px(0.);
+        for line in &self.last_lines {
+            let len = line.len();
+            let height = self.line_height * (line.wrap_boundaries.len() + 1) as f32;
+            paragraphs.push((at, len, top, height));
+            at += len;
+            if self.content[at..].starts_with('\n') {
+                at += 1;
+            }
+            top += height;
+        }
+        paragraphs
+    }
+
+    fn locate(&self, offset: usize) -> Option<Point<Pixels>> {
+        let paragraphs = self.paragraphs();
+        if paragraphs.is_empty() {
+            return Some(point(px(0.), px(0.)));
+        }
+        for (index, (start, len, top, _)) in paragraphs.iter().copied().enumerate() {
+            let last = index + 1 == paragraphs.len();
+            if offset <= start + len || last {
+                let local = offset.saturating_sub(start).min(len);
+                let pos = self.last_lines[index]
+                    .position_for_index(local, self.line_height)
+                    .unwrap_or(point(px(0.), px(0.)));
+                return Some(point(pos.x, top + pos.y));
+            }
+        }
+        None
+    }
+
+    fn offset_at(&self, position: Point<Pixels>) -> usize {
+        let paragraphs = self.paragraphs();
+        let Some((index, (start, len, top, height))) = paragraphs
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, (_, _, top, height))| position.y < *top + *height)
+            .or_else(|| {
+                paragraphs
+                    .last()
+                    .copied()
+                    .map(|para| (paragraphs.len() - 1, para))
+            })
+        else {
+            return 0;
+        };
+        let local_y = (position.y - top).clamp(px(0.), (height - px(1.)).max(px(0.)));
+        let local = match self.last_lines[index]
+            .closest_index_for_position(point(position.x.max(px(0.)), local_y), self.line_height)
+        {
+            Ok(index) | Err(index) => index,
+        };
+        start + local.min(len)
+    }
+
+    /// The content range of the visual row the caret is on.
+    fn row_bounds(&self, offset: usize) -> Option<(usize, usize)> {
+        if self.line_height == px(0.) || self.last_lines.is_empty() {
+            return None;
+        }
+        let point = self.locate(offset)?;
+        let row = (point.y / self.line_height) as usize;
+        let mut at = 0usize;
+        let mut seen = 0usize;
+        for line in &self.last_lines {
+            let len = line.len();
+            let mut local_start = 0usize;
+            let mut breaks = line
+                .wrap_boundaries
+                .iter()
+                .map(|boundary| {
+                    line.unwrapped_layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index
+                })
+                .collect::<Vec<_>>();
+            breaks.push(len);
+            for local_end in breaks {
+                if seen == row {
+                    return Some((at + local_start, at + local_end));
+                }
+                seen += 1;
+                local_start = local_end;
+            }
+            at += len;
+            if self.content[at..].starts_with('\n') {
+                at += 1;
+            }
+        }
+        None
+    }
+
+    fn vertical(&mut self, down: bool, selecting: bool, cx: &mut Context<Self>) {
+        if !self.growing || self.line_height == px(0.) || self.last_lines.is_empty() {
+            return;
+        }
+        let Some(origin) = self.locate(self.cursor()) else {
+            return;
+        };
+        let x = self.preferred_x.unwrap_or(origin.x);
+        let y = match down {
+            true => origin.y + self.line_height * 1.5,
+            false => origin.y - self.line_height * 0.5,
+        };
+        let offset = match y < px(0.) {
+            true => 0,
+            false => self.offset_at(point(x, y)),
+        };
+        match selecting {
+            true => self.select_to(offset, cx),
+            false => self.move_to(offset, cx),
+        }
+        self.preferred_x = Some(x);
     }
 }
 
@@ -647,16 +921,19 @@ impl EntityInputHandler for Input {
         &mut self,
         range_utf16: Option<Range<usize>>,
         text: &str,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let range = self.edited_range(range_utf16.as_ref());
         self.splice(&range, text);
+        self.activity(window, cx);
 
         let caret = range.start + text.len();
         self.selected_range = caret..caret;
         self.selection_reversed = false;
         self.marked_range.take();
+        self.preferred_x = None;
+        self.note_growth();
         cx.notify();
     }
 
@@ -665,11 +942,12 @@ impl EntityInputHandler for Input {
         range_utf16: Option<Range<usize>>,
         text: &str,
         selected: Option<Range<usize>>,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let range = self.edited_range(range_utf16.as_ref());
         self.splice(&range, text);
+        self.activity(window, cx);
 
         let caret = range.start + text.len();
         self.marked_range = (!text.is_empty()).then_some(range.start..caret);
@@ -681,6 +959,8 @@ impl EntityInputHandler for Input {
             .unwrap_or(caret..caret);
         self.selected_range = clamp_range(&self.content, &selected);
         self.selection_reversed = false;
+        self.preferred_x = None;
+        self.note_growth();
         cx.notify();
     }
 
@@ -691,6 +971,15 @@ impl EntityInputHandler for Input {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        if self.growing {
+            let range = clamp_range(&self.content, &self.range_from_utf16(&range_utf16));
+            let origin = self.locate(range.start)?;
+            let y = origin.y - self.line_height * self.scroll as f32;
+            return Some(Bounds::new(
+                point(bounds.left() + origin.x, bounds.top() + y),
+                size(px(1.), self.line_height),
+            ));
+        }
         let line = self.last_layout.as_ref()?;
         let range = clamp_range(&self.content, &self.range_from_utf16(&range_utf16));
         let at = |offset: usize| match self.masked && !self.content.is_empty() {
@@ -715,6 +1004,10 @@ impl EntityInputHandler for Input {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
+        if self.growing {
+            let index = self.offset_for(position);
+            return Some(offset_to_utf16(&self.content, index));
+        }
         let bounds = self.last_bounds?;
         let line = self.last_layout.as_ref()?;
         let index = line.index_for_x(position.x - bounds.left())?;
@@ -724,6 +1017,32 @@ impl EntityInputHandler for Input {
         };
         Some(offset_to_utf16(&self.content, index))
     }
+}
+
+fn pasted_picture(item: &ClipboardItem) -> Option<PastedPicture> {
+    for entry in item.entries() {
+        if let ClipboardEntry::Image(image) = entry {
+            return Some(PastedPicture::Image(image.clone()));
+        }
+    }
+    for entry in item.entries() {
+        if let ClipboardEntry::ExternalPaths(paths) = entry
+            && let Some(path) = paths.paths().iter().find(|path| is_image_path(path))
+        {
+            return Some(PastedPicture::File(path.clone()));
+        }
+    }
+    None
+}
+
+fn is_image_path(path: &Path) -> bool {
+    let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+        return false;
+    };
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg"
+    )
 }
 
 #[cfg(test)]

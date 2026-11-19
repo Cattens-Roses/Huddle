@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use gpui::prelude::*;
 use gpui::{
     App, Bounds, Context, Entity, FocusHandle, FontWeight, Hsla, Render, Rgba, ScrollHandle,
@@ -15,9 +17,11 @@ use ui::{
     ThemeOverrides, WindowControls,
 };
 
-mod showcase;
+mod matrix;
 
-const FIRST_SIZE: gpui::Size<gpui::Pixels> = gpui::size(px(920.), px(640.));
+use matrix::PhotoSize;
+
+const FIRST_SIZE: gpui::Size<gpui::Pixels> = gpui::size(px(1240.), px(800.));
 const AMBIENT_DOWNSCALE: f32 = 3.;
 const AMBIENT_BLUR: f32 = 4.;
 const AMBIENT_DISCS: usize = 18;
@@ -149,12 +153,14 @@ struct BaseApp {
     ambient_style: AmbientStyle,
     ambient_transition: Option<AmbientTransition>,
     ambient_motion: bool,
+    photo_compress: bool,
+    photo_size: PhotoSize,
     ambient_started: Instant,
     ambient_bounds: Rc<Cell<Bounds<gpui::Pixels>>>,
     focus: FocusHandle,
     scrollbar: Entity<Scrollbar>,
     appearance_observer: Option<gpui::Subscription>,
-    demo: showcase::Showcase,
+    matrix: Entity<matrix::MatrixClient>,
 }
 
 #[derive(Clone, Copy)]
@@ -172,6 +178,8 @@ struct Preferences {
     ambient: bool,
     ambient_style: AmbientStyle,
     ambient_motion: bool,
+    photo_compress: bool,
+    photo_size: PhotoSize,
 }
 
 impl Default for Preferences {
@@ -190,6 +198,8 @@ impl Default for Preferences {
             ambient: false,
             ambient_style: AmbientStyle::Aurora,
             ambient_motion: true,
+            photo_compress: true,
+            photo_size: PhotoSize::Balanced,
         }
     }
 }
@@ -235,6 +245,10 @@ impl Preferences {
                 "ambient_motion" => {
                     prefs.ambient_motion = value.parse().unwrap_or(prefs.ambient_motion)
                 }
+                "photo_compress" => {
+                    prefs.photo_compress = value.parse().unwrap_or(prefs.photo_compress)
+                }
+                "photo_size" => prefs.photo_size = PhotoSize::from_id(value),
                 _ => {}
             }
         }
@@ -249,10 +263,11 @@ impl Preferences {
         let Some(parent) = path.parent() else { return };
         if let Err(error) = std::fs::create_dir_all(parent).and_then(|()| {
             std::fs::write(path, format!(
-                "theme={}\nrounding={}\nblur={}\nblur_window={}\nfont_size={}\nicon_pack={}\ntransparent={}\ntransparency={}\nstillness={}\npace={}\nambient={}\nambient_style={}\nambient_motion={}\n",
+                "theme={}\nrounding={}\nblur={}\nblur_window={}\nfont_size={}\nicon_pack={}\ntransparent={}\ntransparency={}\nstillness={}\npace={}\nambient={}\nambient_style={}\nambient_motion={}\nphoto_compress={}\nphoto_size={}\n",
                 self.theme.id(), self.rounding.id(), self.blur, self.blur_window, self.font_size,
                 self.icon_pack, self.transparent, self.transparency, self.stillness.id(), self.pace.id(),
-                self.ambient, self.ambient_style.id(), self.ambient_motion
+                self.ambient, self.ambient_style.id(), self.ambient_motion, self.photo_compress,
+                self.photo_size.id()
             ))
         }) {
             log::warn!("Could not save appearance preferences: {error}");
@@ -298,12 +313,26 @@ impl BaseApp {
             ambient_style: prefs.ambient_style,
             ambient_transition: None,
             ambient_motion: prefs.ambient_motion,
+            photo_compress: prefs.photo_compress,
+            photo_size: prefs.photo_size,
             ambient_started: Instant::now(),
             ambient_bounds: Rc::new(Cell::new(Bounds::default())),
             focus: cx.focus_handle(),
             scrollbar: cx.new(|_| Scrollbar::new(ScrollHandle::new()).watching(owner)),
             appearance_observer: None,
-            demo: showcase::Showcase::new(cx),
+            matrix: {
+                let matrix = cx.new(|cx| {
+                    let mut client = matrix::MatrixClient::new(cx);
+                    client.set_photo_send(prefs.photo_compress, prefs.photo_size);
+                    client
+                });
+                cx.subscribe(&matrix, |this, _, _: &matrix::OpenSettings, cx| {
+                    this.page = Page::Appearance;
+                    cx.notify();
+                })
+                .detach();
+                matrix
+            },
         }
     }
 
@@ -354,11 +383,22 @@ impl BaseApp {
             ambient: self.ambient,
             ambient_style: self.ambient_style,
             ambient_motion: self.ambient_motion,
+            photo_compress: self.photo_compress,
+            photo_size: self.photo_size,
         }
     }
 
     fn save(&self) {
         self.preferences().save();
+    }
+
+    fn remember_photo(&mut self, cx: &mut Context<Self>) {
+        let compress = self.photo_compress;
+        let size = self.photo_size;
+        self.matrix
+            .update(cx, |matrix, _| matrix.set_photo_send(compress, size));
+        self.save();
+        cx.notify();
     }
 
     fn settings_card(
@@ -423,7 +463,7 @@ impl BaseApp {
 impl Render for BaseApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.theme();
-        let sidebar_open = self.sidebar_open;
+        let sidebar_open = self.sidebar_open && self.page != Page::Home;
         let nav = |page, id: &'static str, icon: &'static str| {
             Button::new(id)
                 .ghost()
@@ -470,7 +510,7 @@ impl Render for BaseApp {
             .child(nav(Page::Appearance, "nav-settings", "icons/settings.svg"));
 
         let content = match self.page {
-            Page::Home => self.render_showcase(cx).into_any_element(),
+            Page::Home => self.matrix.clone().into_any_element(),
             Page::Appearance => {
                 let packs = icons::packs().collect::<Vec<_>>();
                 let pack = packs.get(self.icon_pack % packs.len().max(1));
@@ -659,6 +699,23 @@ impl Render for BaseApp {
                         this.ambient_motion = !this.ambient_motion;
                         this.save();
                         cx.notify();
+                    }))
+                    .into_any_element();
+                let photo_compress = Switch::new("photo-compress", self.photo_compress)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.photo_compress = !this.photo_compress;
+                        this.remember_photo(cx);
+                    }))
+                    .into_any_element();
+                let photo_size = Picker::new("photo-size", &self.popovers, self.photo_size.label())
+                    .width(Picker::NARROW)
+                    .items(PhotoSize::ALL.into_iter().map(|size| {
+                        MenuItem::new(size.id(), size.label())
+                            .selected(size == self.photo_size)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.photo_size = size;
+                                this.remember_photo(cx);
+                            }))
                     }))
                     .into_any_element();
                 let font = div()
@@ -859,6 +916,26 @@ impl Render for BaseApp {
                                             .into_any_element(),
                                     ],
                                 cx,
+                            ))
+                            .child(self.settings_card(
+                                "Sending photos",
+                                vec![
+                                        self.row(
+                                            "Compress before sending",
+                                            "Turn photos into smaller JPEGs first",
+                                            photo_compress,
+                                            cx,
+                                        )
+                                        .into_any_element(),
+                                        self.row(
+                                            "Photo size",
+                                            "Longest side kept on a compressed photo",
+                                            photo_size,
+                                            cx,
+                                        )
+                                        .into_any_element(),
+                                    ],
+                                cx,
                             )),
                     )
                     .into_any_element()
@@ -875,20 +952,22 @@ impl Render for BaseApp {
             .border_b_1()
             .border_color(theme.title_bar_border)
             .window_control_area(gpui::WindowControlArea::Drag)
-            .child(
-                Button::new("sidebar-toggle")
-                    .ghost()
-                    .small()
-                    .icon(icons::path(if self.sidebar_open {
-                        "icons/panel-left-close.svg"
-                    } else {
-                        "icons/panel-left-open.svg"
-                    }))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.sidebar_open = !this.sidebar_open;
-                        cx.notify();
-                    })),
-            )
+            .when(self.page != Page::Home, |toolbar| {
+                toolbar.child(
+                    Button::new("sidebar-toggle")
+                        .ghost()
+                        .small()
+                        .icon(icons::path(if self.sidebar_open {
+                            "icons/panel-left-close.svg"
+                        } else {
+                            "icons/panel-left-open.svg"
+                        }))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.sidebar_open = !this.sidebar_open;
+                            cx.notify();
+                        })),
+                )
+            })
             .child(
                 div()
                     .flex_1()
@@ -898,7 +977,7 @@ impl Render for BaseApp {
                     .px_3()
                     .text_color(theme.muted_foreground)
                     .text_size(theme.text(ui::Text::Small))
-                    .child("baseapp")
+                    .child("Huddle")
                     .window_control_area(gpui::WindowControlArea::Drag),
             )
             .child(WindowControls::new(false));
@@ -1051,6 +1130,61 @@ fn shaded(color: Hsla) -> Hsla {
     })
 }
 
+fn bind_input_keys(cx: &mut App) {
+    use gpui::KeyBinding;
+    use ui::{
+        Backspace, BackspaceWord, Copy, Cut, Delete, DeleteWord, Down, End, Home, Left, Newline,
+        Paste, Right, SelectAll, SelectDown, SelectEnd, SelectHome, SelectLeft, SelectRight,
+        SelectUp, SelectWordLeft, SelectWordRight, Submit, Up, WordLeft, WordRight,
+    };
+
+    let context = Some(ui::INPUT_CONTEXT);
+    let (command, word) = match cfg!(target_os = "macos") {
+        true => ("cmd", "alt"),
+        false => ("ctrl", "ctrl"),
+    };
+    let chord = |keys: &str| keys.replace("command", command).replace("word", word);
+    let mut bindings = vec![
+        KeyBinding::new("backspace", Backspace, context),
+        KeyBinding::new(&chord("word-backspace"), BackspaceWord, context),
+        KeyBinding::new("delete", Delete, context),
+        KeyBinding::new(&chord("word-delete"), DeleteWord, context),
+        KeyBinding::new("left", Left, context),
+        KeyBinding::new("right", Right, context),
+        KeyBinding::new(&chord("word-left"), WordLeft, context),
+        KeyBinding::new(&chord("word-right"), WordRight, context),
+        KeyBinding::new("shift-left", SelectLeft, context),
+        KeyBinding::new("shift-right", SelectRight, context),
+        KeyBinding::new(&chord("word-shift-left"), SelectWordLeft, context),
+        KeyBinding::new(&chord("word-shift-right"), SelectWordRight, context),
+        KeyBinding::new("home", Home, context),
+        KeyBinding::new("end", End, context),
+        KeyBinding::new("shift-home", SelectHome, context),
+        KeyBinding::new("shift-end", SelectEnd, context),
+        KeyBinding::new(&chord("command-a"), SelectAll, context),
+        KeyBinding::new(&chord("command-c"), Copy, context),
+        KeyBinding::new(&chord("command-c"), Copy, None),
+        KeyBinding::new(&chord("command-x"), Cut, context),
+        KeyBinding::new(&chord("command-v"), Paste, context),
+        KeyBinding::new("enter", Submit, context),
+        KeyBinding::new("shift-enter", Newline, context),
+        KeyBinding::new("up", Up, context),
+        KeyBinding::new("down", Down, context),
+        KeyBinding::new("shift-up", SelectUp, context),
+        KeyBinding::new("shift-down", SelectDown, context),
+        KeyBinding::new("escape", ui::Dismiss, context),
+    ];
+    if cfg!(target_os = "macos") {
+        bindings.extend([
+            KeyBinding::new("cmd-left", Home, context),
+            KeyBinding::new("cmd-right", End, context),
+            KeyBinding::new("cmd-shift-left", SelectHome, context),
+            KeyBinding::new("cmd-shift-right", SelectEnd, context),
+        ]);
+    }
+    cx.bind_keys(bindings);
+}
+
 fn main() {
     env_logger::init();
     i18n::set(i18n::resolve("en"));
@@ -1073,13 +1207,14 @@ fn main() {
             };
             Theme::init(look, &ThemeOverrides::default(), cx);
             ui::motion::apply(prefs.stillness, prefs.pace, cx);
+            bind_input_keys(cx);
             let bounds = WindowBounds::Windowed(Bounds::centered(None, FIRST_SIZE, cx));
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(bounds),
                     window_background: ui::backdrop(prefs.blur_window, prefs.transparent),
                     titlebar: Some(TitlebarOptions {
-                        title: Some("baseapp".into()),
+                        title: Some("Huddle".into()),
                         appears_transparent: true,
                         ..Default::default()
                     }),

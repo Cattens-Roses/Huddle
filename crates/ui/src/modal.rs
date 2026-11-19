@@ -130,6 +130,7 @@ impl RenderOnce for Modal {
             close_button,
         } = self;
         let outside = dismiss.clone();
+        let escape = dismiss.clone();
         // with no action row under it the body carries the bottom padding itself, so the
         // panel is inset by the same amount all the way round
         let tail = match actions.is_empty() {
@@ -171,6 +172,11 @@ impl RenderOnce for Modal {
                 let mut panel = base
                     .relative()
                     .occlude()
+                    .on_action(move |_: &crate::Dismiss, window, cx| {
+                        if let Some(escape) = &escape {
+                            escape(&(), window, cx);
+                        }
+                    })
                     .w(theme.metrics.cover * WIDTH)
                     .max_w_full()
                     .max_h_full()

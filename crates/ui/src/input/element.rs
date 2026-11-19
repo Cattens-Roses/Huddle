@@ -1,8 +1,9 @@
 use gpui::prelude::*;
 use gpui::{
     App, Bounds, Context, CursorStyle, Element, ElementInputHandler, Entity, GlobalElementId,
-    InspectorElementId, LayoutId, MouseButton, PaintQuad, Pixels, ShapedLine, Style, TextRun,
-    UnderlineStyle, Window, div, fill, point, px, relative, size, svg,
+    InspectorElementId, LayoutId, MouseButton, PaintQuad, Pixels, Point, ShapedLine, Style,
+    TextAlign, TextRun, UnderlineStyle, Window, WrappedLine, div, fill, point, px, relative, size,
+    svg,
 };
 
 use i18n::t;
@@ -23,8 +24,10 @@ struct Text {
 
 struct Painted {
     line: Option<ShapedLine>,
+    lines: Vec<WrappedLine>,
     caret: Option<PaintQuad>,
     selection: Option<PaintQuad>,
+    selections: Vec<PaintQuad>,
 }
 
 impl IntoElement for Text {
@@ -54,9 +57,14 @@ impl Element for Text {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
+        let input = self.input.read(cx);
+        let rows = match input.growing {
+            true => input.rows.clamp(1, super::GROWING_ROWS),
+            false => 1,
+        };
         let mut style = Style::default();
         style.size.width = relative(1.).into();
-        style.size.height = window.line_height().into();
+        style.size.height = (window.line_height() * rows as f32).into();
         (window.request_layout(style, [], cx), ())
     }
 
@@ -71,6 +79,9 @@ impl Element for Text {
     ) -> Self::PrepaintState {
         let theme = *cx.theme();
         let input = self.input.read(cx);
+        if input.growing && !input.content.is_empty() {
+            return prepaint_growing(&self.input, bounds, window, cx);
+        }
         let empty = input.content.is_empty();
         let style = window.text_style();
 
@@ -188,8 +199,10 @@ impl Element for Text {
 
         Painted {
             line: Some(line),
+            lines: Vec::new(),
             caret,
             selection,
+            selections: Vec::new(),
         }
     }
 
@@ -211,6 +224,39 @@ impl Element for Text {
         );
 
         let focused = focus.is_focused(window);
+        if !painted.lines.is_empty() {
+            if focused {
+                for selection in painted.selections.drain(..) {
+                    window.paint_quad(selection);
+                }
+            }
+            let line_height = window.line_height();
+            let scroll = self.input.read(cx).scroll;
+            let mut y = bounds.top() - line_height * scroll as f32;
+            let lines = std::mem::take(&mut painted.lines);
+            for line in &lines {
+                line.paint(
+                    point(bounds.left(), y),
+                    line_height,
+                    TextAlign::Left,
+                    Some(bounds),
+                    window,
+                    cx,
+                )
+                .ok();
+                y += line_height * (line.wrap_boundaries.len() + 1) as f32;
+            }
+            if focused && let Some(caret) = painted.caret.take() {
+                window.paint_quad(caret);
+            }
+            self.input.update(cx, |input, _| {
+                input.last_lines = lines;
+                input.last_layout = None;
+                input.last_bounds = Some(bounds);
+            });
+            return;
+        }
+
         if focused && let Some(selection) = painted.selection.take() {
             window.paint_quad(selection);
         }
@@ -234,17 +280,247 @@ impl Element for Text {
 
         self.input.update(cx, |input, _| {
             input.last_layout = (!input.content.is_empty()).then_some(line);
+            input.last_lines.clear();
             input.last_bounds = Some(bounds);
         });
     }
 }
 
+fn prepaint_growing(
+    field: &Entity<Input>,
+    bounds: Bounds<Pixels>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Painted {
+    let theme = *cx.theme();
+    let input = field.read(cx);
+    let style = window.text_style();
+    let font_size = style.font_size.to_pixels(window.rem_size());
+    let line_height = window.line_height();
+    let text = input.content.clone();
+    let run = TextRun {
+        len: text.len(),
+        font: style.font(),
+        color: style.color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let marked = input.marked_range.clone().unwrap_or(0..0);
+    let runs = [
+        TextRun {
+            len: marked.start,
+            ..run.clone()
+        },
+        TextRun {
+            len: marked.end - marked.start,
+            underline: Some(UnderlineStyle {
+                color: Some(run.color),
+                thickness: px(1.),
+                wavy: false,
+            }),
+            ..run.clone()
+        },
+        TextRun {
+            len: text.len() - marked.end,
+            ..run
+        },
+    ]
+    .into_iter()
+    .filter(|run| run.len > 0)
+    .collect::<Vec<_>>();
+    let lines: Vec<WrappedLine> = window
+        .text_system()
+        .shape_text(
+            text.clone(),
+            font_size,
+            &runs,
+            Some(bounds.size.width),
+            None,
+        )
+        .map(|lines| lines.into_iter().collect())
+        .unwrap_or_default();
+    let visual = lines
+        .iter()
+        .map(|line| line.wrap_boundaries.len() + 1)
+        .sum::<usize>()
+        .max(1);
+    let cursor = input.cursor();
+    let selected = input.selected_range.clone();
+    let scroll = scrolled(input.scroll, visual, cursor, &lines, &text, line_height);
+    let changed = input.rows != visual || input.scroll != scroll;
+    field.update(cx, |input, cx| {
+        input.line_height = line_height;
+        input.rows = visual;
+        input.scroll = scroll;
+        if changed {
+            cx.notify();
+        }
+    });
+
+    let caret_h = font_size * super::CARET_LINES;
+    let caret = point_of(cursor, &lines, &text, line_height).map(|origin| {
+        fill(
+            Bounds::new(
+                point(
+                    bounds.left() + origin.x,
+                    bounds.top() + origin.y - line_height * scroll as f32
+                        + (line_height - caret_h) / 2.,
+                ),
+                size(super::CARET, caret_h),
+            ),
+            theme.foreground,
+        )
+    });
+    let selections = selection_quads(
+        &lines,
+        &text,
+        &selected,
+        bounds,
+        line_height,
+        scroll,
+        theme.selection.opacity(0.4),
+    );
+    Painted {
+        line: None,
+        lines,
+        caret,
+        selection: None,
+        selections,
+    }
+}
+
+fn point_of(
+    offset: usize,
+    lines: &[WrappedLine],
+    content: &str,
+    line_height: Pixels,
+) -> Option<Point<Pixels>> {
+    if lines.is_empty() {
+        return Some(point(px(0.), px(0.)));
+    }
+    let mut at = 0usize;
+    let mut top = px(0.);
+    for (index, line) in lines.iter().enumerate() {
+        let len = line.len();
+        let last = index + 1 == lines.len();
+        if offset <= at + len || last {
+            let local = offset.saturating_sub(at).min(len);
+            let pos = line
+                .position_for_index(local, line_height)
+                .unwrap_or(point(px(0.), px(0.)));
+            return Some(point(pos.x, top + pos.y));
+        }
+        at += len;
+        if content[at..].starts_with('\n') {
+            at += 1;
+        }
+        top += line_height * (line.wrap_boundaries.len() + 1) as f32;
+    }
+    None
+}
+
+fn scrolled(
+    scroll: usize,
+    visual: usize,
+    cursor: usize,
+    lines: &[WrappedLine],
+    content: &str,
+    line_height: Pixels,
+) -> usize {
+    let max_scroll = visual.saturating_sub(super::GROWING_ROWS);
+    let mut scroll = scroll.min(max_scroll);
+    let Some(origin) = point_of(cursor, lines, content, line_height) else {
+        return scroll;
+    };
+    if line_height == px(0.) {
+        return scroll;
+    }
+    let row = (origin.y / line_height) as usize;
+    if row < scroll {
+        scroll = row;
+    } else if row >= scroll + super::GROWING_ROWS {
+        scroll = row + 1 - super::GROWING_ROWS;
+    }
+    scroll.min(max_scroll)
+}
+
+fn selection_quads(
+    lines: &[WrappedLine],
+    content: &str,
+    selected: &std::ops::Range<usize>,
+    bounds: Bounds<Pixels>,
+    line_height: Pixels,
+    scroll: usize,
+    color: gpui::Hsla,
+) -> Vec<PaintQuad> {
+    if selected.is_empty() {
+        return Vec::new();
+    }
+    let mut quads = Vec::new();
+    let mut at = 0usize;
+    let mut top = px(0.);
+    for line in lines {
+        let len = line.len();
+        let mut local_start = 0usize;
+        let mut breaks = line
+            .wrap_boundaries
+            .iter()
+            .map(|boundary| {
+                line.unwrapped_layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index
+            })
+            .collect::<Vec<_>>();
+        breaks.push(len);
+        for local_end in breaks {
+            let start = at + local_start;
+            let end = at + local_end;
+            let from = selected.start.max(start);
+            let to = selected.end.min(end);
+            if from < to {
+                let x = |offset: usize| {
+                    line.position_for_index(offset - at, line_height)
+                        .map(|pos| pos.x)
+                        .unwrap_or(px(0.))
+                };
+                let y = bounds.top() + top - line_height * scroll as f32;
+                quads.push(fill(
+                    Bounds::from_corners(
+                        point(bounds.left() + x(from), y),
+                        point(bounds.left() + x(to), y + line_height),
+                    ),
+                    color,
+                ));
+            }
+            local_start = local_end;
+            top += line_height;
+        }
+        at += len;
+        if content[at..].starts_with('\n') {
+            at += 1;
+        }
+    }
+    quads
+}
+
 impl Render for Input {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.theme();
-        let height = match self.compact {
-            true => theme.metrics.control_small,
-            false => theme.metrics.field,
+        let line = window.line_height();
+        let height = match self.growing {
+            true => {
+                let rows = self.rows.clamp(1, super::GROWING_ROWS);
+                let text = line * rows as f32;
+                // One line shares the pill with the icon and send button. Match
+                // those controls so the line has equal space above and below.
+                match rows == 1 {
+                    true => text.max(theme.metrics.control_small + px(2.)),
+                    false => text,
+                }
+            }
+            false => match self.compact {
+                true => theme.metrics.control_small,
+                false => theme.metrics.field,
+            },
         };
         let radius = match self.tucked {
             true => crate::tucked(theme.radius, window),
@@ -349,6 +625,11 @@ impl Render for Input {
             .on_action(cx.listener(Self::end))
             .on_action(cx.listener(Self::select_home))
             .on_action(cx.listener(Self::select_end))
+            .on_action(cx.listener(Self::newline))
+            .on_action(cx.listener(Self::up))
+            .on_action(cx.listener(Self::down))
+            .on_action(cx.listener(Self::select_up))
+            .on_action(cx.listener(Self::select_down))
             .on_action(cx.listener(Self::space))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::cut))

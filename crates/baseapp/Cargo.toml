@@ -8,10 +8,22 @@ license.workspace = true
 profiler = ["gpui/profiler"]
 
 [dependencies]
+anyhow.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+dirs = "6"
 env_logger.workspace = true
+futures.workspace = true
+matrix-sdk.workspace = true
+ruma.workspace = true
+rumpeg = "0.1.4"
+serde.workspace = true
+serde_json = "1"
+tokio.workspace = true
 log.workspace = true
+mime = "0.3"
 gpui.workspace = true
 gpui_platform.workspace = true
+image = { workspace = true, features = ["bmp"] }
 i18n.workspace = true
 icons.workspace = true
 ui.workspace = true

@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use gpui::prelude::*;
 use gpui::{
     AnyWindowHandle, App, Context, DragMoveEvent, Empty, EntityId, ListState, MouseButton,
-    MouseDownEvent, Pixels, Point, Render, ScrollHandle, SpringConfig, Task, WeakEntity, Window,
-    anchored, deferred, div, img, point, px,
+    MouseDownEvent, Pixels, Point, Render, ScrollHandle, SharedString, SpringConfig, Task,
+    WeakEntity, Window, anchored, deferred, div, img, point, px,
 };
 
 use crate::glide::Glide;
@@ -132,6 +132,7 @@ pub fn quantize(scroll: &ScrollHandle, window: &Window) {
 }
 
 pub struct Scrollbar {
+    name: SharedString,
     scroll: ScrollHandle,
     list: Option<ListState>,
     seen: Pixels,
@@ -153,6 +154,7 @@ pub struct Scrollbar {
 impl Scrollbar {
     pub fn new(scroll: ScrollHandle) -> Self {
         Self {
+            name: "scrollbar".into(),
             scroll,
             list: None,
             seen: Pixels::ZERO,
@@ -182,6 +184,12 @@ impl Scrollbar {
         let mut scrollbar = Self::new(ScrollHandle::new());
         scrollbar.list = Some(list);
         scrollbar
+    }
+
+    /// Gives this bar its own element id, so two bars in one window do not share hover state.
+    pub fn named(mut self, name: impl Into<SharedString>) -> Self {
+        self.name = name.into();
+        self
     }
 
     pub fn always_visible(mut self) -> Self {
@@ -582,8 +590,9 @@ impl Render for Scrollbar {
         let anchor = self.middle_scroll.map(|middle| middle.origin);
         let marker = theme.metrics.control;
 
+        let thumb_id = SharedString::from(format!("{}-thumb", self.name));
         div()
-            .id("scrollbar")
+            .id(self.name.clone())
             .occlude()
             .absolute()
             .top(self.track_inset + self.track_top)
@@ -614,7 +623,7 @@ impl Render for Scrollbar {
             )
             .child(
                 div()
-                    .id("scrollbar-thumb")
+                    .id(thumb_id)
                     .absolute()
                     .top(travel * progress)
                     .right(THUMB_INSET + REACH)

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Huddle
+GenericName=Chat
+Comment=A Matrix chat client
+Icon=huddle
+Exec=huddle
+Terminal=false
+Categories=Network;InstantMessaging;
+StartupWMClass=baseapp
+StartupNotify=true

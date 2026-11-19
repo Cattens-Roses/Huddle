@@ -1,0 +1,1875 @@
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use anyhow::{Context as _, Result, anyhow};
+use futures::StreamExt as _;
+use futures::channel::mpsc as ui;
+use matrix_sdk::attachment::{AttachmentConfig, AttachmentInfo, BaseImageInfo};
+use matrix_sdk::authentication::matrix::MatrixSession;
+use matrix_sdk::config::SyncSettings;
+use matrix_sdk::deserialized_responses::RawSyncOrStrippedState;
+use matrix_sdk::encryption::recovery::RecoveryState;
+use matrix_sdk::encryption::verification::{
+    SasState, SasVerification, Verification, VerificationRequest, VerificationRequestState,
+};
+use matrix_sdk::encryption::{BackupDownloadStrategy, EncryptionSettings, VerificationState};
+use matrix_sdk::media::{MediaFormat, MediaRequestParameters, MediaThumbnailSettings};
+use matrix_sdk::room::reply::{EnforceThread, Reply as RoomReply};
+use matrix_sdk::room::{IncludeRelations, MessagesOptions, RelationsOptions};
+use matrix_sdk::ruma::api::Direction;
+use matrix_sdk::ruma::api::client::account::{register, request_registration_token_via_email};
+use matrix_sdk::ruma::api::client::receipt::create_receipt::v3::ReceiptType;
+use matrix_sdk::ruma::api::client::room::create_room;
+use matrix_sdk::ruma::api::client::uiaa::{self, AuthData, AuthType, UiaaInfo};
+use matrix_sdk::ruma::api::error::ErrorKind;
+use matrix_sdk::ruma::events::key::verification::request::ToDeviceKeyVerificationRequestEvent;
+use matrix_sdk::ruma::events::reaction::ReactionEventContent;
+use matrix_sdk::ruma::events::receipt::ReceiptThread;
+use matrix_sdk::ruma::events::relation::{Annotation, RelationType, Thread};
+use matrix_sdk::ruma::events::room::MediaSource;
+use matrix_sdk::ruma::events::room::encrypted;
+use matrix_sdk::ruma::events::room::message::{
+    AddMentions, FormattedBody, ForwardThread, MessageFormat, MessageType,
+    OriginalSyncRoomMessageEvent, Relation, ReplacementMetadata, ReplyMetadata, ReplyWithinThread,
+    RoomMessageEventContent, TextMessageEventContent,
+};
+use matrix_sdk::ruma::events::room::redaction::SyncRoomRedactionEvent;
+use matrix_sdk::ruma::events::space::child::SpaceChildEventContent;
+use matrix_sdk::ruma::events::{
+    AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent, SyncStateEvent,
+};
+use matrix_sdk::ruma::media::Method;
+use matrix_sdk::ruma::serde::Raw;
+use matrix_sdk::ruma::{
+    ClientSecret, EventId, MilliSecondsSinceUnixEpoch, OwnedClientSecret, OwnedEventId,
+    OwnedMxcUri, OwnedRoomId, OwnedRoomOrAliasId, OwnedSessionId, OwnedUserId, UInt, UserId,
+};
+use matrix_sdk::{Client, ClientBuilder, LoopCtrl, Room, RoomMemberships, RoomState};
+use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
+use super::rich::{self, Rich};
+
+const DEVICE_NAME: &str = "Huddle";
+const HISTORY: u32 = 60;
+const PAGE: usize = 20;
+const MEMBERS: usize = 300;
+const THREAD: u32 = 100;
+pub const SIGN_UP: &str = "https://app.element.io/#/register";
+const NO_IDENTITY: &str =
+    "Your account has no other verified device yet. Use your recovery key instead, or set one up.";
+const WRONG_KEY: &str = "That key didn't work. Check it and try again.";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RoomKind {
+    Room,
+    Direct,
+    Space,
+}
+
+#[derive(Clone)]
+pub struct RoomSummary {
+    pub id: OwnedRoomId,
+    pub name: String,
+    pub topic: Option<String>,
+    pub avatar: Option<OwnedMxcUri>,
+    pub kind: RoomKind,
+    pub invite: bool,
+    pub encrypted: bool,
+    pub unread: u64,
+    pub mentions: u64,
+    pub members: u64,
+    pub children: Vec<OwnedRoomId>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MessageKind {
+    Text,
+    Emote,
+    Notice,
+    Image,
+    Attachment,
+    Encrypted,
+}
+
+#[derive(Clone)]
+pub struct Picture {
+    pub key: String,
+    pub source: MediaSource,
+    pub width: u32,
+    pub height: u32,
+    pub name: String,
+}
+
+#[derive(Clone)]
+pub struct Reaction {
+    pub key: String,
+    pub senders: Vec<(OwnedUserId, OwnedEventId)>,
+}
+
+#[derive(Clone)]
+pub struct Message {
+    pub id: Option<OwnedEventId>,
+    pub local: Option<u64>,
+    pub sender: OwnedUserId,
+    pub sender_name: String,
+    pub avatar: Option<OwnedMxcUri>,
+    pub body: String,
+    pub rich: Rich,
+    pub kind: MessageKind,
+    pub picture: Option<Picture>,
+    pub timestamp: i64,
+    pub edited: bool,
+    pub reply: Option<OwnedEventId>,
+    pub thread: Option<OwnedEventId>,
+    pub replies: u64,
+    pub reactions: Vec<Reaction>,
+}
+
+pub enum Event {
+    Message(Message),
+    Edit {
+        target: OwnedEventId,
+        sender: OwnedUserId,
+        body: String,
+        rich: Rich,
+    },
+    React {
+        target: OwnedEventId,
+        key: String,
+        sender: OwnedUserId,
+        id: OwnedEventId,
+    },
+    Redact(OwnedEventId),
+}
+
+#[derive(Clone)]
+pub struct Member {
+    pub id: OwnedUserId,
+    pub name: String,
+    pub avatar: Option<OwnedMxcUri>,
+    pub power: i64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Recovery {
+    Unknown,
+    Enabled,
+    Disabled,
+    Incomplete,
+}
+
+pub enum Verify {
+    Incoming,
+    Waiting,
+    Emojis(Vec<(String, String)>),
+    Done,
+    Cancelled(String),
+}
+
+#[derive(Clone)]
+pub enum Step {
+    Token,
+    Terms(Vec<(String, String)>),
+    Captcha(String),
+    Email,
+    EmailSent(String),
+    Website(String),
+}
+
+pub enum Answer {
+    Token(String),
+    Terms,
+    Captcha,
+    Email(String),
+    EmailConfirmed,
+}
+
+pub enum Command {
+    SignIn {
+        server: String,
+        username: String,
+        password: String,
+    },
+    SignUp {
+        server: String,
+        username: String,
+        password: String,
+    },
+    Answer(Answer),
+    CancelSignUp,
+    SignOut,
+    Open {
+        room: OwnedRoomId,
+        history: bool,
+    },
+    Older {
+        room: OwnedRoomId,
+        from: String,
+    },
+    Thread {
+        room: OwnedRoomId,
+        root: OwnedEventId,
+    },
+    Send {
+        room: OwnedRoomId,
+        body: String,
+        local: u64,
+        reply: Option<(OwnedEventId, OwnedUserId)>,
+        thread: Option<(OwnedEventId, OwnedEventId)>,
+    },
+    Picture {
+        room: OwnedRoomId,
+        name: String,
+        mime: String,
+        bytes: Vec<u8>,
+        width: u32,
+        height: u32,
+        caption: String,
+        local: u64,
+        reply: Option<(OwnedEventId, OwnedUserId)>,
+        thread: Option<(OwnedEventId, OwnedEventId)>,
+    },
+    Profile {
+        name: String,
+        bytes: Option<Vec<u8>>,
+        mime: Option<String>,
+        remove: bool,
+    },
+    Edit {
+        room: OwnedRoomId,
+        event: OwnedEventId,
+        body: String,
+    },
+    React {
+        room: OwnedRoomId,
+        event: OwnedEventId,
+        key: String,
+    },
+    Redact {
+        room: OwnedRoomId,
+        event: OwnedEventId,
+    },
+    Read {
+        room: OwnedRoomId,
+        event: OwnedEventId,
+    },
+    Fetch {
+        key: String,
+        source: MediaSource,
+        size: Option<(u32, u32, bool)>,
+    },
+    Join(String),
+    Create(String),
+    Talk(String),
+    Accept(OwnedRoomId),
+    Leave(OwnedRoomId),
+    Verify,
+    AcceptVerify,
+    Match(bool),
+    CancelVerify,
+    Recover(String),
+    SetUpRecovery,
+}
+
+pub enum Update {
+    SignedOut,
+    SigningIn,
+    SignInFailed(String),
+    SignUp(Step),
+    SignUpFailed(String),
+    SignedIn {
+        user: OwnedUserId,
+        name: String,
+        avatar: Option<OwnedMxcUri>,
+    },
+    Profile {
+        name: String,
+        avatar: Option<OwnedMxcUri>,
+    },
+    Rooms(Vec<RoomSummary>),
+    History {
+        room: OwnedRoomId,
+        events: Vec<Event>,
+        token: Option<String>,
+        older: bool,
+    },
+    Thread {
+        room: OwnedRoomId,
+        root: OwnedEventId,
+        events: Vec<Event>,
+    },
+    Members {
+        room: OwnedRoomId,
+        members: Vec<Member>,
+    },
+    Live {
+        room: OwnedRoomId,
+        event: Event,
+    },
+    Sent {
+        room: OwnedRoomId,
+        local: u64,
+        event: Option<OwnedEventId>,
+    },
+    Opened(OwnedRoomId),
+    Media {
+        key: String,
+        bytes: Option<Vec<u8>>,
+    },
+    Security {
+        verified: bool,
+        recovery: Recovery,
+    },
+    Verify(Verify),
+    RecoveryKey(String),
+    Recovered,
+    Failed(String),
+}
+
+#[derive(Serialize, Deserialize)]
+struct Saved {
+    homeserver: String,
+    session: MatrixSession,
+    #[serde(default)]
+    store: Option<String>,
+}
+
+type Outbox = ui::UnboundedSender<Update>;
+
+fn post(outbox: &Outbox, update: Update) {
+    outbox.unbounded_send(update).ok();
+}
+
+pub fn start() -> (
+    mpsc::UnboundedSender<Command>,
+    ui::UnboundedReceiver<Update>,
+) {
+    let (commands, inbox) = mpsc::unbounded_channel();
+    let (outbox, updates) = ui::unbounded();
+    std::thread::Builder::new()
+        .name("matrix".into())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to start the Matrix runtime");
+            runtime.block_on(Worker::new(outbox).run(inbox));
+        })
+        .expect("failed to spawn the Matrix thread");
+    (commands, updates)
+}
+
+fn home() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|root| root.join("Huddle"))
+}
+
+fn session_path() -> Option<PathBuf> {
+    home().map(|home| home.join("session.json"))
+}
+
+fn store_path(name: &str) -> Result<PathBuf> {
+    home()
+        .map(|home| home.join(name))
+        .ok_or_else(|| anyhow!("no data directory"))
+}
+
+fn fresh_store() -> String {
+    format!("store-{}", chrono::Utc::now().timestamp_millis())
+}
+
+/// Removes the saved session and every local store, so the next account starts clean.
+fn forget() {
+    let Some(home) = home() else { return };
+    std::fs::remove_file(home.join("session.json")).ok();
+    let Ok(entries) = std::fs::read_dir(&home) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with("store") {
+            std::fs::remove_dir_all(entry.path()).ok();
+        }
+    }
+}
+
+fn builder() -> ClientBuilder {
+    let mut settings = EncryptionSettings::default();
+    settings.auto_enable_cross_signing = true;
+    settings.auto_enable_backups = true;
+    settings.backup_download_strategy = BackupDownloadStrategy::OneShot;
+    Client::builder().with_encryption_settings(settings)
+}
+
+fn persist(client: &Client, store: &str) -> Result<()> {
+    let session = client
+        .matrix_auth()
+        .session()
+        .ok_or_else(|| anyhow!("the server did not return a session"))?;
+    let saved = Saved {
+        homeserver: client.homeserver().to_string(),
+        session,
+        store: Some(store.to_owned()),
+    };
+    if let Some(path) = session_path() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, serde_json::to_string(&saved)?)?;
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct Shared {
+    request: Mutex<Option<VerificationRequest>>,
+    sas: Mutex<Option<SasVerification>>,
+}
+
+impl Shared {
+    fn request(&self) -> Option<VerificationRequest> {
+        self.request.lock().ok().and_then(|request| request.clone())
+    }
+
+    fn sas(&self) -> Option<SasVerification> {
+        self.sas.lock().ok().and_then(|sas| sas.clone())
+    }
+
+    fn set_request(&self, request: Option<VerificationRequest>) {
+        if let Ok(mut slot) = self.request.lock() {
+            *slot = request;
+        }
+    }
+
+    fn set_sas(&self, sas: Option<SasVerification>) {
+        if let Ok(mut slot) = self.sas.lock() {
+            *slot = sas;
+        }
+    }
+}
+
+struct SignUp {
+    client: Client,
+    store: String,
+    username: String,
+    password: String,
+    session: Option<String>,
+    email: Option<(OwnedClientSecret, OwnedSessionId)>,
+    attempt: u32,
+}
+
+struct Worker {
+    outbox: Outbox,
+    client: Option<Client>,
+    tasks: Vec<JoinHandle<()>>,
+    shared: Arc<Shared>,
+    signup: Option<SignUp>,
+}
+
+impl Worker {
+    fn new(outbox: Outbox) -> Self {
+        Self {
+            outbox,
+            client: None,
+            tasks: Vec::new(),
+            shared: Arc::default(),
+            signup: None,
+        }
+    }
+
+    async fn run(mut self, mut inbox: mpsc::UnboundedReceiver<Command>) {
+        match self.restore().await {
+            Ok(true) => {}
+            Ok(false) => post(&self.outbox, Update::SignedOut),
+            Err(error) => {
+                log::warn!("matrix: could not restore the session: {error:#}");
+                post(&self.outbox, Update::SignedOut);
+            }
+        }
+
+        while let Some(command) = inbox.recv().await {
+            match command {
+                Command::SignIn {
+                    server,
+                    username,
+                    password,
+                } => {
+                    self.signup = None;
+                    post(&self.outbox, Update::SigningIn);
+                    if let Err(error) = self.sign_in(&server, &username, &password).await {
+                        log::warn!("matrix: sign in failed: {error:#}");
+                        post(&self.outbox, Update::SignInFailed(sign_in_problem(&error)));
+                    }
+                }
+                Command::SignUp {
+                    server,
+                    username,
+                    password,
+                } => {
+                    if let Err(error) = self.sign_up(&server, &username, &password).await {
+                        log::warn!("matrix: sign up failed: {error:#}");
+                        post(&self.outbox, Update::SignUpFailed(sign_up_problem(&error)));
+                    }
+                }
+                Command::Answer(answer) => {
+                    if let Err(error) = self.answer(answer).await {
+                        log::warn!("matrix: sign up step failed: {error:#}");
+                        post(&self.outbox, Update::SignUpFailed(sign_up_problem(&error)));
+                    }
+                }
+                Command::CancelSignUp => self.signup = None,
+                Command::SignOut => self.sign_out().await,
+                command => {
+                    let Some(client) = self.client.clone() else {
+                        continue;
+                    };
+                    let outbox = self.outbox.clone();
+                    let shared = self.shared.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = handle(&client, &outbox, &shared, command).await {
+                            log::warn!("matrix: {error:#}");
+                            post(&outbox, Update::Failed(problem(&error)));
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    async fn restore(&mut self) -> Result<bool> {
+        let Some(path) = session_path() else {
+            return Ok(false);
+        };
+        let Ok(json) = std::fs::read_to_string(&path) else {
+            return Ok(false);
+        };
+        let saved: Saved = serde_json::from_str(&json)?;
+        let store = saved.store.unwrap_or_else(|| "store".to_owned());
+        let client = builder()
+            .homeserver_url(&saved.homeserver)
+            .sqlite_store(store_path(&store)?, None)
+            .build()
+            .await?;
+        client.restore_session(saved.session).await?;
+        self.begin(client).await;
+        Ok(true)
+    }
+
+    async fn sign_in(&mut self, server: &str, username: &str, password: &str) -> Result<()> {
+        let username = username.trim();
+        let server = match username.strip_prefix('@').and_then(|id| id.split_once(':')) {
+            Some((_, host)) => host,
+            None => server.trim(),
+        };
+        let server = if server.is_empty() {
+            "matrix.org"
+        } else {
+            server
+        };
+
+        forget();
+        let store = fresh_store();
+        let client = builder()
+            .server_name_or_homeserver_url(server)
+            .sqlite_store(store_path(&store)?, None)
+            .build()
+            .await
+            .context("unreachable")?;
+        client
+            .matrix_auth()
+            .login_username(username, password)
+            .initial_device_display_name(DEVICE_NAME)
+            .await?;
+        persist(&client, &store)?;
+        self.begin(client).await;
+        Ok(())
+    }
+
+    async fn sign_up(&mut self, server: &str, username: &str, password: &str) -> Result<()> {
+        let username = username.trim().trim_start_matches('@');
+        let (username, server) = match username.split_once(':') {
+            Some((name, host)) => (name, host),
+            None => (username, server.trim()),
+        };
+        let server = if server.is_empty() {
+            "matrix.org"
+        } else {
+            server
+        };
+
+        self.signup = None;
+        forget();
+        let store = fresh_store();
+        let client = builder()
+            .server_name_or_homeserver_url(server)
+            .sqlite_store(store_path(&store)?, None)
+            .build()
+            .await
+            .context("unreachable")?;
+
+        if let Ok(metadata) = client.oauth().server_metadata().await {
+            let page = metadata
+                .issuer
+                .join("register")
+                .map_or_else(|_| SIGN_UP.to_owned(), |page| page.to_string());
+            post(&self.outbox, Update::SignUp(Step::Website(page)));
+            return Ok(());
+        }
+
+        self.signup = Some(SignUp {
+            client,
+            store,
+            username: username.to_lowercase(),
+            password: password.to_owned(),
+            session: None,
+            email: None,
+            attempt: 0,
+        });
+        self.register(None).await
+    }
+
+    async fn answer(&mut self, answer: Answer) -> Result<()> {
+        let Some(signup) = self.signup.as_mut() else {
+            return Ok(());
+        };
+        let session = signup.session.clone();
+        let auth = match answer {
+            Answer::Token(token) => {
+                let mut data = uiaa::RegistrationToken::new(token.trim().to_owned());
+                data.session = session;
+                AuthData::RegistrationToken(data)
+            }
+            Answer::Terms => {
+                let mut data = uiaa::Terms::new();
+                data.session = session;
+                AuthData::Terms(data)
+            }
+            Answer::Captcha => AuthData::FallbackAcknowledgement(
+                uiaa::FallbackAcknowledgement::new(session.unwrap_or_default()),
+            ),
+            Answer::Email(address) => {
+                let secret = ClientSecret::new();
+                signup.attempt += 1;
+                let request = request_registration_token_via_email::v3::Request::new(
+                    secret.clone(),
+                    address.trim().to_owned(),
+                    UInt::from(signup.attempt),
+                );
+                let response = signup.client.send(request).await?;
+                signup.email = Some((secret, response.sid));
+                post(&self.outbox, Update::SignUp(Step::EmailSent(address)));
+                return Ok(());
+            }
+            Answer::EmailConfirmed => {
+                let Some((secret, sid)) = signup.email.clone() else {
+                    return Ok(());
+                };
+                let serde_json::Value::Object(data) = serde_json::json!({
+                    "threepid_creds": { "sid": sid, "client_secret": secret },
+                }) else {
+                    return Ok(());
+                };
+                AuthData::new("m.login.email.identity", session, data)?
+            }
+        };
+        self.register(Some(auth)).await
+    }
+
+    async fn register(&mut self, mut auth: Option<AuthData>) -> Result<()> {
+        let Some(signup) = self.signup.as_mut() else {
+            return Ok(());
+        };
+        for _ in 0..4 {
+            let mut request = register::v3::Request::new();
+            request.username = Some(signup.username.clone());
+            request.password = Some(signup.password.clone());
+            request.initial_device_display_name = Some(DEVICE_NAME.to_owned());
+            request.auth = auth.take();
+            let error = match signup.client.matrix_auth().register(request).await {
+                Ok(_) => {
+                    let SignUp { client, store, .. } = self.signup.take().expect("checked above");
+                    persist(&client, &store)?;
+                    self.begin(client).await;
+                    return Ok(());
+                }
+                Err(error) => error,
+            };
+            let Some(info) = error.as_uiaa_response().cloned() else {
+                return Err(error.into());
+            };
+            signup.session = info.session.clone();
+            if info.auth_error.is_some() {
+                post(
+                    &self.outbox,
+                    Update::SignUpFailed("That didn't work. Check it and try again.".into()),
+                );
+            }
+            let step = match next_stage(&info) {
+                Some(AuthType::Dummy) => {
+                    let mut data = uiaa::Dummy::new();
+                    data.session = info.session.clone();
+                    auth = Some(AuthData::Dummy(data));
+                    continue;
+                }
+                Some(AuthType::RegistrationToken) => Step::Token,
+                Some(AuthType::Terms) => Step::Terms(policies(&info)),
+                Some(AuthType::ReCaptcha) => {
+                    let page = signup
+                        .client
+                        .homeserver()
+                        .join(&format!(
+                            "_matrix/client/v3/auth/m.login.recaptcha/fallback/web?session={}",
+                            info.session.clone().unwrap_or_default()
+                        ))
+                        .map_or_else(|_| SIGN_UP.to_owned(), |page| page.to_string());
+                    Step::Captcha(page)
+                }
+                Some(AuthType::EmailIdentity) => Step::Email,
+                _ => Step::Website(SIGN_UP.to_owned()),
+            };
+            post(&self.outbox, Update::SignUp(step));
+            return Ok(());
+        }
+        Err(anyhow!("the server kept asking for more steps"))
+    }
+
+    async fn sign_out(&mut self) {
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
+        self.shared.set_request(None);
+        self.shared.set_sas(None);
+        if let Some(client) = self.client.take()
+            && let Err(error) = client.logout().await
+        {
+            log::warn!("matrix: could not sign out on the server: {error}");
+        }
+        forget();
+        post(&self.outbox, Update::SignedOut);
+    }
+
+    async fn begin(&mut self, client: Client) {
+        let Some(user) = client.user_id().map(UserId::to_owned) else {
+            return;
+        };
+        let account = client.account();
+        let name = account
+            .get_display_name()
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| user.localpart().to_owned());
+        let avatar = account.get_avatar_url().await.ok().flatten();
+        post(&self.outbox, Update::SignedIn { user, name, avatar });
+
+        let outbox = self.outbox.clone();
+        client.add_event_handler(move |raw: Raw<AnySyncTimelineEvent>, room: Room| {
+            let outbox = outbox.clone();
+            async move {
+                if let Some(event) = parse(&room, &raw).await {
+                    let room = room.room_id().to_owned();
+                    post(&outbox, Update::Live { room, event });
+                }
+            }
+        });
+
+        let outbox = self.outbox.clone();
+        let shared = self.shared.clone();
+        client.add_event_handler(
+            move |event: ToDeviceKeyVerificationRequestEvent, client: Client| {
+                let outbox = outbox.clone();
+                let shared = shared.clone();
+                async move {
+                    let Some(request) = client
+                        .encryption()
+                        .get_verification_request(&event.sender, &event.content.transaction_id)
+                        .await
+                    else {
+                        return;
+                    };
+                    if !request.is_self_verification() {
+                        return;
+                    }
+                    shared.set_request(Some(request));
+                    post(&outbox, Update::Verify(Verify::Incoming));
+                }
+            },
+        );
+
+        let outbox = self.outbox.clone();
+        let watched = client.clone();
+        self.tasks.push(tokio::spawn(async move {
+            let encryption = watched.encryption();
+            let mut verification = encryption.verification_state();
+            let mut recovery = encryption.recovery().state_stream();
+            security(&watched, &outbox);
+            loop {
+                tokio::select! {
+                    Some(_) = verification.next() => security(&watched, &outbox),
+                    Some(_) = recovery.next() => security(&watched, &outbox),
+                    else => break,
+                }
+            }
+        }));
+
+        post(&self.outbox, Update::Rooms(summaries(&client).await));
+
+        let outbox = self.outbox.clone();
+        let syncing = client.clone();
+        self.tasks.push(tokio::spawn(async move {
+            let settings = SyncSettings::default().timeout(Duration::from_secs(30));
+            let result = syncing
+                .sync_with_callback(settings, |_| {
+                    let client = syncing.clone();
+                    let outbox = outbox.clone();
+                    async move {
+                        post(&outbox, Update::Rooms(summaries(&client).await));
+                        LoopCtrl::Continue
+                    }
+                })
+                .await;
+            if let Err(error) = result {
+                log::warn!("matrix: sync stopped: {error}");
+                if matches!(
+                    error.client_api_error_kind(),
+                    Some(ErrorKind::UnknownToken(_))
+                ) {
+                    forget();
+                    post(&outbox, Update::SignedOut);
+                } else {
+                    post(
+                        &outbox,
+                        Update::Failed(
+                            "Lost the connection to your server. Restart Huddle to reconnect."
+                                .into(),
+                        ),
+                    );
+                }
+            }
+        }));
+        self.client = Some(client);
+    }
+}
+
+fn security(client: &Client, outbox: &Outbox) {
+    let encryption = client.encryption();
+    let verified = encryption.verification_state().get() == VerificationState::Verified;
+    let recovery = match encryption.recovery().state() {
+        RecoveryState::Enabled => Recovery::Enabled,
+        RecoveryState::Disabled => Recovery::Disabled,
+        RecoveryState::Incomplete => Recovery::Incomplete,
+        _ => Recovery::Unknown,
+    };
+    post(outbox, Update::Security { verified, recovery });
+}
+
+fn next_stage(info: &UiaaInfo) -> Option<AuthType> {
+    let supported = |stage: &AuthType| {
+        matches!(
+            stage,
+            AuthType::Dummy
+                | AuthType::RegistrationToken
+                | AuthType::Terms
+                | AuthType::ReCaptcha
+                | AuthType::EmailIdentity
+        )
+    };
+    let effort = |stages: &[AuthType]| {
+        stages
+            .iter()
+            .filter(|stage| matches!(stage, AuthType::ReCaptcha | AuthType::EmailIdentity))
+            .count()
+    };
+    let flow = info
+        .flows
+        .iter()
+        .filter(|flow| flow.stages.iter().all(supported))
+        .min_by_key(|flow| effort(&flow.stages))?;
+    flow.stages
+        .iter()
+        .find(|stage| !info.completed.contains(stage))
+        .cloned()
+}
+
+fn policies(info: &UiaaInfo) -> Vec<(String, String)> {
+    let Some(params) = &info.params else {
+        return Vec::new();
+    };
+    let Ok(params) = serde_json::from_str::<serde_json::Value>(params.get()) else {
+        return Vec::new();
+    };
+    let Some(policies) = params["m.login.terms"]["policies"].as_object() else {
+        return Vec::new();
+    };
+    policies
+        .values()
+        .filter_map(|policy| {
+            let policy = policy.as_object()?;
+            let translation = policy
+                .get("en")
+                .or_else(|| policy.values().find(|value| value.is_object()))?;
+            Some((
+                translation["name"].as_str()?.to_owned(),
+                translation["url"].as_str()?.to_owned(),
+            ))
+        })
+        .collect()
+}
+
+async fn handle(
+    client: &Client,
+    outbox: &Outbox,
+    shared: &Arc<Shared>,
+    command: Command,
+) -> Result<()> {
+    match command {
+        Command::Open { room: id, history } => {
+            let room = joined(client, &id)?;
+            if history {
+                let (events, token) = page(&room, None).await?;
+                let latest = events.iter().rev().find_map(|event| match event {
+                    Event::Message(message) => message.id.clone(),
+                    _ => None,
+                });
+                post(
+                    outbox,
+                    Update::History {
+                        room: id.clone(),
+                        events,
+                        token,
+                        older: false,
+                    },
+                );
+                if let Some(latest) = latest {
+                    read(&room, latest).await;
+                }
+            }
+
+            let mut members = Vec::new();
+            for member in room.members_no_sync(RoomMemberships::JOIN).await? {
+                members.push(Member {
+                    id: member.user_id().to_owned(),
+                    name: member.name().to_owned(),
+                    avatar: member.avatar_url().map(ToOwned::to_owned),
+                    power: match member.normalized_power_level() {
+                        matrix_sdk::ruma::events::room::power_levels::UserPowerLevel::Infinite => {
+                            100
+                        }
+                        matrix_sdk::ruma::events::room::power_levels::UserPowerLevel::Int(
+                            level,
+                        ) => i64::from(level),
+                        _ => 0,
+                    },
+                });
+            }
+            members.sort_by(|a, b| {
+                b.power
+                    .cmp(&a.power)
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            });
+            members.truncate(MEMBERS);
+            post(outbox, Update::Members { room: id, members });
+        }
+        Command::Older { room: id, from } => {
+            let room = joined(client, &id)?;
+            let (events, token) = page(&room, Some(from)).await?;
+            post(
+                outbox,
+                Update::History {
+                    room: id,
+                    events,
+                    token,
+                    older: true,
+                },
+            );
+        }
+        Command::Thread { room: id, root } => {
+            let room = joined(client, &id)?;
+            let mut options = RelationsOptions::default();
+            options.dir = Direction::Backward;
+            options.limit = Some(UInt::from(THREAD));
+            options.include_relations = IncludeRelations::RelationsOfType(RelationType::Thread);
+            let relations = room.relations(root.clone(), options).await?;
+            let mut events = Vec::new();
+            for event in relations.chunk.iter().rev() {
+                if let Some(event) = parse(&room, event.raw()).await {
+                    events.push(event);
+                }
+            }
+            post(
+                outbox,
+                Update::Thread {
+                    room: id,
+                    root,
+                    events,
+                },
+            );
+        }
+        Command::Send {
+            room: id,
+            body,
+            local,
+            reply,
+            thread,
+        } => {
+            let room = joined(client, &id)?;
+            let mut content = RoomMessageEventContent::text_markdown(&body);
+            if let Some((event, sender)) = &reply
+                && thread.is_none()
+            {
+                content = content.make_reply_to(
+                    ReplyMetadata::new(event, sender, None),
+                    ForwardThread::No,
+                    AddMentions::Yes,
+                );
+            }
+            if let Some((root, latest)) = thread {
+                content.relates_to = Some(Relation::Thread(match reply {
+                    Some((event, _)) => Thread::reply(root, event),
+                    None => Thread::plain(root, latest),
+                }));
+            }
+            match room.send(content).await {
+                Ok(sent) => post(
+                    outbox,
+                    Update::Sent {
+                        room: id,
+                        local,
+                        event: Some(sent.response.event_id),
+                    },
+                ),
+                Err(error) => {
+                    post(
+                        outbox,
+                        Update::Sent {
+                            room: id,
+                            local,
+                            event: None,
+                        },
+                    );
+                    return Err(anyhow::Error::from(error).context("send"));
+                }
+            }
+        }
+        Command::Picture {
+            room: id,
+            name,
+            mime,
+            bytes,
+            width,
+            height,
+            caption,
+            local,
+            reply,
+            thread,
+        } => {
+            let room = joined(client, &id)?;
+            let mime = mime.parse().unwrap_or(mime::IMAGE_PNG);
+            let mut config = AttachmentConfig::new().info(AttachmentInfo::Image(BaseImageInfo {
+                width: (width > 0).then_some(UInt::from(width)),
+                height: (height > 0).then_some(UInt::from(height)),
+                size: UInt::try_from(bytes.len() as u64).ok(),
+                ..BaseImageInfo::default()
+            }));
+            if !caption.is_empty() {
+                config = config.caption(Some(TextMessageEventContent::markdown(caption)));
+            }
+            if let Some((_, latest)) = thread {
+                let (event_id, within) = match reply {
+                    Some((event, _)) => (event, ReplyWithinThread::Yes),
+                    None => (latest, ReplyWithinThread::No),
+                };
+                config = config.reply(Some(RoomReply {
+                    event_id,
+                    enforce_thread: EnforceThread::Threaded(within),
+                    add_mentions: AddMentions::Yes,
+                }));
+            } else if let Some((event, _)) = reply {
+                config = config.reply(Some(RoomReply {
+                    event_id: event,
+                    enforce_thread: EnforceThread::Unthreaded,
+                    add_mentions: AddMentions::Yes,
+                }));
+            }
+            match room
+                .send_attachment(name, &mime, bytes, config)
+                .store_in_cache()
+                .await
+            {
+                Ok(sent) => post(
+                    outbox,
+                    Update::Sent {
+                        room: id,
+                        local,
+                        event: Some(sent.event_id),
+                    },
+                ),
+                Err(error) => {
+                    post(
+                        outbox,
+                        Update::Sent {
+                            room: id,
+                            local,
+                            event: None,
+                        },
+                    );
+                    return Err(anyhow::Error::from(error).context("upload"));
+                }
+            }
+        }
+        Command::Profile {
+            name,
+            bytes,
+            mime,
+            remove,
+        } => {
+            let account = client.account();
+            let avatar = if let Some(bytes) = bytes {
+                let mime = mime
+                    .and_then(|mime| mime.parse().ok())
+                    .unwrap_or(mime::IMAGE_PNG);
+                Some(account.upload_avatar(&mime, bytes).await?)
+            } else if remove {
+                account.set_avatar_url(None).await?;
+                None
+            } else {
+                account.get_avatar_url().await?
+            };
+            account.set_display_name(Some(&name)).await?;
+            post(outbox, Update::Profile { name, avatar });
+        }
+        Command::Edit {
+            room: id,
+            event,
+            body,
+        } => {
+            let room = joined(client, &id)?;
+            let content = RoomMessageEventContent::text_markdown(&body)
+                .make_replacement(ReplacementMetadata::new(event, None));
+            room.send(content).await?;
+        }
+        Command::React {
+            room: id,
+            event,
+            key,
+        } => {
+            let room = joined(client, &id)?;
+            room.send(ReactionEventContent::new(Annotation::new(event, key)))
+                .await?;
+        }
+        Command::Redact { room: id, event } => {
+            let room = joined(client, &id)?;
+            room.redact(&event, None, None).await?;
+        }
+        Command::Read { room: id, event } => {
+            if let Some(room) = client.get_room(&id) {
+                read(&room, event).await;
+            }
+        }
+        Command::Fetch { key, source, size } => {
+            let media = client.media();
+            let format = match (&source, size) {
+                (MediaSource::Plain(_), Some((width, height, crop))) => {
+                    MediaFormat::Thumbnail(MediaThumbnailSettings::with_method(
+                        if crop { Method::Crop } else { Method::Scale },
+                        UInt::from(width),
+                        UInt::from(height),
+                    ))
+                }
+                _ => MediaFormat::File,
+            };
+            let thumbnail = matches!(format, MediaFormat::Thumbnail(_));
+            let mut bytes = media
+                .get_media_content(
+                    &MediaRequestParameters {
+                        source: source.clone(),
+                        format,
+                    },
+                    true,
+                )
+                .await;
+            if bytes.is_err() && thumbnail {
+                bytes = media
+                    .get_media_content(
+                        &MediaRequestParameters {
+                            source,
+                            format: MediaFormat::File,
+                        },
+                        true,
+                    )
+                    .await;
+            }
+            if let Err(error) = &bytes {
+                log::debug!("matrix: could not load {key}: {error}");
+            }
+            post(
+                outbox,
+                Update::Media {
+                    key,
+                    bytes: bytes.ok(),
+                },
+            );
+        }
+        Command::Join(address) => {
+            let address = room_address(client, &address)?;
+            let room = client.join_room_by_id_or_alias(&address, &[]).await?;
+            opened(client, outbox, room.room_id().to_owned()).await;
+        }
+        Command::Create(name) => {
+            let mut request = create_room::v3::Request::new();
+            request.name = Some(name);
+            let room = client.create_room(request).await?;
+            opened(client, outbox, room.room_id().to_owned()).await;
+        }
+        Command::Talk(user) => {
+            let user = user_address(client, &user)?;
+            let room = match client.get_dm_room(&user) {
+                Some(room) => room,
+                None => client.create_dm(&user).await?,
+            };
+            opened(client, outbox, room.room_id().to_owned()).await;
+        }
+        Command::Accept(id) => {
+            let room = client
+                .get_room(&id)
+                .ok_or_else(|| anyhow!("unknown room"))?;
+            room.join().await?;
+            opened(client, outbox, id).await;
+        }
+        Command::Leave(id) => {
+            let room = client
+                .get_room(&id)
+                .ok_or_else(|| anyhow!("unknown room"))?;
+            room.leave().await?;
+            post(outbox, Update::Rooms(summaries(client).await));
+        }
+        Command::Verify => {
+            let user = client
+                .user_id()
+                .ok_or_else(|| anyhow!("not signed in"))?
+                .to_owned();
+            let identity = client
+                .encryption()
+                .request_user_identity(&user)
+                .await?
+                .ok_or_else(|| anyhow!(NO_IDENTITY))?;
+            let request = identity.request_verification().await?;
+            post(outbox, Update::Verify(Verify::Waiting));
+            watch_request(outbox.clone(), shared.clone(), request);
+        }
+        Command::AcceptVerify => {
+            let request = shared.request().ok_or_else(|| {
+                anyhow!("The request has expired. Start again from the other device.")
+            })?;
+            request.accept().await?;
+            post(outbox, Update::Verify(Verify::Waiting));
+            watch_request(outbox.clone(), shared.clone(), request);
+        }
+        Command::Match(matches) => {
+            let sas = shared
+                .sas()
+                .ok_or_else(|| anyhow!("The comparison has expired. Start again."))?;
+            match matches {
+                true => sas.confirm().await?,
+                false => sas.mismatch().await?,
+            }
+        }
+        Command::CancelVerify => {
+            if let Some(sas) = shared.sas() {
+                sas.cancel().await.ok();
+            }
+            if let Some(request) = shared.request() {
+                request.cancel().await.ok();
+            }
+            shared.set_sas(None);
+            shared.set_request(None);
+        }
+        Command::Recover(key) => {
+            client
+                .encryption()
+                .recovery()
+                .recover(key.trim())
+                .await
+                .map_err(|error| anyhow!(error).context(WRONG_KEY))?;
+            security(client, outbox);
+            post(outbox, Update::Recovered);
+        }
+        Command::SetUpRecovery => {
+            let key = client.encryption().recovery().enable().await.map_err(|error| {
+                anyhow!(error).context(
+                    "Your account already has a recovery key. Enter it instead, or verify with another device.",
+                )
+            })?;
+            post(outbox, Update::RecoveryKey(key));
+            security(client, outbox);
+        }
+        Command::SignIn { .. }
+        | Command::SignUp { .. }
+        | Command::Answer(_)
+        | Command::CancelSignUp
+        | Command::SignOut => {}
+    }
+    Ok(())
+}
+
+fn watch_request(outbox: Outbox, shared: Arc<Shared>, request: VerificationRequest) {
+    shared.set_request(Some(request.clone()));
+    tokio::spawn(async move {
+        let mut changes = request.changes();
+        let mut state = Some(request.state());
+        loop {
+            let current = match state.take() {
+                Some(state) => state,
+                None => match changes.next().await {
+                    Some(state) => state,
+                    None => break,
+                },
+            };
+            match current {
+                VerificationRequestState::Ready { .. } if request.we_started() => {
+                    match request.start_sas().await {
+                        Ok(Some(sas)) => watch_sas(outbox, shared, sas).await,
+                        _ => post(
+                            &outbox,
+                            Update::Verify(Verify::Cancelled(
+                                "Couldn't start comparing emoji.".into(),
+                            )),
+                        ),
+                    }
+                    return;
+                }
+                VerificationRequestState::Transitioned { verification } => {
+                    if let Verification::SasV1(sas) = verification {
+                        if !sas.we_started() {
+                            sas.accept().await.ok();
+                        }
+                        watch_sas(outbox, shared, sas).await;
+                    }
+                    return;
+                }
+                VerificationRequestState::Done => {
+                    post(&outbox, Update::Verify(Verify::Done));
+                    return;
+                }
+                VerificationRequestState::Cancelled(info) => {
+                    post(
+                        &outbox,
+                        Update::Verify(Verify::Cancelled(info.reason().to_owned())),
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
+async fn watch_sas(outbox: Outbox, shared: Arc<Shared>, sas: SasVerification) {
+    shared.set_sas(Some(sas.clone()));
+    let mut changes = sas.changes();
+    let mut state = Some(sas.state());
+    loop {
+        let current = match state.take() {
+            Some(state) => state,
+            None => match changes.next().await {
+                Some(state) => state,
+                None => break,
+            },
+        };
+        match current {
+            SasState::KeysExchanged {
+                emojis: Some(emojis),
+                ..
+            } => {
+                let emojis = emojis
+                    .emojis
+                    .iter()
+                    .map(|emoji| (emoji.symbol.to_owned(), emoji.description.to_owned()))
+                    .collect();
+                post(&outbox, Update::Verify(Verify::Emojis(emojis)));
+            }
+            SasState::Done { .. } => {
+                post(&outbox, Update::Verify(Verify::Done));
+                break;
+            }
+            SasState::Cancelled(info) => {
+                post(
+                    &outbox,
+                    Update::Verify(Verify::Cancelled(info.reason().to_owned())),
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
+    shared.set_sas(None);
+    shared.set_request(None);
+}
+
+fn joined(client: &Client, id: &OwnedRoomId) -> Result<Room> {
+    client.get_room(id).ok_or_else(|| anyhow!("unknown room"))
+}
+
+/// Pages backwards until enough visible messages arrive, oldest first.
+async fn page(room: &Room, mut from: Option<String>) -> Result<(Vec<Event>, Option<String>)> {
+    let mut batches = Vec::new();
+    let mut shown = 0;
+    for _ in 0..5 {
+        let mut options = MessagesOptions::backward();
+        options.from = from.clone();
+        options.limit = UInt::from(HISTORY);
+        let response = room.messages(options).await?;
+        let mut batch = Vec::with_capacity(response.chunk.len());
+        for event in response.chunk.iter().rev() {
+            if let Some(event) = parse(room, event.raw()).await {
+                if matches!(event, Event::Message(_)) {
+                    shown += 1;
+                }
+                batch.push(event);
+            }
+        }
+        batches.push(batch);
+        from = response.end;
+        if from.is_none() || shown >= PAGE {
+            break;
+        }
+    }
+    Ok((batches.into_iter().rev().flatten().collect(), from))
+}
+
+async fn opened(client: &Client, outbox: &Outbox, room: OwnedRoomId) {
+    post(outbox, Update::Rooms(summaries(client).await));
+    post(outbox, Update::Opened(room));
+}
+
+async fn read(room: &Room, event: OwnedEventId) {
+    if let Err(error) = room
+        .send_single_receipt(ReceiptType::Read, ReceiptThread::Unthreaded, event)
+        .await
+    {
+        log::debug!("matrix: could not send a read receipt: {error}");
+    }
+}
+
+fn own_server(client: &Client) -> String {
+    client
+        .user_id()
+        .map(|user| user.server_name().to_string())
+        .unwrap_or_else(|| "matrix.org".into())
+}
+
+fn room_address(client: &Client, input: &str) -> Result<OwnedRoomOrAliasId> {
+    let input = input.trim();
+    let input = input.strip_prefix("https://matrix.to/#/").unwrap_or(input);
+    let input = input.split('?').next().unwrap_or(input);
+    let address = match input.chars().next() {
+        Some('#' | '!') if input.contains(':') => input.to_owned(),
+        Some('#') => format!("{input}:{}", own_server(client)),
+        _ if input.contains(':') => format!("#{input}"),
+        _ => format!("#{input}:{}", own_server(client)),
+    };
+    OwnedRoomOrAliasId::try_from(address.as_str()).map_err(|_| {
+        anyhow!("That doesn't look like a room address. Try something like #room:matrix.org.")
+    })
+}
+
+fn user_address(client: &Client, input: &str) -> Result<OwnedUserId> {
+    let input = input.trim();
+    let input = input.strip_prefix("https://matrix.to/#/").unwrap_or(input);
+    let input = input.strip_prefix('@').unwrap_or(input);
+    let address = match input.contains(':') {
+        true => format!("@{input}"),
+        false => format!("@{input}:{}", own_server(client)),
+    };
+    OwnedUserId::try_from(address.as_str()).map_err(|_| {
+        anyhow!("That doesn't look like a username. Try something like @friend:matrix.org.")
+    })
+}
+
+async fn summaries(client: &Client) -> Vec<RoomSummary> {
+    let mut rooms = Vec::new();
+    for room in client.rooms() {
+        let state = room.state();
+        if !matches!(state, RoomState::Joined | RoomState::Invited) {
+            continue;
+        }
+        let name = room
+            .display_name()
+            .await
+            .map(|name| name.to_string())
+            .unwrap_or_else(|_| room.room_id().to_string());
+        let kind = match (room.is_space(), room.is_direct().await.unwrap_or(false)) {
+            (true, _) => RoomKind::Space,
+            (false, true) => RoomKind::Direct,
+            (false, false) => RoomKind::Room,
+        };
+        let children = match kind {
+            RoomKind::Space => space_children(&room).await,
+            _ => Vec::new(),
+        };
+        let counts = room.unread_notification_counts();
+        rooms.push(RoomSummary {
+            id: room.room_id().to_owned(),
+            name,
+            topic: room.topic().filter(|topic| !topic.trim().is_empty()),
+            avatar: room.avatar_url(),
+            kind,
+            invite: state == RoomState::Invited,
+            encrypted: room.encryption_state().is_encrypted(),
+            unread: counts.notification_count,
+            mentions: counts.highlight_count,
+            members: room.joined_members_count(),
+            children,
+        });
+    }
+    rooms.sort_by_key(|room| room.name.to_lowercase());
+    rooms
+}
+
+async fn space_children(space: &Room) -> Vec<OwnedRoomId> {
+    let Ok(events) = space
+        .get_state_events_static::<SpaceChildEventContent>()
+        .await
+    else {
+        return Vec::new();
+    };
+    events
+        .into_iter()
+        .filter_map(|event| match event {
+            RawSyncOrStrippedState::Sync(raw) => match raw.deserialize().ok()? {
+                SyncStateEvent::Original(event) if !event.content.via.is_empty() => {
+                    Some(event.state_key)
+                }
+                _ => None,
+            },
+            RawSyncOrStrippedState::Stripped(_) => None,
+        })
+        .collect()
+}
+
+fn millis(timestamp: MilliSecondsSinceUnixEpoch) -> i64 {
+    i64::from(timestamp.0)
+}
+
+fn media_url(source: &MediaSource) -> String {
+    match source {
+        MediaSource::Plain(uri) => uri.to_string(),
+        MediaSource::Encrypted(file) => file.url.to_string(),
+    }
+}
+
+async fn base(
+    room: &Room,
+    sender: &UserId,
+    id: &EventId,
+    timestamp: MilliSecondsSinceUnixEpoch,
+) -> Message {
+    let member = room.get_member_no_sync(sender).await.ok().flatten();
+    Message {
+        id: Some(id.to_owned()),
+        local: None,
+        sender: sender.to_owned(),
+        sender_name: member.as_ref().map_or_else(
+            || sender.localpart().to_owned(),
+            |member| member.name().to_owned(),
+        ),
+        avatar: member.and_then(|member| member.avatar_url().map(ToOwned::to_owned)),
+        body: String::new(),
+        rich: Rich::new(),
+        kind: MessageKind::Text,
+        picture: None,
+        timestamp: millis(timestamp),
+        edited: false,
+        reply: None,
+        thread: None,
+        replies: 0,
+        reactions: Vec::new(),
+    }
+}
+
+async fn parse(room: &Room, raw: &Raw<AnySyncTimelineEvent>) -> Option<Event> {
+    let AnySyncTimelineEvent::MessageLike(event) = raw.deserialize().ok()? else {
+        return None;
+    };
+    match event {
+        AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(event)) => {
+            from_message(room, &event).await
+        }
+        AnySyncMessageLikeEvent::RoomEncrypted(SyncMessageLikeEvent::Original(event)) => {
+            let thread = match &event.content.relates_to {
+                Some(encrypted::Relation::Thread(thread)) => Some(thread.event_id.clone()),
+                Some(encrypted::Relation::Replacement(_) | encrypted::Relation::Annotation(_)) => {
+                    return None;
+                }
+                _ => None,
+            };
+            let mut message =
+                base(room, &event.sender, &event.event_id, event.origin_server_ts).await;
+            message.kind = MessageKind::Encrypted;
+            message.thread = thread;
+            Some(Event::Message(message))
+        }
+        AnySyncMessageLikeEvent::Reaction(SyncMessageLikeEvent::Original(event)) => {
+            Some(Event::React {
+                target: event.content.relates_to.event_id,
+                key: event.content.relates_to.key,
+                sender: event.sender,
+                id: event.event_id,
+            })
+        }
+        AnySyncMessageLikeEvent::RoomRedaction(SyncRoomRedactionEvent::Original(event)) => {
+            event.content.redacts.or(event.redacts).map(Event::Redact)
+        }
+        _ => None,
+    }
+}
+
+async fn from_message(room: &Room, event: &OriginalSyncRoomMessageEvent) -> Option<Event> {
+    let content = &event.content;
+    if let Some(Relation::Replacement(replacement)) = &content.relates_to {
+        let (body, rich, _, _) = describe(&replacement.new_content.msgtype);
+        return Some(Event::Edit {
+            target: replacement.event_id.clone(),
+            sender: event.sender.clone(),
+            body,
+            rich,
+        });
+    }
+
+    let mut message = base(room, &event.sender, &event.event_id, event.origin_server_ts).await;
+    match &content.relates_to {
+        Some(Relation::Reply(reply)) => message.reply = Some(reply.in_reply_to.event_id.clone()),
+        Some(Relation::Thread(thread)) => {
+            message.thread = Some(thread.event_id.clone());
+            if !thread.is_falling_back {
+                message.reply = thread
+                    .in_reply_to
+                    .as_ref()
+                    .map(|reply| reply.event_id.clone());
+            }
+        }
+        _ => {}
+    }
+
+    let mut msgtype = &content.msgtype;
+    if let Some(replace) = &event.unsigned.relations.replace
+        && replace.sender == event.sender
+        && let Some(Relation::Replacement(replacement)) = &replace.content.relates_to
+    {
+        msgtype = &replacement.new_content.msgtype;
+        message.edited = true;
+    }
+    message.replies = event
+        .unsigned
+        .relations
+        .thread
+        .as_ref()
+        .map_or(0, |thread| u64::from(thread.count));
+
+    let (body, rich, kind, picture) = describe(msgtype);
+    message.body = body;
+    message.rich = rich;
+    message.kind = kind;
+    message.picture = picture;
+    Some(Event::Message(message))
+}
+
+fn formatted(body: &str, formatted: Option<&FormattedBody>) -> Rich {
+    match formatted.filter(|formatted| formatted.format == MessageFormat::Html) {
+        Some(formatted) => {
+            let rich = rich::html(&formatted.body);
+            match rich.is_empty() {
+                true => rich::plain(&without_reply(body)),
+                false => rich,
+            }
+        }
+        None => rich::plain(&without_reply(body)),
+    }
+}
+
+fn size(value: Option<UInt>) -> u32 {
+    value.map_or(0, |value| u32::try_from(u64::from(value)).unwrap_or(0))
+}
+
+fn describe(msgtype: &MessageType) -> (String, Rich, MessageKind, Option<Picture>) {
+    match msgtype {
+        MessageType::Text(text) => (
+            without_reply(&text.body),
+            formatted(&text.body, text.formatted.as_ref()),
+            MessageKind::Text,
+            None,
+        ),
+        MessageType::Notice(notice) => (
+            without_reply(&notice.body),
+            formatted(&notice.body, notice.formatted.as_ref()),
+            MessageKind::Notice,
+            None,
+        ),
+        MessageType::Emote(emote) => (
+            emote.body.clone(),
+            formatted(&emote.body, emote.formatted.as_ref()),
+            MessageKind::Emote,
+            None,
+        ),
+        MessageType::Image(image) => {
+            let info = image.info.as_deref();
+            let body = without_reply(&image.body);
+            let name = image
+                .filename
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| body.clone());
+            let picture = Picture {
+                key: format!("{}#image", media_url(&image.source)),
+                source: image.source.clone(),
+                width: size(info.and_then(|info| info.width)),
+                height: size(info.and_then(|info| info.height)),
+                name,
+            };
+            let caption = match &image.filename {
+                Some(filename) if filename != &body => formatted(&body, image.formatted.as_ref()),
+                _ => Rich::new(),
+            };
+            (body, caption, MessageKind::Image, Some(picture))
+        }
+        MessageType::Video(video) => attachment(format!("Shared a video: {}", video.body)),
+        MessageType::Audio(audio) => attachment(format!("Shared audio: {}", audio.body)),
+        MessageType::File(file) => attachment(format!("Shared a file: {}", file.body)),
+        other => (
+            other.body().to_owned(),
+            rich::plain(other.body()),
+            MessageKind::Text,
+            None,
+        ),
+    }
+}
+
+fn attachment(label: String) -> (String, Rich, MessageKind, Option<Picture>) {
+    (
+        label.clone(),
+        rich::plain(&label),
+        MessageKind::Attachment,
+        None,
+    )
+}
+
+fn without_reply(body: &str) -> String {
+    if !body.starts_with("> ") {
+        return body.to_owned();
+    }
+    let mut lines = body.lines().skip_while(|line| line.starts_with('>'));
+    match lines.next() {
+        Some(line) if line.is_empty() => lines.collect::<Vec<_>>().join("\n"),
+        _ => body.to_owned(),
+    }
+}
+
+fn kind(error: &anyhow::Error) -> Option<&ErrorKind> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<matrix_sdk::Error>())
+        .and_then(matrix_sdk::Error::client_api_error_kind)
+        .or_else(|| {
+            error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<matrix_sdk::HttpError>())
+                .and_then(matrix_sdk::HttpError::client_api_error_kind)
+        })
+}
+
+fn unreachable(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string() == "unreachable")
+}
+
+fn sign_in_problem(error: &anyhow::Error) -> String {
+    if unreachable(error) {
+        return "We couldn't reach that server. Check the address and your connection.".into();
+    }
+    match kind(error) {
+        Some(ErrorKind::Forbidden) => {
+            "That username and password don't match. Please try again.".into()
+        }
+        Some(ErrorKind::LimitExceeded(_)) => {
+            "Too many attempts. Wait a moment and try again.".into()
+        }
+        Some(ErrorKind::UserDeactivated) => "This account has been deactivated.".into(),
+        _ => "Couldn't sign in. Check your details and try again.".into(),
+    }
+}
+
+fn sign_up_problem(error: &anyhow::Error) -> String {
+    if unreachable(error) {
+        return "We couldn't reach that server. Check the address and your connection.".into();
+    }
+    match kind(error) {
+        Some(ErrorKind::UserInUse) => "That username is taken. Try another one.".into(),
+        Some(ErrorKind::InvalidUsername) => {
+            "Usernames can only use lowercase letters, numbers and . _ = - /".into()
+        }
+        Some(ErrorKind::WeakPassword) => "That password is too weak. Try a longer one.".into(),
+        Some(ErrorKind::ThreepidInUse) => "That email is already used by another account.".into(),
+        Some(ErrorKind::Forbidden) => {
+            "This server isn't taking new accounts. Try matrix.org instead.".into()
+        }
+        Some(ErrorKind::LimitExceeded(_)) => {
+            "Too many attempts. Wait a moment and try again.".into()
+        }
+        _ => "Couldn't create the account. Please try again.".into(),
+    }
+}
+
+fn problem(error: &anyhow::Error) -> String {
+    let friendly = [
+        "That doesn't look",
+        "That key didn't",
+        "Your account",
+        "The request has",
+        "The comparison has",
+    ];
+    if let Some(message) = error.chain().find_map(|cause| {
+        let text = cause.to_string();
+        friendly
+            .iter()
+            .any(|start| text.starts_with(start))
+            .then_some(text)
+    }) {
+        return message;
+    }
+    match kind(error) {
+        Some(ErrorKind::NotFound) => {
+            "We couldn't find that. Check the address and try again.".into()
+        }
+        Some(ErrorKind::Forbidden) => "You don't have permission to do that.".into(),
+        Some(ErrorKind::LimitExceeded(_)) => "Slow down a little and try again.".into(),
+        _ => "Something went wrong. Please try again.".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_reply_fallbacks() {
+        assert_eq!(without_reply("> <@a:b> hi\n> there\n\nhello"), "hello");
+        assert_eq!(
+            without_reply("> quote without break"),
+            "> quote without break"
+        );
+        assert_eq!(without_reply("plain"), "plain");
+    }
+
+    #[test]
+    fn picks_the_easiest_registration_flow() {
+        let mut info = UiaaInfo::new(vec![
+            uiaa::AuthFlow::new(vec![AuthType::ReCaptcha, AuthType::Terms]),
+            uiaa::AuthFlow::new(vec![AuthType::RegistrationToken]),
+        ]);
+        assert_eq!(next_stage(&info), Some(AuthType::RegistrationToken));
+        info.completed = vec![AuthType::RegistrationToken];
+        assert_eq!(next_stage(&info), None);
+    }
+}
