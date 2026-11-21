@@ -54,6 +54,10 @@ use tokio::task::JoinHandle;
 
 use super::rich::{self, Rich};
 
+#[cfg(test)]
+#[path = "media_tests.rs"]
+mod media_tests;
+
 #[path = "call.rs"]
 mod call;
 
@@ -102,6 +106,8 @@ pub enum MessageKind {
 #[derive(Clone)]
 pub struct Picture {
     pub mime: Option<String>,
+    pub thumbnail: Option<MediaSource>,
+    pub duration: Option<Duration>,
     pub key: String,
     pub source: MediaSource,
     pub width: u32,
@@ -132,6 +138,7 @@ pub struct Message {
     pub thread: Option<OwnedEventId>,
     pub replies: u64,
     pub reactions: Vec<Reaction>,
+    pub mentioned: bool,
 }
 
 pub enum Event {
@@ -235,6 +242,7 @@ pub enum Command {
         height: u32,
         caption: String,
         duration: Option<Duration>,
+        thumbnail: Option<super::playback::Thumbnail>,
         local: u64,
         reply: Option<(OwnedEventId, OwnedUserId)>,
         thread: Option<(OwnedEventId, OwnedEventId)>,
@@ -263,6 +271,12 @@ pub enum Command {
         room: OwnedRoomId,
         event: OwnedEventId,
     },
+    VideoPreview {
+        key: String,
+        source: MediaSource,
+        thumbnail: Option<MediaSource>,
+    },
+    ClearCache,
     Fetch {
         key: String,
         source: MediaSource,
@@ -336,6 +350,14 @@ pub enum Update {
         event: Option<OwnedEventId>,
     },
     Opened(OwnedRoomId),
+    CacheCleared {
+        error: Option<String>,
+    },
+    VideoPreview {
+        key: String,
+        bytes: Option<Vec<u8>>,
+        thumbnail: Option<Vec<u8>>,
+    },
     Media {
         key: String,
         bytes: Option<Vec<u8>>,
@@ -455,6 +477,7 @@ struct Shared {
     request: Mutex<Option<VerificationRequest>>,
     sas: Mutex<Option<SasVerification>>,
     calls: Arc<call::Calls>,
+    cache_work: tokio::sync::Mutex<()>,
 }
 
 impl Shared {
@@ -781,6 +804,15 @@ impl Worker {
     }
 
     async fn begin(&mut self, client: Client) {
+        if let Err(error) = client
+            .media()
+            .set_media_retention_policy(cache_policy())
+            .await
+        {
+            log::warn!("Could not configure the media cache: {error}");
+        } else if let Err(error) = client.media().clean().await {
+            log::warn!("Could not trim the media cache: {error}");
+        }
         let Some(user) = client.user_id().map(UserId::to_owned) else {
             return;
         };
@@ -967,6 +999,45 @@ fn policies(info: &UiaaInfo) -> Vec<(String, String)> {
         .collect()
 }
 
+fn cache_policy() -> matrix_sdk::media::MediaRetentionPolicy {
+    matrix_sdk::media::MediaRetentionPolicy::empty()
+        .with_max_cache_size(Some(512 * 1024 * 1024))
+        .with_max_file_size(Some(128 * 1024 * 1024))
+        .with_last_access_expiry(Some(Duration::from_secs(30 * 24 * 60 * 60)))
+        .with_cleanup_frequency(Some(Duration::from_secs(15 * 60)))
+}
+
+fn video_preview_request(source: &MediaSource) -> MediaRequestParameters {
+    MediaRequestParameters {
+        source: source.clone(),
+        format: MediaFormat::Thumbnail(MediaThumbnailSettings::with_method(
+            Method::Scale,
+            UInt::from(640u32),
+            UInt::from(640u32),
+        )),
+    }
+}
+
+async fn clear_media_cache(client: &Client, shared: &Shared) -> Result<()> {
+    let _operation = shared.cache_work.lock().await;
+    let media = client.media();
+    let previous = media.media_retention_policy().await?;
+    media
+        .set_media_retention_policy(
+            matrix_sdk::media::MediaRetentionPolicy::empty()
+                .with_max_cache_size(Some(0))
+                .with_max_file_size(Some(0)),
+        )
+        .await?;
+    // The SDK retains protected media used by pending uploads. Account state,
+    // message history, and encryption keys live in separate stores.
+    let cleaned = media.clean().await;
+    let restored = media.set_media_retention_policy(previous).await;
+    cleaned?;
+    restored?;
+    Ok(())
+}
+
 async fn handle(
     client: &Client,
     outbox: &Outbox,
@@ -1111,6 +1182,7 @@ async fn handle(
             height,
             caption,
             duration,
+            thumbnail,
             local,
             reply,
             thread,
@@ -1138,7 +1210,18 @@ async fn handle(
                     ..BaseImageInfo::default()
                 }),
             };
-            let mut config = AttachmentConfig::new().info(info);
+            let mut config =
+                AttachmentConfig::new()
+                    .info(info)
+                    .thumbnail(
+                        thumbnail.map(|thumbnail| matrix_sdk::attachment::Thumbnail {
+                            size: UInt::try_from(thumbnail.bytes.len() as u64).unwrap_or(UInt::MAX),
+                            data: thumbnail.bytes,
+                            content_type: mime::IMAGE_JPEG,
+                            width: UInt::from(thumbnail.width),
+                            height: UInt::from(thumbnail.height),
+                        }),
+                    );
             if !caption.is_empty() {
                 config = config.caption(Some(TextMessageEventContent::markdown(caption)));
             }
@@ -1233,6 +1316,100 @@ async fn handle(
             if let Some(room) = client.get_room(&id) {
                 read(&room, event).await;
             }
+        }
+        Command::ClearCache => {
+            let result = clear_media_cache(client, shared).await;
+            if let Err(error) = &result {
+                log::warn!("Could not clear the media cache: {error}");
+            }
+            post(
+                outbox,
+                Update::CacheCleared {
+                    error: result
+                        .err()
+                        .map(|_| "The cache couldn't be cleared. Try again.".into()),
+                },
+            );
+        }
+        Command::VideoPreview {
+            key,
+            source,
+            thumbnail,
+        } => {
+            let media = client.media();
+            let request = video_preview_request(&source);
+            let mut preview = client
+                .media_store()
+                .lock()
+                .await?
+                .get_media_content(&request)
+                .await?;
+            let cached = preview.is_some();
+            if let Some(source) = thumbnail.filter(|_| !cached) {
+                if let Ok(bytes) = media
+                    .get_media_content(
+                        &MediaRequestParameters {
+                            source,
+                            format: MediaFormat::File,
+                        },
+                        true,
+                    )
+                    .await
+                {
+                    // A broken advertised thumbnail must not prevent local extraction.
+                    preview = tokio::task::spawn_blocking(move || {
+                        image::load_from_memory(&bytes).ok().map(|_| bytes)
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                }
+            }
+            let mut original = None;
+            if preview.is_none() {
+                if let Ok(bytes) = media
+                    .get_media_content(
+                        &MediaRequestParameters {
+                            source,
+                            format: MediaFormat::File,
+                        },
+                        true,
+                    )
+                    .await
+                {
+                    let copy = bytes.clone();
+                    preview = tokio::task::spawn_blocking(move || {
+                        super::playback::thumbnail(copy).ok().map(|p| p.bytes)
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    original = Some(bytes);
+                }
+            }
+            if !cached && let Some(bytes) = &preview {
+                if let Err(error) = client
+                    .media_store()
+                    .lock()
+                    .await?
+                    .add_media_content(
+                        &request,
+                        bytes.clone(),
+                        matrix_sdk::media::store::IgnoreMediaRetentionPolicy::No,
+                    )
+                    .await
+                {
+                    log::debug!("Could not cache the video preview: {error}");
+                }
+            }
+            post(
+                outbox,
+                Update::VideoPreview {
+                    key,
+                    bytes: original,
+                    thumbnail: preview,
+                },
+            );
         }
         Command::Fetch { key, source, size } => {
             let media = client.media();
@@ -1701,6 +1878,7 @@ async fn base(
         thread: None,
         replies: 0,
         reactions: Vec::new(),
+        mentioned: false,
     }
 }
 
@@ -1741,6 +1919,12 @@ async fn parse(room: &Room, raw: &Raw<AnySyncTimelineEvent>) -> Option<Event> {
     }
 }
 
+fn mentions_user(content: &RoomMessageEventContent, user: Option<&UserId>) -> bool {
+    content.mentions.as_ref().is_some_and(|mentions| {
+        mentions.room || user.is_some_and(|user| mentions.user_ids.contains(user))
+    })
+}
+
 async fn from_message(room: &Room, event: &OriginalSyncRoomMessageEvent) -> Option<Event> {
     let content = &event.content;
     if let Some(Relation::Replacement(replacement)) = &content.relates_to {
@@ -1754,6 +1938,7 @@ async fn from_message(room: &Room, event: &OriginalSyncRoomMessageEvent) -> Opti
     }
 
     let mut message = base(room, &event.sender, &event.event_id, event.origin_server_ts).await;
+    message.mentioned = mentions_user(content, room.client().user_id());
     match &content.relates_to {
         Some(Relation::Reply(reply)) => message.reply = Some(reply.in_reply_to.event_id.clone()),
         Some(Relation::Thread(thread)) => {
@@ -1838,6 +2023,8 @@ fn describe(msgtype: &MessageType) -> (String, Rich, MessageKind, Option<Picture
                 .unwrap_or_else(|| body.clone());
             let picture = Picture {
                 mime: None,
+                thumbnail: None,
+                duration: None,
                 key: format!("{}#image", media_url(&image.source)),
                 source: image.source.clone(),
                 width: size(info.and_then(|info| info.width)),
@@ -1850,15 +2037,38 @@ fn describe(msgtype: &MessageType) -> (String, Rich, MessageKind, Option<Picture
             };
             (body, caption, MessageKind::Image, Some(picture))
         }
-        MessageType::Video(video) => playable(
-            &video.body,
-            video.filename.as_deref(),
-            &video.source,
-            video
-                .info
-                .as_ref()
-                .and_then(|info| info.mimetype.as_deref()),
-        ),
+        MessageType::Video(video) => {
+            let (body, _, kind, mut picture) = playable(
+                &video.body,
+                video.filename.as_deref(),
+                &video.source,
+                video
+                    .info
+                    .as_ref()
+                    .and_then(|info| info.mimetype.as_deref()),
+            );
+            if let Some(picture) = &mut picture {
+                picture.mime = Some(
+                    video
+                        .info
+                        .as_ref()
+                        .and_then(|i| i.mimetype.clone())
+                        .unwrap_or("video/mp4".into()),
+                );
+                if let Some(info) = &video.info {
+                    picture.width = size(info.width);
+                    picture.height = size(info.height);
+                    picture.duration = info.duration;
+                    picture.thumbnail = info.thumbnail_source.clone();
+                }
+            }
+            let caption = if video.filename.as_ref().is_some_and(|name| name != &body) {
+                formatted(&body, video.formatted.as_ref())
+            } else {
+                Rich::new()
+            };
+            (body, caption, kind, picture)
+        }
         MessageType::Audio(audio) => playable(
             &audio.body,
             audio.filename.as_deref(),
@@ -1910,6 +2120,8 @@ fn playable(
             height: 0,
             name,
             mime: Some(mime),
+            thumbnail: None,
+            duration: None,
         }),
     )
 }
@@ -2021,6 +2233,52 @@ fn problem(error: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notification_mentions_target_the_signed_in_user() {
+        let user = <&UserId>::try_from("@me:example.org").unwrap();
+        for (mentions, expected) in [
+            (serde_json::json!({"user_ids":["@me:example.org"]}), true),
+            (
+                serde_json::json!({"user_ids":["@other:example.org"]}),
+                false,
+            ),
+            (serde_json::json!({"room":true}), true),
+            (serde_json::json!({}), false),
+        ] {
+            let content: RoomMessageEventContent = serde_json::from_value(serde_json::json!({
+                "msgtype":"m.text", "body":"A message", "m.mentions":mentions
+            }))
+            .unwrap();
+            assert_eq!(mentions_user(&content, Some(user)), expected);
+        }
+        let content = RoomMessageEventContent::text_plain("@me:example.org is plain text");
+        assert!(!mentions_user(&content, Some(user)));
+        assert!(!mentions_user(&content, None));
+    }
+
+    #[test]
+    fn video_metadata_and_encrypted_thumbnail_survive_message_parsing() {
+        let encrypted = serde_json::json!({
+            "url":"mxc://example.org/thumbnail", "v":"v2",
+            "key":{"kty":"oct","key_ops":["encrypt","decrypt"],"alg":"A256CTR","ext":true,
+                "k":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+            "iv":"AAAAAAAAAAAAAAAAAAAAAA",
+            "hashes":{"sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}
+        });
+        let message: MessageType = serde_json::from_value(serde_json::json!({
+            "msgtype":"m.video", "body":"A caption", "filename":"clip.mp4",
+            "url":"mxc://example.org/video",
+            "info":{"mimetype":"video/mp4","w":1920,"h":1080,"duration":12345,"thumbnail_file":encrypted}
+        })).unwrap();
+        let (_, caption, _, video) = describe(&message);
+        let video = video.unwrap();
+        assert_eq!((video.width, video.height), (1920, 1080));
+        assert_eq!(video.duration, Some(Duration::from_millis(12345)));
+        assert!(!caption.is_empty());
+        assert!(matches!(video.thumbnail, Some(MediaSource::Encrypted(_))));
+        assert_eq!(video.mime.as_deref(), Some("video/mp4"));
+    }
 
     #[test]
     fn preserves_playable_media_sources_and_names() {

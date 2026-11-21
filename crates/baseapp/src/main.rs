@@ -18,7 +18,11 @@ use ui::{
     ThemeOverrides, WindowControls,
 };
 
+mod cache;
 mod matrix;
+mod notifications;
+
+use notifications::NotificationPreferences;
 mod presence;
 
 use matrix::PhotoSize;
@@ -40,6 +44,8 @@ const AMBIENT_SPECS: [(f32, f32, f32, f32, f32, f32, f32); 5] = [
 enum Page {
     Home,
     Appearance,
+    Notifications,
+    Cache,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -161,6 +167,8 @@ struct BaseApp {
     ambient_bounds: Rc<Cell<Bounds<gpui::Pixels>>>,
     focus: FocusHandle,
     scrollbar: Entity<Scrollbar>,
+    notifications: NotificationPreferences,
+    notifications_scrollbar: Entity<Scrollbar>,
     appearance_observer: Option<gpui::Subscription>,
     activation_observer: Option<gpui::Subscription>,
     matrix: Entity<matrix::MatrixClient>,
@@ -183,6 +191,7 @@ struct Preferences {
     ambient_motion: bool,
     photo_compress: bool,
     photo_size: PhotoSize,
+    notifications: NotificationPreferences,
 }
 
 impl Default for Preferences {
@@ -203,19 +212,25 @@ impl Default for Preferences {
             ambient_motion: true,
             photo_compress: true,
             photo_size: PhotoSize::Balanced,
+            notifications: NotificationPreferences::default(),
         }
     }
 }
 
 impl Preferences {
     fn load() -> Self {
-        let mut prefs = Self::default();
+        let prefs = Self::default();
         let Some(path) = preferences_path() else {
             return prefs;
         };
         let Ok(contents) = std::fs::read_to_string(path) else {
             return prefs;
         };
+        Self::parse(&contents)
+    }
+
+    fn parse(contents: &str) -> Self {
+        let mut prefs = Self::default();
         for line in contents.lines() {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
@@ -252,6 +267,9 @@ impl Preferences {
                     prefs.photo_compress = value.parse().unwrap_or(prefs.photo_compress)
                 }
                 "photo_size" => prefs.photo_size = PhotoSize::from_id(value),
+                "notifications" => {
+                    prefs.notifications = serde_json::from_str(value).unwrap_or(prefs.notifications)
+                }
                 _ => {}
             }
         }
@@ -264,17 +282,32 @@ impl Preferences {
             return;
         };
         let Some(parent) = path.parent() else { return };
-        if let Err(error) = std::fs::create_dir_all(parent).and_then(|()| {
-            std::fs::write(path, format!(
-                "theme={}\nrounding={}\nblur={}\nblur_window={}\nfont_size={}\nicon_pack={}\ntransparent={}\ntransparency={}\nstillness={}\npace={}\nambient={}\nambient_style={}\nambient_motion={}\nphoto_compress={}\nphoto_size={}\n",
-                self.theme.id(), self.rounding.id(), self.blur, self.blur_window, self.font_size,
-                self.icon_pack, self.transparent, self.transparency, self.stillness.id(), self.pace.id(),
-                self.ambient, self.ambient_style.id(), self.ambient_motion, self.photo_compress,
-                self.photo_size.id()
-            ))
-        }) {
-            log::warn!("Could not save appearance preferences: {error}");
+        if let Err(error) =
+            std::fs::create_dir_all(parent).and_then(|()| std::fs::write(path, self.encode()))
+        {
+            log::warn!("Could not save preferences: {error}");
         }
+    }
+    fn encode(self) -> String {
+        format!(
+            "theme={}\nrounding={}\nblur={}\nblur_window={}\nfont_size={}\nicon_pack={}\ntransparent={}\ntransparency={}\nstillness={}\npace={}\nambient={}\nambient_style={}\nambient_motion={}\nphoto_compress={}\nphoto_size={}\nnotifications={}\n",
+            self.theme.id(),
+            self.rounding.id(),
+            self.blur,
+            self.blur_window,
+            self.font_size,
+            self.icon_pack,
+            self.transparent,
+            self.transparency,
+            self.stillness.id(),
+            self.pace.id(),
+            self.ambient,
+            self.ambient_style.id(),
+            self.ambient_motion,
+            self.photo_compress,
+            self.photo_size.id(),
+            serde_json::to_string(&self.notifications).expect("notification preferences serialize")
+        )
     }
 }
 
@@ -290,6 +323,43 @@ fn preferences_path() -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
     Some(base.join("baseapp").join("appearance.cfg"))
+}
+
+#[cfg(test)]
+mod notification_preferences_tests {
+    use super::*;
+
+    #[test]
+    fn notifications_round_trip_with_existing_preferences() {
+        let prefs = Preferences {
+            font_size: 18.,
+            photo_compress: false,
+            notifications: NotificationPreferences {
+                enabled: false,
+                direct_messages: true,
+                room_messages: false,
+                mentions: true,
+                thread_replies: false,
+                calls: true,
+                show_preview: false,
+                attention: false,
+            },
+            ..Default::default()
+        };
+        let restored = Preferences::parse(&prefs.encode());
+        assert_eq!(restored.notifications, prefs.notifications);
+        assert_eq!(restored.font_size, 18.);
+        assert!(!restored.photo_compress);
+    }
+
+    #[test]
+    fn notifications_keep_defaults_for_old_or_invalid_config() {
+        for config in ["font_size=16\n", "notifications=not-json\nfont_size=16\n"] {
+            let prefs = Preferences::parse(config);
+            assert_eq!(prefs.notifications, NotificationPreferences::default());
+            assert_eq!(prefs.font_size, 16.);
+        }
+    }
 }
 
 impl BaseApp {
@@ -322,19 +392,27 @@ impl BaseApp {
             ambient_bounds: Rc::new(Cell::new(Bounds::default())),
             focus: cx.focus_handle(),
             scrollbar: cx.new(|_| Scrollbar::new(ScrollHandle::new()).watching(owner)),
+            notifications: prefs.notifications,
+            notifications_scrollbar: cx
+                .new(|_| Scrollbar::new(ScrollHandle::new()).watching(owner)),
             appearance_observer: None,
             activation_observer: None,
             matrix: {
                 let matrix = cx.new(|cx| {
                     let mut client = matrix::MatrixClient::new(cx);
                     client.set_photo_send(prefs.photo_compress, prefs.photo_size);
+                    client.set_notifications(prefs.notifications);
                     client
                 });
                 cx.subscribe(&matrix, |this, _, _: &matrix::OpenSettings, cx| {
                     this.page = Page::Appearance;
+                    this.matrix
+                        .update(cx, |client, _| client.set_focused(false));
                     cx.notify();
                 })
                 .detach();
+                cx.subscribe(&matrix, |_, _, _: &matrix::CacheChanged, cx| cx.notify())
+                    .detach();
                 matrix
             },
         }
@@ -389,6 +467,7 @@ impl BaseApp {
             ambient_motion: self.ambient_motion,
             photo_compress: self.photo_compress,
             photo_size: self.photo_size,
+            notifications: self.notifications,
         }
     }
 
@@ -403,6 +482,173 @@ impl BaseApp {
             .update(cx, |matrix, _| matrix.set_photo_send(compress, size));
         self.save();
         cx.notify();
+    }
+
+    fn settings_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        ui::TabBar::new("settings-sections").items(
+            [
+                (Page::Appearance, "settings-appearance", "Appearance"),
+                (
+                    Page::Notifications,
+                    "settings-notifications",
+                    "Notifications",
+                ),
+                (Page::Cache, "settings-cache", "Cache"),
+            ]
+            .into_iter()
+            .map(|(page, id, label)| {
+                Button::new(id)
+                    .ghost()
+                    .label(label)
+                    .selected(self.page == page)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.page = page;
+                        cx.notify();
+                    }))
+            }),
+        )
+    }
+
+    fn cache_settings(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = *cx.theme();
+        let matrix = self.matrix.read(cx);
+        let memory = matrix.cache_bytes() as f64 / (1024. * 1024.);
+        let status = matrix.cache_status().map(str::to_owned);
+        let available = matrix.can_clear_cache();
+        let clear = Button::new("clear-media-cache")
+            .secondary()
+            .label("Clear media cache")
+            .disabled(!available)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.matrix.update(cx, |matrix, cx| matrix.clear_cache(cx));
+            }))
+            .into_any_element();
+        let rows = vec![
+            self.row(
+                "Downloaded media",
+                "Reuse images, video, audio, and thumbnails instead of downloading them again",
+                clear,
+                cx,
+            )
+            .into_any_element(),
+        ];
+        Scroller::new("cache-settings", &self.notifications_scrollbar)
+            .flex_1().min_h_0().min_w_0().flex_col().items_center()
+            .child(div().flex().flex_col().gap_5().w_full().max_w(px(860.)).p_6()
+                .child(self.settings_tabs(cx))
+                .child(div().flex().flex_col().gap_2()
+                    .child(div().text_size(theme.text(ui::Text::Title)).font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.foreground).child("Cache"))
+                    .child(div().text_color(theme.muted_foreground).child("Keep frequently used media close at hand.")))
+                .child(self.settings_card("Media cache", rows, cx))
+                .child(format!("Cached in memory: {memory:.1} MB"))
+                .child(div().text_color(theme.muted_foreground).child("Disk retention limit: 512 MB. Media unused for 30 days is removed automatically."))
+                .child(div().text_color(theme.muted_foreground).child("Clearing cached media keeps your messages, account, and pending uploads. Media can be downloaded again."))
+                .when_some(status.clone(), |body, status| body.child(status))
+                .when(!available && status.is_none(), |body| body.child("Sign in to manage the disk cache.")))
+            .into_any_element()
+    }
+
+    fn notification_row(
+        &self,
+        id: &'static str,
+        title: &'static str,
+        detail: &'static str,
+        field: fn(&mut NotificationPreferences) -> &mut bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let mut prefs = self.notifications;
+        let control = Switch::new(id, *field(&mut prefs))
+            .disabled(!self.notifications.enabled && id != "notifications-enabled")
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let value = field(&mut this.notifications);
+                *value = !*value;
+                let prefs = this.notifications;
+                this.matrix
+                    .update(cx, |matrix, _| matrix.set_notifications(prefs));
+                this.save();
+                cx.notify();
+            }))
+            .into_any_element();
+        self.row(title, detail, control, cx).into_any_element()
+    }
+
+    fn notification_settings(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = *cx.theme();
+        let delivery = vec![self.notification_row(
+            "notifications-enabled",
+            "Desktop notifications",
+            "Show alerts when you're not viewing the conversation",
+            |p| &mut p.enabled,
+            cx,
+        )];
+        let categories = vec![
+            self.notification_row(
+                "notifications-direct",
+                "Direct messages",
+                "Messages in one-to-one conversations",
+                |p| &mut p.direct_messages,
+                cx,
+            ),
+            self.notification_row(
+                "notifications-rooms",
+                "Room messages",
+                "New messages in rooms",
+                |p| &mut p.room_messages,
+                cx,
+            ),
+            self.notification_row(
+                "notifications-mentions",
+                "Mentions",
+                "Personal and @room mentions, even when other message alerts are off",
+                |p| &mut p.mentions,
+                cx,
+            ),
+            self.notification_row(
+                "notifications-threads",
+                "Thread replies",
+                "Replies in message threads",
+                |p| &mut p.thread_replies,
+                cx,
+            ),
+            self.notification_row(
+                "notifications-calls",
+                "Incoming calls",
+                "Desktop alerts for incoming voice and video calls",
+                |p| &mut p.calls,
+                cx,
+            ),
+        ];
+        let presentation = vec![
+            self.notification_row(
+                "notifications-previews",
+                "Message previews",
+                "Include message text in desktop alerts",
+                |p| &mut p.show_preview,
+                cx,
+            ),
+            self.notification_row(
+                "notifications-attention",
+                "Taskbar attention",
+                "Draw attention to the app when a desktop alert arrives",
+                |p| &mut p.attention,
+                cx,
+            ),
+        ];
+        Scroller::new("notification-settings", &self.notifications_scrollbar)
+            .flex_1().min_h_0().min_w_0().flex_col().items_center()
+            .child(div().flex().flex_col().gap_5().w_full().max_w(px(860.)).p_6()
+                .child(self.settings_tabs(cx))
+                .child(div().flex().flex_col().gap_2()
+                    .child(div().text_size(theme.text(ui::Text::Title)).font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.foreground).child("Notifications"))
+                    .child(div().text_color(theme.muted_foreground).child("Choose which desktop alerts you receive on this device.")))
+                .child(self.settings_card("Delivery", delivery, cx))
+                .child(self.settings_card("Notify me about", categories, cx))
+                .child(self.settings_card("Privacy & attention", presentation, cx))
+                .child(div().text_size(theme.text(ui::Text::Small)).text_color(theme.muted_foreground)
+                    .child("These preferences apply to this device. Your system notification settings also apply.")))
+            .into_any_element()
     }
 
     fn settings_card(
@@ -479,14 +725,23 @@ impl Render for BaseApp {
                 })
                 .size(px(44.))
                 .rounded(px(12.))
-                .when(self.page == page, |button| {
-                    button
-                        .bg(theme.sidebar_accent)
-                        .border_l_2()
-                        .border_color(theme.primary)
-                })
-                .on_click(cx.listener(move |this, _, _, cx| {
+                .when(
+                    self.page == page || (page == Page::Appearance && self.page != Page::Home),
+                    |button| {
+                        button
+                            .bg(theme.sidebar_accent)
+                            .border_l_2()
+                            .border_color(theme.primary)
+                    },
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
                     this.page = page;
+                    this.matrix.update(cx, |client, cx| {
+                        client.set_focused(page == Page::Home && window.is_window_active());
+                        if page == Page::Home {
+                            client.dismiss_alert(cx);
+                        }
+                    });
                     cx.notify();
                 }))
         };
@@ -515,6 +770,8 @@ impl Render for BaseApp {
 
         let content = match self.page {
             Page::Home => self.matrix.clone().into_any_element(),
+            Page::Notifications => self.notification_settings(cx),
+            Page::Cache => self.cache_settings(cx),
             Page::Appearance => {
                 let packs = icons::packs().collect::<Vec<_>>();
                 let pack = packs.get(self.icon_pack % packs.len().max(1));
@@ -809,6 +1066,7 @@ impl Render for BaseApp {
                             .w_full()
                             .max_w(px(860.))
                             .p_6()
+                            .child(self.settings_tabs(cx))
                             .child(
                                 div()
                                     .flex()
@@ -1266,7 +1524,8 @@ fn main() {
                                 this.activation_observer = Some(cx.observe_window_activation(
                                     window,
                                     |this, window, cx| {
-                                        let focused = window.is_window_active();
+                                        let focused =
+                                            window.is_window_active() && this.page == Page::Home;
                                         this.matrix.update(cx, |client, cx| {
                                             client.set_focused(focused);
                                             if focused {

@@ -1,0 +1,595 @@
+//! Exercise the real Matrix upload/download API against an in-process homeserver.
+use super::*;
+use std::{
+    collections::HashMap,
+    io::{Read, Write},
+    net::TcpListener,
+    sync::atomic::{AtomicBool, Ordering},
+};
+
+#[derive(Default)]
+struct Traffic {
+    uploads: Vec<(String, Vec<u8>)>,
+    sent: Vec<serde_json::Value>,
+    files: HashMap<String, Vec<u8>>,
+    downloads: Vec<String>,
+    reject_uploads: bool,
+}
+
+#[tokio::test]
+async fn cache_clear_removes_downloads_but_preserves_session_and_pending_uploads() {
+    use matrix_sdk::media::store::IgnoreMediaRetentionPolicy;
+    let server = Server::new();
+    let client = Client::builder()
+        .homeserver_url(&server.url)
+        .server_versions([matrix_sdk::ruma::api::MatrixVersion::V1_11])
+        .build()
+        .await
+        .unwrap();
+    let session: MatrixSession = serde_json::from_value(serde_json::json!({
+        "user_id":"@tester:example.org", "device_id":"CACHE", "access_token":"test-token"
+    }))
+    .unwrap();
+    client.restore_session(session).await.unwrap();
+    let room = client
+        .create_room(create_room::v3::Request::new())
+        .await
+        .unwrap();
+    let policy = cache_policy();
+    client
+        .media()
+        .set_media_retention_policy(policy)
+        .await
+        .unwrap();
+    let downloaded = MediaRequestParameters {
+        source: MediaSource::Plain("mxc://example.org/downloaded".into()),
+        format: MediaFormat::File,
+    };
+    let pending = MediaRequestParameters {
+        source: MediaSource::Plain("mxc://example.org/pending".into()),
+        format: MediaFormat::File,
+    };
+    let poster = video_preview_request(&downloaded.source);
+    {
+        let store = client.media_store().lock().await.unwrap();
+        store
+            .add_media_content(&downloaded, vec![1, 2, 3], IgnoreMediaRetentionPolicy::No)
+            .await
+            .unwrap();
+        store
+            .add_media_content(&poster, vec![4, 5, 6], IgnoreMediaRetentionPolicy::No)
+            .await
+            .unwrap();
+        store
+            .add_media_content(&pending, vec![7, 8, 9], IgnoreMediaRetentionPolicy::Yes)
+            .await
+            .unwrap();
+    }
+    clear_media_cache(&client, &Shared::default())
+        .await
+        .unwrap();
+    let store = client.media_store().lock().await.unwrap();
+    assert!(
+        store
+            .get_media_content(&downloaded)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.get_media_content(&poster).await.unwrap().is_none());
+    assert_eq!(
+        store.get_media_content(&pending).await.unwrap(),
+        Some(vec![7, 8, 9])
+    );
+    assert_eq!(store.media_retention_policy(), policy);
+    assert_eq!(client.user_id().unwrap().as_str(), "@tester:example.org");
+    assert!(client.get_room(room.room_id()).is_some());
+}
+
+struct Server {
+    url: String,
+    traffic: Arc<Mutex<Traffic>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Server {
+    fn new() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let traffic = Arc::new(Mutex::new(Traffic::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let captured = traffic.clone();
+        let stopped = stop.clone();
+        let thread = std::thread::spawn(move || {
+            while !stopped.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(stream) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 8192];
+                let header_end = loop {
+                    let count = stream.read(&mut buffer).unwrap();
+                    if count == 0 {
+                        break None;
+                    }
+                    request.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = request.windows(4).position(|b| b == b"\r\n\r\n") {
+                        break Some(end + 4);
+                    }
+                };
+                let Some(header_end) = header_end else {
+                    continue;
+                };
+                let header = String::from_utf8_lossy(&request[..header_end]).to_string();
+                let length = header
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|n| n.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                while request.len() < header_end + length {
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let path = header
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap();
+                let mut traffic = captured.lock().unwrap();
+                let mut status = "200 OK";
+                let mut content_type = "application/json";
+                let response = if path.contains("/upload") && traffic.reject_uploads {
+                    status = "403 Forbidden";
+                    br#"{"errcode":"M_FORBIDDEN","error":"Uploads disabled"}"#.to_vec()
+                } else if path.contains("/upload") {
+                    let id = format!("file{}", traffic.uploads.len());
+                    let mime = header
+                        .lines()
+                        .find_map(|line| {
+                            line.split_once(':')
+                                .filter(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                                .map(|(_, value)| value.trim().to_owned())
+                        })
+                        .unwrap();
+                    let body = request[header_end..header_end + length].to_vec();
+                    traffic.files.insert(id.clone(), body.clone());
+                    traffic.uploads.push((mime, body));
+                    serde_json::to_vec(
+                        &serde_json::json!({"content_uri":format!("mxc://example.org/{id}")}),
+                    )
+                    .unwrap()
+                } else if path.contains("/download/") {
+                    let id = path.split('?').next().unwrap().rsplit('/').next().unwrap();
+                    traffic.downloads.push(id.to_owned());
+                    match traffic.files.get(id) {
+                        Some(bytes) => {
+                            content_type = "application/octet-stream";
+                            bytes.clone()
+                        }
+                        None => {
+                            status = "404 Not Found";
+                            br#"{"errcode":"M_NOT_FOUND","error":"Missing"}"#.to_vec()
+                        }
+                    }
+                } else if path.contains("/send/m.room.message/") {
+                    let body =
+                        serde_json::from_slice(&request[header_end..header_end + length]).unwrap();
+                    traffic.sent.push(body);
+                    br#"{"event_id":"$sent:example.org"}"#.to_vec()
+                } else if path.contains("/config") {
+                    br#"{"m.upload.size":20971520}"#.to_vec()
+                } else if path.contains("/createRoom") {
+                    br#"{"room_id":"!media:example.org"}"#.to_vec()
+                } else if path.contains("/state/") {
+                    status = "404 Not Found";
+                    br#"{"errcode":"M_NOT_FOUND","error":"No state"}"#.to_vec()
+                } else if path.contains("/state") {
+                    b"[]".to_vec()
+                } else if path.contains("/members") {
+                    br#"{"chunk":[]}"#.to_vec()
+                } else {
+                    b"{}".to_vec()
+                };
+                drop(traffic);
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len()).unwrap();
+                stream.write_all(&response).ok();
+            }
+        });
+        Self {
+            url,
+            traffic,
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+#[tokio::test]
+async fn uploads_video_thumbnail_and_downloads_preview_and_original() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let server = Server::new();
+        let client = Client::builder()
+            .homeserver_url(&server.url)
+            .server_versions([matrix_sdk::ruma::api::MatrixVersion::V1_11])
+            .build()
+            .await
+            .unwrap();
+        let session: MatrixSession = serde_json::from_value(serde_json::json!({
+            "user_id":"@tester:example.org", "device_id":"MEDIA", "access_token":"test-token"
+        }))
+        .unwrap();
+        client.restore_session(session).await.unwrap();
+        let room = client
+            .create_room(create_room::v3::Request::new())
+            .await
+            .unwrap();
+        let bytes = include_bytes!("../../tests/media/clip.mp4").to_vec();
+        let info = super::super::playback::inspect(&bytes, "video/mp4").unwrap();
+        let expected_poster = info.thumbnail.as_ref().unwrap().bytes.clone();
+        let (outbox, mut updates) = ui::unbounded();
+        let shared = Arc::new(Shared::default());
+        handle(
+            &client,
+            &outbox,
+            &shared,
+            Command::Picture {
+                room: room.room_id().to_owned(),
+                name: "clip.mp4".into(),
+                mime: "video/mp4".into(),
+                bytes: bytes.clone(),
+                width: info.width,
+                height: info.height,
+                caption: "A video caption".into(),
+                duration: info.duration,
+                thumbnail: info.thumbnail,
+                local: 1,
+                reply: None,
+                thread: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            updates.next().await,
+            Some(Update::Sent { event: Some(_), .. })
+        ));
+        let sent = {
+            let traffic = server.traffic.lock().unwrap();
+            assert_eq!(traffic.uploads.len(), 2);
+            assert!(
+                traffic
+                    .uploads
+                    .iter()
+                    .any(|(mime, body)| mime == "video/mp4" && body == &bytes)
+            );
+            assert!(
+                traffic
+                    .uploads
+                    .iter()
+                    .any(|(mime, body)| mime == "image/jpeg" && body == &expected_poster)
+            );
+            traffic.sent.last().unwrap().clone()
+        };
+        assert_eq!(sent["msgtype"], "m.video");
+        assert_eq!(sent["info"]["w"], 64);
+        assert_eq!(sent["info"]["h"], 48);
+        assert_eq!(sent["info"]["thumbnail_info"]["mimetype"], "image/jpeg");
+        let message: MessageType = serde_json::from_value(sent).unwrap();
+        let (_, caption, _, picture) = describe(&message);
+        assert!(!caption.is_empty());
+        let picture = picture.unwrap();
+        handle(
+            &client,
+            &outbox,
+            &shared,
+            Command::VideoPreview {
+                key: picture.key.clone(),
+                source: picture.source.clone(),
+                thumbnail: picture.thumbnail,
+            },
+        )
+        .await
+        .unwrap();
+        match updates.next().await.unwrap() {
+            Update::VideoPreview {
+                thumbnail: Some(poster),
+                bytes: None,
+                ..
+            } => assert_eq!(poster, expected_poster),
+            _ => panic!("Expected advertised preview without downloading the video"),
+        }
+        client
+            .media()
+            .remove_media_content(&video_preview_request(&picture.source))
+            .await
+            .unwrap();
+        handle(
+            &client,
+            &outbox,
+            &shared,
+            Command::VideoPreview {
+                key: picture.key.clone(),
+                source: picture.source.clone(),
+                thumbnail: Some(MediaSource::Plain("mxc://example.org/missing".into())),
+            },
+        )
+        .await
+        .unwrap();
+        match updates.next().await.unwrap() {
+            Update::VideoPreview {
+                thumbnail: Some(poster),
+                bytes: Some(original),
+                ..
+            } => {
+                assert_eq!(original, bytes);
+                assert_eq!(poster, expected_poster);
+            }
+            _ => panic!("Expected native fallback preview and cached video"),
+        }
+        let downloads = server.traffic.lock().unwrap().downloads.len();
+        handle(
+            &client,
+            &outbox,
+            &shared,
+            Command::VideoPreview {
+                key: picture.key.clone(),
+                source: picture.source.clone(),
+                thumbnail: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            updates.next().await,
+            Some(Update::VideoPreview {
+                thumbnail: Some(_),
+                bytes: None,
+                ..
+            })
+        ));
+        assert_eq!(
+            server.traffic.lock().unwrap().downloads.len(),
+            downloads,
+            "Cached video previews must not download the original again"
+        );
+        handle(
+            &client,
+            &outbox,
+            &shared,
+            Command::Fetch {
+                key: picture.key,
+                source: picture.source,
+                size: None,
+            },
+        )
+        .await
+        .unwrap();
+        match updates.next().await.unwrap() {
+            Update::Media {
+                bytes: Some(original),
+                ..
+            } => assert_eq!(original, bytes),
+            _ => panic!("Expected original playable bytes"),
+        }
+        // Every advertised container/extension uses the same real SDK upload path.
+        for (name, data) in [
+            (
+                "clip.m4v",
+                include_bytes!("../../tests/media/clip.m4v").as_slice(),
+            ),
+            (
+                "clip.mov",
+                include_bytes!("../../tests/media/clip.mov").as_slice(),
+            ),
+            (
+                "clip.mkv",
+                include_bytes!("../../tests/media/clip.mkv").as_slice(),
+            ),
+            (
+                "clip.webm",
+                include_bytes!("../../tests/media/clip.webm").as_slice(),
+            ),
+            (
+                "tone.mp3",
+                include_bytes!("../../tests/media/tone.mp3").as_slice(),
+            ),
+            (
+                "tone.m4a",
+                include_bytes!("../../tests/media/tone.m4a").as_slice(),
+            ),
+            (
+                "tone.aac",
+                include_bytes!("../../tests/media/tone.aac").as_slice(),
+            ),
+            (
+                "tone.wav",
+                include_bytes!("../../tests/media/tone.wav").as_slice(),
+            ),
+            (
+                "tone.flac",
+                include_bytes!("../../tests/media/tone.flac").as_slice(),
+            ),
+            (
+                "tone.ogg",
+                include_bytes!("../../tests/media/tone.ogg").as_slice(),
+            ),
+            (
+                "tone.oga",
+                include_bytes!("../../tests/media/tone.ogg").as_slice(),
+            ),
+        ] {
+            let mime = super::super::playback::mime(name).unwrap();
+            let info = super::super::playback::inspect(data, mime).unwrap();
+            handle(
+                &client,
+                &outbox,
+                &shared,
+                Command::Picture {
+                    room: room.room_id().to_owned(),
+                    name: name.into(),
+                    mime: mime.into(),
+                    bytes: data.to_vec(),
+                    width: info.width,
+                    height: info.height,
+                    duration: info.duration,
+                    thumbnail: info.thumbnail,
+                    caption: String::new(),
+                    local: 2,
+                    reply: None,
+                    thread: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(
+                    updates.next().await,
+                    Some(Update::Sent { event: Some(_), .. })
+                ),
+                "{name}"
+            );
+            let traffic = server.traffic.lock().unwrap();
+            let sent = traffic.sent.last().unwrap();
+            assert_eq!(
+                sent["msgtype"],
+                if mime.starts_with("video/") {
+                    "m.video"
+                } else {
+                    "m.audio"
+                },
+                "{name}"
+            );
+            assert_eq!(sent["info"]["mimetype"], mime, "{name}");
+            assert_eq!(sent["info"]["size"], data.len(), "{name}");
+            assert!(
+                traffic
+                    .uploads
+                    .iter()
+                    .any(|(uploaded_mime, bytes)| uploaded_mime == mime && bytes == data),
+                "{name}"
+            );
+        }
+        for (format, mime) in [
+            (image::ImageFormat::Png, "image/png"),
+            (image::ImageFormat::Jpeg, "image/jpeg"),
+            (image::ImageFormat::Gif, "image/gif"),
+            (image::ImageFormat::WebP, "image/webp"),
+            (image::ImageFormat::Bmp, "image/bmp"),
+        ] {
+            let mut data = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgb8(16, 12)
+                .write_to(&mut data, format)
+                .unwrap();
+            let bytes = data.into_inner();
+            assert!(super::super::sniff(&bytes).is_some());
+            assert_eq!(super::super::measure(&bytes), (16, 12));
+            handle(
+                &client,
+                &outbox,
+                &shared,
+                Command::Picture {
+                    room: room.room_id().to_owned(),
+                    name: format!("still.{}", format.extensions_str()[0]),
+                    mime: mime.into(),
+                    bytes: bytes.clone(),
+                    width: 16,
+                    height: 12,
+                    duration: None,
+                    thumbnail: None,
+                    caption: String::new(),
+                    local: 3,
+                    reply: None,
+                    thread: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                updates.next().await,
+                Some(Update::Sent { event: Some(_), .. })
+            ));
+            let traffic = server.traffic.lock().unwrap();
+            let sent = traffic.sent.last().unwrap();
+            assert_eq!(sent["msgtype"], "m.image");
+            assert_eq!(sent["info"]["mimetype"], mime);
+        }
+        server.traffic.lock().unwrap().reject_uploads = true;
+        let failed = handle(
+            &client,
+            &outbox,
+            &shared,
+            Command::Picture {
+                room: room.room_id().to_owned(),
+                name: "failed.mp4".into(),
+                mime: "video/mp4".into(),
+                bytes,
+                width: 64,
+                height: 48,
+                duration: None,
+                thumbnail: None,
+                caption: String::new(),
+                local: 99,
+                reply: None,
+                thread: None,
+            },
+        )
+        .await;
+        assert!(failed.is_err());
+        assert!(matches!(
+            updates.next().await,
+            Some(Update::Sent {
+                local: 99,
+                event: None,
+                ..
+            })
+        ));
+        handle(
+            &client,
+            &outbox,
+            &shared,
+            Command::VideoPreview {
+                key: "missing-preview".into(),
+                source: MediaSource::Plain("mxc://example.org/missing-video".into()),
+                thumbnail: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            updates.next().await,
+            Some(Update::VideoPreview {
+                bytes: None,
+                thumbnail: None,
+                ..
+            })
+        ));
+    })
+    .await
+    .expect("Media API integration test timed out");
+}

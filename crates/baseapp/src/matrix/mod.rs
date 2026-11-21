@@ -3,6 +3,9 @@ mod photo;
 mod playback;
 mod rich;
 
+use crate::cache::Cache;
+use crate::notifications::NotificationPreferences;
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -23,7 +26,7 @@ use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedUse
 use tokio::sync::mpsc::UnboundedSender;
 use ui::{
     ActiveTheme as _, Button, Checkbox, Copy, Dismiss, Fading as _, Input, Modal, Motioned as _,
-    PastedPicture, Scrollbar, Scroller, Submit, Text, Toast,
+    PastedPicture, Scrollbar, Scroller, Scrubber, ScrubberState, Submit, Text, Toast,
 };
 
 use backend::{
@@ -65,6 +68,7 @@ const EMOJI: [&str; 12] = [
 
 /// Asks the app shell to show its appearance settings.
 pub struct OpenSettings;
+pub struct CacheChanged;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -132,6 +136,7 @@ struct Upload {
     height: u32,
     preview: Option<Arc<Image>>,
     duration: Option<Duration>,
+    thumbnail: Option<playback::Thumbnail>,
 }
 
 const UPLOAD_LIMIT: usize = 20 * 1024 * 1024;
@@ -405,6 +410,7 @@ pub struct MatrixClient {
     space: Option<OwnedRoomId>,
     room: Option<OwnedRoomId>,
     focused: bool,
+    notifications: NotificationPreferences,
     timelines: HashMap<OwnedRoomId, Timeline>,
     members: HashMap<OwnedRoomId, Vec<Member>>,
     show_members: bool,
@@ -422,11 +428,15 @@ pub struct MatrixClient {
     notice_timer: Option<Task<()>>,
     refresh: Option<Task<()>>,
     next_local: u64,
-    media: RefCell<HashMap<String, Media>>,
-    files: HashMap<String, Vec<u8>>,
+    media: RefCell<Cache<Media>>,
+    files: Cache<Vec<u8>>,
+    cache_clearing: bool,
+    cache_status: Option<String>,
     viewing: Option<View>,
     player: Option<playback::Player>,
-    player_image: Option<Arc<Image>>,
+    player_image: Option<Arc<gpui::RenderImage>>,
+    player_timeline: ScrubberState,
+    player_scrub: Option<Duration>,
     pending_play: Option<Picture>,
     saving: Option<Task<()>>,
     person: Option<Person>,
@@ -457,6 +467,7 @@ pub struct MatrixClient {
 }
 
 impl EventEmitter<OpenSettings> for MatrixClient {}
+impl EventEmitter<CacheChanged> for MatrixClient {}
 
 impl MatrixClient {
     pub fn new(cx: &mut Context<Self>) -> Self {
@@ -496,6 +507,7 @@ impl MatrixClient {
             space: None,
             room: None,
             focused: true,
+            notifications: NotificationPreferences::default(),
             timelines: HashMap::new(),
             members: HashMap::new(),
             show_members: true,
@@ -521,11 +533,18 @@ impl MatrixClient {
             notice_timer: None,
             refresh: None,
             next_local: 0,
-            media: RefCell::default(),
-            files: HashMap::new(),
+            media: RefCell::new(Cache::new(32 * 1024 * 1024, 512, |media| match media {
+                Media::Ready(image) => image.bytes.len(),
+                _ => 0,
+            })),
+            files: Cache::new(128 * 1024 * 1024, 128, Vec::len),
+            cache_clearing: false,
+            cache_status: None,
             viewing: None,
             player: None,
             player_image: None,
+            player_timeline: ScrubberState::new("media-timeline"),
+            player_scrub: None,
             pending_play: None,
             saving: None,
             person: None,
@@ -581,6 +600,9 @@ impl MatrixClient {
     fn apply(&mut self, update: Update, cx: &mut Context<Self>) {
         match update {
             Update::SignedOut => {
+                self.cache_clearing = false;
+                self.cache_status = None;
+                cx.emit(CacheChanged);
                 self.phase = Phase::SignedOut;
                 self.me = None;
                 self.rooms.clear();
@@ -601,7 +623,9 @@ impl MatrixClient {
                 self.player = None;
                 self.pending_play = None;
                 self.player_image = None;
+                self.player_scrub = None;
                 self.files.clear();
+                self.media.borrow_mut().clear();
                 self.saving = None;
                 self.person = None;
                 self.line = None;
@@ -693,6 +717,7 @@ impl MatrixClient {
             }
             Update::SignedIn { user, name, avatar } => {
                 self.phase = Phase::SignedIn;
+                cx.emit(CacheChanged);
                 self.me = Some(Me {
                     id: user,
                     name,
@@ -736,7 +761,13 @@ impl MatrixClient {
             Update::Live { room, event } => {
                 let tag = room.to_string();
                 if let Some((title, body)) = self.live(room, event) {
-                    crate::presence::announce(cx, &title, &body, &tag);
+                    crate::presence::announce(
+                        cx,
+                        &title,
+                        &body,
+                        &tag,
+                        self.notifications.attention,
+                    );
                 }
             }
             Update::Sent { room, local, event } => self.sent(room, local, event),
@@ -744,6 +775,32 @@ impl MatrixClient {
                 self.dialog = None;
                 self.reveal(room, None, cx);
                 self.pending_focus = Some(Focus::Draft);
+            }
+            Update::CacheCleared { error } => {
+                self.cache_clearing = false;
+                self.cache_status = Some(error.unwrap_or_else(|| "Media cache cleared.".into()));
+                cx.emit(CacheChanged);
+            }
+            Update::VideoPreview {
+                key,
+                bytes,
+                thumbnail,
+            } => {
+                if let Some(bytes) = bytes {
+                    self.files.insert(format!("{key}#original"), bytes);
+                }
+                self.media.borrow_mut().insert(
+                    format!("{key}#poster"),
+                    match thumbnail {
+                        Some(bytes) => match sniff(&bytes) {
+                            Some(format) => {
+                                Media::Ready(Arc::new(Image::from_bytes(format, bytes)))
+                            }
+                            None => Media::Failed,
+                        },
+                        None => Media::Failed,
+                    },
+                );
             }
             Update::Media { key, bytes } => {
                 if self
@@ -753,6 +810,8 @@ impl MatrixClient {
                 {
                     let media = self.pending_play.take().unwrap();
                     if let Some(bytes) = bytes {
+                        self.files
+                            .insert(format!("{}#original", media.key), bytes.clone());
                         self.start_media(media, bytes, cx);
                     } else {
                         self.notify("This media file couldn't load. Try again.", true, cx);
@@ -813,8 +872,14 @@ impl MatrixClient {
                     .summary(&room)
                     .map(|room| room.name.clone())
                     .unwrap_or_else(|| "Someone".into());
-                if !self.focused {
-                    crate::presence::announce(cx, "Incoming call", &name, room.as_str());
+                if !self.focused && self.notifications.allows_call() {
+                    crate::presence::announce(
+                        cx,
+                        "Incoming call",
+                        &name,
+                        room.as_str(),
+                        self.notifications.attention,
+                    );
                 }
                 self.line = Some(Line::Ringing { room, event, name });
             }
@@ -987,7 +1052,15 @@ impl MatrixClient {
 
     fn live(&mut self, room: OwnedRoomId, event: Event) -> Option<(String, String)> {
         let preview = match &event {
-            Event::Message(message) if self.my_id().as_ref() != Some(&message.sender) => {
+            Event::Message(message)
+                if self.my_id().as_ref() != Some(&message.sender)
+                    && self.notifications.allows_message(
+                        self.summary(&room)
+                            .is_some_and(|room| room.kind == RoomKind::Direct),
+                        message.thread.is_some(),
+                        message.mentioned,
+                    ) =>
+            {
                 Some((self.alert(&room, message), message.thread.clone()))
             }
             _ => None,
@@ -1072,6 +1145,34 @@ impl MatrixClient {
         })
     }
 
+    pub fn cache_bytes(&self) -> usize {
+        self.files.bytes() + self.media.borrow().bytes()
+    }
+    pub fn cache_status(&self) -> Option<&str> {
+        self.cache_status.as_deref()
+    }
+    pub fn can_clear_cache(&self) -> bool {
+        self.phase == Phase::SignedIn && !self.cache_clearing
+    }
+    pub fn clear_cache(&mut self, cx: &mut Context<Self>) {
+        if !self.can_clear_cache() {
+            return;
+        }
+        self.files.retain(|key| key.starts_with("local:"));
+        self.media
+            .borrow_mut()
+            .retain(|key| key.starts_with("local:"));
+        self.cache_clearing = true;
+        self.cache_status = Some("Clearing media cache…".into());
+        self.command(Command::ClearCache);
+        cx.emit(CacheChanged);
+        cx.notify();
+    }
+
+    pub fn set_notifications(&mut self, preferences: NotificationPreferences) {
+        self.notifications = preferences;
+    }
+
     pub fn set_focused(&mut self, focused: bool) {
         self.focused = focused;
     }
@@ -1101,6 +1202,7 @@ impl MatrixClient {
             MessageKind::Emote => format!("* {}", one_line(&message.body)),
             _ => one_line(&message.body),
         };
+        let body = self.notifications.preview(body);
         let direct = self
             .summary(room)
             .is_some_and(|room| room.kind == RoomKind::Direct);
@@ -1488,6 +1590,7 @@ impl MatrixClient {
             thread: thread.clone(),
             replies: 0,
             reactions: Vec::new(),
+            mentioned: false,
         };
         let timeline = self.timelines.entry(room.clone()).or_default();
         let thread = match thread {
@@ -1552,9 +1655,14 @@ impl MatrixClient {
         };
         let key = format!("local:{local}#image");
         if let Some(preview) = &shot.preview {
-            self.media
-                .borrow_mut()
-                .insert(key.clone(), Media::Ready(preview.clone()));
+            self.media.borrow_mut().insert(
+                if shot.mime.starts_with("video/") {
+                    format!("{key}#poster")
+                } else {
+                    key.clone()
+                },
+                Media::Ready(preview.clone()),
+            );
         }
         self.files
             .insert(format!("{key}#original"), shot.bytes.clone());
@@ -1573,13 +1681,15 @@ impl MatrixClient {
                 true => rich::Rich::new(),
                 false => rich::markdown(&caption),
             },
-            kind: if shot.preview.is_some() {
+            kind: if shot.mime.starts_with("image/") {
                 MessageKind::Image
             } else {
                 MessageKind::Attachment
             },
             picture: Some(Picture {
-                mime: shot.preview.is_none().then(|| shot.mime.clone()),
+                mime: (!shot.mime.starts_with("image/")).then(|| shot.mime.clone()),
+                thumbnail: None,
+                duration: shot.duration,
                 key,
                 source: MediaSource::Plain(
                     <&matrix_sdk::ruma::MxcUri>::from("mxc://huddle/local").to_owned(),
@@ -1594,6 +1704,7 @@ impl MatrixClient {
             thread: thread.clone(),
             replies: 0,
             reactions: Vec::new(),
+            mentioned: false,
         };
         let timeline = self.timelines.entry(room.clone()).or_default();
         let thread = match thread {
@@ -1635,6 +1746,7 @@ impl MatrixClient {
             height: shot.height,
             caption,
             duration: shot.duration,
+            thumbnail: shot.thumbnail,
             local,
             reply: reply.map(|target| (target.id, target.sender)),
             thread,
@@ -1737,7 +1849,13 @@ impl MatrixClient {
                                         width: info.width,
                                         height: info.height,
                                         duration: info.duration,
-                                        preview: None,
+                                        preview: info.thumbnail.as_ref().map(|p| {
+                                            Arc::new(Image::from_bytes(
+                                                ImageFormat::Jpeg,
+                                                p.bytes.clone(),
+                                            ))
+                                        }),
+                                        thumbnail: info.thumbnail,
                                     },
                                 ));
                                 cx.notify();
@@ -1824,6 +1942,7 @@ impl MatrixClient {
             mime: mime_of(format).to_owned(),
             preview: Some(Arc::new(Image::from_bytes(format, bytes.clone()))),
             duration: None,
+            thumbnail: None,
             bytes,
             width,
             height,
@@ -3868,6 +3987,20 @@ impl MatrixClient {
                 })
                 .when(!message.rich.is_empty(), |body| body.child(rich(false, cx)))
                 .into_any_element(),
+            MessageKind::Attachment
+                if message.picture.as_ref().is_some_and(|p| {
+                    p.mime.as_deref().is_some_and(|m| m.starts_with("video/"))
+                }) =>
+            {
+                let picture = message.picture.as_ref().unwrap();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(self.render_video(picture, cx))
+                    .when(!message.rich.is_empty(), |body| body.child(rich(false, cx)))
+                    .into_any_element()
+            }
             MessageKind::Attachment => div()
                 .flex()
                 .items_center()
@@ -4212,9 +4345,103 @@ impl MatrixClient {
         .into_any_element()
     }
 
+    fn render_video(&self, video: &Picture, cx: &mut Context<Self>) -> AnyElement {
+        let theme = *cx.theme();
+        let key = format!("{}#poster", video.key);
+        let state = {
+            let mut cache = self.media.borrow_mut();
+            if let Some(state) = cache.get(&key) {
+                state.clone()
+            } else {
+                self.command(Command::VideoPreview {
+                    key: video.key.clone(),
+                    source: video.source.clone(),
+                    thumbnail: video.thumbnail.clone(),
+                });
+                cache.insert(key.clone(), Media::Loading);
+                Media::Loading
+            }
+        };
+        let (width, height) = if video.width > 0 && video.height > 0 {
+            fit(video.width, video.height)
+        } else {
+            (320., 180.)
+        };
+        let open = video.clone();
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .id(SharedString::from(format!("video-{}", video.key)))
+                    .relative()
+                    .w(px(width))
+                    .h(px(height))
+                    .rounded(theme.radius)
+                    .overflow_hidden()
+                    .bg(theme.secondary)
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| this.open_media(open.clone(), cx)))
+                    .when_some(
+                        match state {
+                            Media::Ready(image) => Some(image),
+                            _ => None,
+                        },
+                        |body, image| {
+                            body.child(img(image).size_full().object_fit(ObjectFit::Contain))
+                        },
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .px_3()
+                                    .py_2()
+                                    .rounded(theme.radius)
+                                    .bg(theme.background.opacity(0.85))
+                                    .text_color(theme.foreground)
+                                    .child("Play video"),
+                            ),
+                    )
+                    .when_some(video.duration, |body, duration| {
+                        body.child(
+                            div()
+                                .absolute()
+                                .bottom_2()
+                                .right_2()
+                                .px_2()
+                                .py_1()
+                                .rounded(theme.radius)
+                                .bg(theme.background.opacity(0.85))
+                                .text_color(theme.foreground)
+                                .text_size(theme.text(Text::Small))
+                                .child(format!(
+                                    "{}:{:02}",
+                                    duration.as_secs() / 60,
+                                    duration.as_secs() % 60
+                                )),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .text_size(theme.text(Text::Small))
+                    .text_color(theme.muted_foreground)
+                    .child(video.name.clone()),
+            )
+            .into_any_element()
+    }
+
     fn open_media(&mut self, media: Picture, cx: &mut Context<Self>) {
         self.player = None;
         self.player_image = None;
+        self.player_scrub = None;
         self.pending_play = None;
         if let Some(bytes) = self.files.get(&format!("{}#original", media.key)).cloned() {
             self.start_media(media, bytes, cx);
@@ -4231,16 +4458,22 @@ impl MatrixClient {
 
     fn start_media(&mut self, media: Picture, bytes: Vec<u8>, cx: &mut Context<Self>) {
         self.player_image = None;
+        self.player_scrub = None;
         self.player = Some(playback::Player::new(
             media.name,
             bytes,
             media.mime.unwrap_or_default(),
         ));
         let state = self.player.as_ref().unwrap().state.clone();
+        {
+            let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+            state.duration = media.duration.or(state.duration);
+        }
         cx.spawn(async move |this, cx| {
+            let mut last_status = None;
             loop {
                 cx.background_executor()
-                    .timer(Duration::from_millis(33))
+                    .timer(Duration::from_millis(16))
                     .await;
                 let active = this
                     .update(cx, |this, cx| {
@@ -4252,12 +4485,22 @@ impl MatrixClient {
                             return false;
                         }
                         let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(bytes) = state.frame.take() {
-                            this.player_image =
-                                Some(Arc::new(Image::from_bytes(ImageFormat::Jpeg, bytes)));
+                        let has_frame = state.frame.is_some();
+                        if let Some(image) = state.frame.take() {
+                            this.player_image = Some(image);
                         }
-                        cx.notify();
-                        !state.finished
+                        let status = (
+                            state.finished,
+                            state.seeking,
+                            state.position.as_millis() / 100,
+                            state.duration,
+                            state.error.clone(),
+                        );
+                        if has_frame || last_status.as_ref() != Some(&status) {
+                            cx.notify();
+                        }
+                        last_status = Some(status);
+                        true
                     })
                     .unwrap_or(false);
                 if !active {
@@ -4276,7 +4519,9 @@ impl MatrixClient {
         let theme = *cx.theme();
         let state = player.state.lock().unwrap_or_else(|e| e.into_inner());
         let status = state.error.clone().unwrap_or_else(|| {
-            if state.finished {
+            if state.seeking {
+                "Seeking…".into()
+            } else if state.finished {
                 "Playback finished.".into()
             } else if player.is_paused() {
                 "Paused".into()
@@ -4286,6 +4531,11 @@ impl MatrixClient {
         });
         let finished = state.finished;
         let viewport = window.viewport_size();
+        let position = self.player_scrub.unwrap_or(state.position);
+        let duration = state.duration.filter(|duration| !duration.is_zero());
+        let fraction = duration.map_or(0., |duration| {
+            (position.as_secs_f64() / duration.as_secs_f64()).clamp(0., 1.) as f32
+        });
         deferred(
             anchored().position(point(px(0.), px(0.))).child(
                 div()
@@ -4298,6 +4548,7 @@ impl MatrixClient {
                     .on_action(cx.listener(|this, _: &Dismiss, _, cx| {
                         this.player = None;
                         this.player_image = None;
+                        this.player_scrub = None;
                         cx.notify();
                     }))
                     .child(
@@ -4306,22 +4557,84 @@ impl MatrixClient {
                             .flex_col()
                             .gap_3()
                             .p_4()
-                            .max_w(viewport.width - px(64.))
+                            .w((viewport.width - px(64.)).min(px(960.)))
                             .text_color(theme.foreground)
                             .child(player.name.clone())
                             .when_some(self.player_image.clone(), |body, image| {
                                 body.child(
                                     img(image)
-                                        .w((viewport.width - px(96.)).min(px(960.)))
-                                        .h((viewport.height - px(220.)).max(px(100.)))
+                                        .w_full()
+                                        .h((viewport.height - px(360.)).max(px(80.)))
                                         .object_fit(ObjectFit::Contain),
                                 )
                             })
                             .child(status)
                             .child(
+                                Scrubber::new(&self.player_timeline, fraction)
+                                    .colors(theme.primary, theme.border, theme.foreground)
+                                    .enabled(duration.is_some() && state.error.is_none())
+                                    .when_some(self.player_scrub, |bar, time| {
+                                        bar.bubble(fraction, playback::time_label(time))
+                                    })
+                                    .on_move(cx.listener(move |this, fraction: &f32, _, cx| {
+                                        if let Some(duration) = duration {
+                                            this.player_scrub = Some(
+                                                duration.mul_f64((*fraction as f64).clamp(0., 1.)),
+                                            );
+                                            cx.notify();
+                                        }
+                                    }))
+                                    .on_release(cx.listener(|this, _, _, cx| {
+                                        if let Some(position) = this.player_scrub.take() {
+                                            if let Some(player) = &this.player {
+                                                player.seek_to(position);
+                                            }
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .justify_between()
+                                    .text_size(theme.text(Text::Small))
+                                    .text_color(theme.muted_foreground)
+                                    .child(playback::time_label(position))
+                                    .child(
+                                        duration
+                                            .map(playback::time_label)
+                                            .unwrap_or_else(|| "—".into()),
+                                    ),
+                            )
+                            .child(
                                 div()
                                     .flex()
                                     .gap_2()
+                                    .flex_wrap()
+                                    .child(
+                                        Button::new("media-back")
+                                            .secondary()
+                                            .label("−10s")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                if let Some(player) = &this.player {
+                                                    player.skip(-10);
+                                                }
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .when(finished && state.error.is_none(), |row| {
+                                        row.child(
+                                            Button::new("media-replay")
+                                                .secondary()
+                                                .label("Replay")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    if let Some(player) = &this.player {
+                                                        player.restart();
+                                                    }
+                                                    cx.notify();
+                                                })),
+                                        )
+                                    })
                                     .when(!finished, |row| {
                                         row.child(
                                             Button::new("media-pause")
@@ -4340,12 +4653,64 @@ impl MatrixClient {
                                         )
                                     })
                                     .child(
+                                        Button::new("media-forward")
+                                            .secondary()
+                                            .label("+10s")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                if let Some(player) = &this.player {
+                                                    player.skip(10);
+                                                }
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("media-volume-down")
+                                            .secondary()
+                                            .label("Volume −")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                if let Some(player) = &this.player {
+                                                    player.change_volume(-10);
+                                                }
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        div().px_2().py_2().child(format!("{}%", player.volume())),
+                                    )
+                                    .child(
+                                        Button::new("media-volume-up")
+                                            .secondary()
+                                            .label("Volume +")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                if let Some(player) = &this.player {
+                                                    player.change_volume(10);
+                                                }
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("media-mute")
+                                            .secondary()
+                                            .label(if player.is_muted() {
+                                                "Unmute"
+                                            } else {
+                                                "Mute"
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                if let Some(player) = &this.player {
+                                                    player.mute();
+                                                }
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
                                         Button::new("media-close")
                                             .secondary()
                                             .label("Close")
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.player = None;
                                                 this.player_image = None;
+                                                this.player_scrub = None;
                                                 cx.notify();
                                             })),
                                     ),
@@ -6283,6 +6648,7 @@ mod tests {
             thread: None,
             replies: 0,
             reactions: Vec::new(),
+            mentioned: false,
         }
     }
 

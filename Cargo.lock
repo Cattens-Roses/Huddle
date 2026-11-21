@@ -819,6 +819,7 @@ dependencies = [
  "rumpeg",
  "serde",
  "serde_json",
+ "symphonia",
  "tao",
  "tokio",
  "tray-icon",

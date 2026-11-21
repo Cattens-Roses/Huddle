@@ -73,13 +73,16 @@ pub fn install(window: WindowHandle<BaseApp>, cx: &mut App) -> bool {
 }
 
 /// A new message the person is not already looking at.
-pub fn announce(cx: &mut App, title: &str, body: &str, room: &str) {
+pub fn announce(cx: &mut App, title: &str, body: &str, room: &str, attention: bool) {
     cx.show_system_notification(SystemNotification {
         tag: SharedString::from(room.to_owned()),
         title: SharedString::from(title.to_owned()),
         body: SharedString::from(body.to_owned()),
         actions: Vec::new(),
     });
+    if !attention {
+        return;
+    }
     let Some(window) = cx.try_global::<Seat>().map(|seat| seat.window) else {
         return;
     };
