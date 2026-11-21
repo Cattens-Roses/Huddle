@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/icon.svg" alt="Huddle" width="128" height="128">
+  <img src="/assets/tray/sonora.png" alt="Huddle" width="128" height="128">
 </p>
 
 <h1 align="center">Huddle</h1>
