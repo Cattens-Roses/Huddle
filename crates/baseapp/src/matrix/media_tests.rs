@@ -7,8 +7,35 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+#[path = "room_admin_tests.rs"]
+mod room_admin_tests;
+
+fn decode_component(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut result = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let Ok(value) = u8::from_str_radix(&value[index + 1..index + 3], 16)
+        {
+            result.push(value);
+            index += 3;
+        } else {
+            result.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(result).unwrap()
+}
+
 #[derive(Default)]
 struct Traffic {
+    room_state: Option<Vec<serde_json::Value>>,
+    admin_requests: Vec<(String, serde_json::Value)>,
+    directory: String,
+    reject_admin: bool,
+    aliases: HashMap<String, String>,
     sync: Option<serde_json::Value>,
     state_writes: Vec<(String, serde_json::Value)>,
     uploads: Vec<(String, Vec<u8>)>,
@@ -291,15 +318,78 @@ impl Server {
                 let mut traffic = captured.lock().unwrap();
                 let mut status = "200 OK";
                 let mut content_type = "application/json";
-                let response = if path.contains("/sync") {
-                    serde_json::to_vec(
-                        &traffic
-                            .sync
-                            .take()
-                            .unwrap_or_else(|| serde_json::json!({"next_batch":"empty"})),
-                    )
-                    .unwrap()
+                let response = if path.contains("/keys/upload") {
+                    br#"{"one_time_key_counts":{"signed_curve25519":50}}"#.to_vec()
+                } else if let Some((_, alias)) = path.split_once("/directory/room/") {
+                    let alias = decode_component(alias);
+                    if header.starts_with("PUT ") {
+                        let body: serde_json::Value =
+                            serde_json::from_slice(&request[header_end..header_end + length])
+                                .unwrap();
+                        traffic
+                            .aliases
+                            .insert(alias, body["room_id"].as_str().unwrap().to_owned());
+                        b"{}".to_vec()
+                    } else if header.starts_with("DELETE ") {
+                        traffic.aliases.remove(&alias);
+                        b"{}".to_vec()
+                    } else if let Some(id) = traffic.aliases.get(&alias) {
+                        serde_json::to_vec(
+                            &serde_json::json!({"room_id":id,"servers":["example.org"]}),
+                        )
+                        .unwrap()
+                    } else {
+                        status = "404 Not Found";
+                        br#"{"errcode":"M_NOT_FOUND","error":"No alias"}"#.to_vec()
+                    }
+                } else if path.contains("/directory/list/room/") {
+                    if header.starts_with("PUT ") {
+                        let body: serde_json::Value =
+                            serde_json::from_slice(&request[header_end..header_end + length])
+                                .unwrap();
+                        traffic.directory = body["visibility"].as_str().unwrap().to_owned();
+                        b"{}".to_vec()
+                    } else {
+                        serde_json::to_vec(&serde_json::json!({"visibility":if traffic.directory.is_empty() { "private" } else { &traffic.directory }})).unwrap()
+                    }
+                } else if ["/invite", "/kick", "/ban", "/unban"]
+                    .iter()
+                    .any(|suffix| path.ends_with(suffix))
+                {
+                    traffic.admin_requests.push((
+                        path.to_owned(),
+                        serde_json::from_slice(&request[header_end..header_end + length]).unwrap(),
+                    ));
+                    if traffic.reject_admin {
+                        status = "403 Forbidden";
+                        br#"{"errcode":"M_FORBIDDEN","error":"Denied"}"#.to_vec()
+                    } else {
+                        b"{}".to_vec()
+                    }
+                } else if path.contains("/sync") {
+                    let sync = traffic
+                        .sync
+                        .take()
+                        .unwrap_or_else(|| serde_json::json!({"next_batch":"empty"}));
+                    if let Some(rooms) = sync["rooms"]["join"].as_object()
+                        && let Some(events) = rooms
+                            .values()
+                            .find_map(|room| room["state"]["events"].as_array())
+                    {
+                        traffic.room_state = Some(events.clone());
+                    }
+                    serde_json::to_vec(&sync).unwrap()
                 } else if path.contains("/state/") && header.starts_with("PUT ") {
+                    let suffix = path.split_once("/state/").unwrap().1;
+                    let (kind, key) = suffix.split_once('/').unwrap_or((suffix, ""));
+                    let kind = decode_component(kind);
+                    let key = decode_component(key);
+                    let content: serde_json::Value =
+                        serde_json::from_slice(&request[header_end..header_end + length]).unwrap();
+                    if let Some(state) = &mut traffic.room_state {
+                        state.retain(|event| event["type"] != kind || event["state_key"] != key);
+                        state.push(serde_json::json!({"type":kind,"state_key":key,"content":content,"event_id":"$updated","sender":"@tester:example.org","origin_server_ts":10}));
+                    }
                     traffic.state_writes.push((
                         path.to_owned(),
                         serde_json::from_slice(&request[header_end..header_end + length]).unwrap(),
@@ -365,7 +455,7 @@ impl Server {
                     status = "404 Not Found";
                     br#"{"errcode":"M_NOT_FOUND","error":"No state"}"#.to_vec()
                 } else if path.contains("/state") {
-                    b"[]".to_vec()
+                    serde_json::to_vec(&traffic.room_state.as_deref().unwrap_or_default()).unwrap()
                 } else if path.contains("/members") {
                     br#"{"chunk":[]}"#.to_vec()
                 } else {

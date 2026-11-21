@@ -7,7 +7,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -64,11 +64,82 @@ static WORKER_BUSY: AtomicBool = AtomicBool::new(false);
 static AUTO_ENABLED: AtomicBool = AtomicBool::new(true);
 static STATUS: Mutex<String> = Mutex::new(String::new());
 static REMOTE: Mutex<String> = Mutex::new(String::new());
-static READY_SINCE: Mutex<Option<Instant>> = Mutex::new(None);
+static PROMPT_REQUESTED: AtomicBool = AtomicBool::new(false);
+static DOWNLOAD_POLICY: Mutex<()> = Mutex::new(());
+static DOWNLOADS: DownloadGate = DownloadGate::new(true);
 static DEFER_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 static LAST_PERIODIC: Mutex<Option<Instant>> = Mutex::new(None);
 static STAGE_DIR: OnceLock<PathBuf> = OnceLock::new();
 static INSTALL_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+struct DownloadGate {
+    enabled: AtomicBool,
+    generation: AtomicU64,
+}
+impl DownloadGate {
+    const fn new(enabled: bool) -> Self {
+        Self {
+            enabled: AtomicBool::new(enabled),
+            generation: AtomicU64::new(0),
+        }
+    }
+    fn set(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::SeqCst);
+        if !enabled {
+            self.generation.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    fn ticket(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+    fn allows(&self, ticket: u64) -> bool {
+        self.enabled.load(Ordering::SeqCst) && self.ticket() == ticket
+    }
+}
+
+pub fn downloads_enabled() -> bool {
+    DOWNLOADS.enabled.load(Ordering::SeqCst)
+}
+
+pub fn set_downloads_enabled(enabled: bool) {
+    let _policy = DOWNLOAD_POLICY.lock().unwrap_or_else(|e| e.into_inner());
+    if state() == State::Applying {
+        return;
+    }
+    DOWNLOADS.set(enabled);
+    PROMPT_REQUESTED.store(false, Ordering::Relaxed);
+    if !enabled {
+        PERCENT.store(0, Ordering::Relaxed);
+        if matches!(
+            state(),
+            State::Downloading | State::Ready | State::Available
+        ) {
+            set_status(
+                State::Available,
+                "Update downloads are off. You can still check for new versions.",
+            );
+        }
+    } else {
+        CHECK_REQUESTED.store(true, Ordering::Relaxed);
+    }
+}
+
+pub fn take_restart_prompt() -> bool {
+    PROMPT_REQUESTED.swap(false, Ordering::Relaxed)
+        && state() == State::Ready
+        && downloads_enabled()
+}
+
+/// The only installation entry point; called after the user confirms a restart.
+pub fn apply_ready() {
+    #[cfg(target_os = "windows")]
+    {
+        let _policy = DOWNLOAD_POLICY.lock().unwrap_or_else(|e| e.into_inner());
+        if state() == State::Ready && downloads_enabled() && !WORKER_BUSY.load(Ordering::Relaxed) {
+            begin_apply_windows();
+        }
+    }
+}
 
 pub fn current_version() -> &'static str {
     option_env!("HUDDLE_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
@@ -102,12 +173,19 @@ pub fn set_auto_enabled(on: bool) {
     AUTO_ENABLED.store(on, Ordering::Relaxed);
     if !on {
         CHECK_REQUESTED.store(false, Ordering::Relaxed);
-        WANT_QUIT.store(false, Ordering::Relaxed);
-        *READY_SINCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let st = state();
-        if !matches!(st, State::Downloading | State::Checking | State::Applying) {
+        if !matches!(
+            st,
+            State::Downloading | State::Checking | State::Ready | State::Applying
+        ) {
             set_status(State::Disabled, "Automatic updates are off.");
         }
+        return;
+    }
+    if matches!(
+        state(),
+        State::Checking | State::Downloading | State::Ready | State::Applying
+    ) {
         return;
     }
     if updates_supported() {
@@ -131,10 +209,12 @@ pub fn check_now() {
     CHECK_REQUESTED.store(true, Ordering::Relaxed);
 }
 
-pub fn init(auto: bool) {
+pub fn init(auto: bool, downloads: bool) {
     AUTO_ENABLED.store(auto, Ordering::Relaxed);
     STOP.store(false, Ordering::Relaxed);
     WANT_QUIT.store(false, Ordering::Relaxed);
+    DOWNLOADS.set(downloads);
+    PROMPT_REQUESTED.store(false, Ordering::Relaxed);
     let _ = INSTALL_DIR.set(exe_dir());
     let _ = STAGE_DIR.set(stage_dir());
 
@@ -180,7 +260,7 @@ pub fn tick() {
         }
     }
 
-    if CHECK_REQUESTED.swap(false, Ordering::Relaxed) {
+    if !WORKER_BUSY.load(Ordering::Relaxed) && CHECK_REQUESTED.swap(false, Ordering::Relaxed) {
         let st = state();
         if !matches!(
             st,
@@ -212,17 +292,6 @@ pub fn tick() {
             }
         }
     }
-
-    #[cfg(target_os = "windows")]
-    if state() == State::Ready {
-        let mut since = READY_SINCE.lock().unwrap_or_else(|e| e.into_inner());
-        if since.is_none() {
-            *since = Some(now);
-        }
-        if since.is_some_and(|at| now.duration_since(at) >= Duration::from_millis(1500)) {
-            begin_apply_windows();
-        }
-    }
 }
 
 fn set_status(state: State, text: impl Into<String>) {
@@ -244,6 +313,9 @@ fn idle_message() -> &'static str {
 }
 
 fn unsupported_message() -> &'static str {
+    if environment_disabled() {
+        return "Updates are disabled by HUDDLE_DISABLE_UPDATE.";
+    }
     #[cfg(target_os = "windows")]
     {
         "Install directory is not writable. Reinstall with the per-user setup."
@@ -255,6 +327,9 @@ fn unsupported_message() -> &'static str {
 }
 
 fn updates_supported() -> bool {
+    if environment_disabled() {
+        return false;
+    }
     #[cfg(target_os = "windows")]
     {
         dir_writable(install_dir())
@@ -263,6 +338,10 @@ fn updates_supported() -> bool {
     {
         true
     }
+}
+
+fn environment_disabled() -> bool {
+    std::env::var_os("HUDDLE_DISABLE_UPDATE").is_some_and(|value| !value.is_empty() && value != "0")
 }
 
 fn exe_dir() -> PathBuf {
@@ -305,6 +384,10 @@ fn dir_writable(dir: &Path) -> bool {
 }
 
 fn enqueue_check() {
+    if environment_disabled() {
+        set_status(State::Disabled, unsupported_message());
+        return;
+    }
     if WORKER_BUSY.swap(true, Ordering::Relaxed) {
         return;
     }
@@ -334,20 +417,44 @@ fn http_get(url: &str) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(target_os = "windows")]
-fn http_get_long(url: &str) -> Result<Vec<u8>, String> {
+fn http_get_long(url: &str, ticket: u64) -> Result<Vec<u8>, String> {
+    if !DOWNLOADS.allows(ticket) {
+        return Err("Download cancelled.".into());
+    }
     let client = reqwest::blocking::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(Duration::from_secs(180))
         .build()
         .map_err(|e| e.to_string())?;
-    let response = client.get(url).send().map_err(|e| e.to_string())?;
+    let mut response = client.get(url).send().map_err(|e| e.to_string())?;
     if !response.status().is_success() {
         return Err(format!("HTTP {}", response.status()));
     }
-    response
-        .bytes()
-        .map(|b| b.to_vec())
-        .map_err(|e| e.to_string())
+    read_download(&mut response, || {
+        DOWNLOADS.allows(ticket) && !STOP.load(Ordering::Relaxed)
+    })
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn read_download(
+    reader: &mut impl std::io::Read,
+    allowed: impl Fn() -> bool,
+) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        if !allowed() {
+            return Err("Download cancelled.".into());
+        }
+        let read = reader.read(&mut chunk).map_err(|e| e.to_string())?;
+        if !allowed() {
+            return Err("Download cancelled.".into());
+        }
+        if read == 0 {
+            return Ok(bytes);
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -410,8 +517,38 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn prune_stage(root: &Path, wanted: &std::collections::HashSet<PathBuf>) -> Result<(), String> {
+    fn visit(
+        root: &Path,
+        dir: &Path,
+        wanted: &std::collections::HashSet<PathBuf>,
+    ) -> std::io::Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            let path = entry.path();
+            if kind.is_symlink() {
+                return Err(std::io::Error::other(
+                    "Unexpected link in update staging directory",
+                ));
+            }
+            if kind.is_dir() {
+                visit(root, &path, wanted)?;
+            } else if !wanted.contains(path.strip_prefix(root).map_err(std::io::Error::other)?) {
+                fs::remove_file(path)?;
+            }
+        }
+        Ok(())
+    }
+    fs::create_dir_all(root)
+        .and_then(|_| visit(root, root, wanted))
+        .map_err(|error| error.to_string())
+}
+
 #[cfg(target_os = "windows")]
 fn worker_windows() {
+    let ticket = DOWNLOADS.ticket();
     if STOP.load(Ordering::Relaxed) {
         return;
     }
@@ -453,7 +590,13 @@ fn worker_windows() {
     let mut need = Vec::new();
     for file in &man.files {
         let rel = normalize_rel(&file.path);
-        if rel.is_empty() || rel.contains("..") || file.sha256.len() != 64 {
+        if rel.is_empty()
+            || rel.contains("..")
+            || file.sha256.len() != 64
+            || Path::new(&rel)
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
             continue;
         }
         let local = install_dir().join(&rel);
@@ -468,15 +611,36 @@ fn worker_windows() {
         return;
     }
 
+    if !DOWNLOADS.allows(ticket) {
+        set_status(
+            State::Available,
+            "An update is available. Update downloads are off.",
+        );
+        return;
+    }
+
     set_status(
         State::Downloading,
         format!("Downloading update ({} files)…", need.len()),
     );
-    let _ = fs::create_dir_all(stage());
+    // A cancelled download may belong to an older manifest. Never copy stale
+    // staged files over already-current local files when a newer update resumes.
+    let wanted = need.iter().map(|(rel, _, _)| PathBuf::from(rel)).collect();
+    if let Err(error) = prune_stage(stage(), &wanted) {
+        set_status(
+            State::Error,
+            format!("Could not prepare update files: {error}"),
+        );
+        return;
+    }
 
     let total = need.len().max(1);
     for (index, (rel, sha, _size)) in need.into_iter().enumerate() {
-        if STOP.load(Ordering::Relaxed) {
+        if STOP.load(Ordering::Relaxed) || !DOWNLOADS.allows(ticket) {
+            set_status(
+                State::Available,
+                "Update download paused. Enable downloads to continue.",
+            );
             return;
         }
         let dest = stage().join(&rel);
@@ -485,13 +649,24 @@ fn worker_windows() {
             continue;
         }
         let url = format!("{base}b_{sha}");
-        let bytes = match http_get_long(&url) {
+        let bytes = match http_get_long(&url, ticket) {
             Ok(b) => b,
             Err(err) => {
+                if !DOWNLOADS.allows(ticket) {
+                    set_status(
+                        State::Available,
+                        "Update download paused. Enable downloads to continue.",
+                    );
+                    return;
+                }
                 set_status(State::Error, format!("Download failed for {rel}: {err}"));
                 return;
             }
         };
+        if !DOWNLOADS.allows(ticket) {
+            set_status(State::Available, "Update download paused.");
+            return;
+        }
         if !sha256_bytes(&bytes).eq_ignore_ascii_case(&sha) {
             set_status(State::Error, format!("Checksum failed for {rel}"));
             return;
@@ -507,13 +682,21 @@ fn worker_windows() {
         );
     }
 
+    let _policy = DOWNLOAD_POLICY.lock().unwrap_or_else(|e| e.into_inner());
+    if !DOWNLOADS.allows(ticket) {
+        set_status(State::Available, "Update download paused.");
+        return;
+    }
     let _ = fs::write(stage().join(".huddle-update-version"), &man.version);
     PERCENT.store(100, Ordering::Relaxed);
-    *READY_SINCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
     set_status(
         State::Ready,
-        format!("Update {} ready. Restarting…", man.version),
+        format!(
+            "Update {} is ready. Restart when you're ready to install it.",
+            man.version
+        ),
     );
+    PROMPT_REQUESTED.store(true, Ordering::Relaxed);
 }
 
 #[cfg(target_os = "windows")]
@@ -662,4 +845,108 @@ pub fn apt_setup_url() -> &'static str {
 
 pub fn releases_url() -> String {
     format!("https://github.com/{UPDATE_REPO}/releases/tag/{UPDATE_CHANNEL}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn disabling_downloads_cancels_old_requests_even_after_reenabling() {
+        let gate = DownloadGate::new(true);
+        let first = gate.ticket();
+        assert!(gate.allows(first));
+        gate.set(false);
+        assert!(!gate.allows(first));
+        gate.set(true);
+        assert!(!gate.allows(first));
+        assert!(gate.allows(gate.ticket()));
+    }
+
+    #[test]
+    fn disabled_download_does_not_read_the_response_body() {
+        let mut body = Cursor::new(vec![1u8; 128 * 1024]);
+        assert!(read_download(&mut body, || false).is_err());
+        assert_eq!(body.position(), 0);
+    }
+
+    #[test]
+    fn disabling_a_running_download_stops_before_the_next_chunk() {
+        struct Body<'a> {
+            gate: &'a DownloadGate,
+            reads: usize,
+        }
+        impl std::io::Read for Body<'_> {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                out.fill(7);
+                self.gate.set(false);
+                Ok(out.len())
+            }
+        }
+        let gate = DownloadGate::new(true);
+        let ticket = gate.ticket();
+        let mut body = Body {
+            gate: &gate,
+            reads: 0,
+        };
+        assert!(read_download(&mut body, || gate.allows(ticket)).is_err());
+        assert_eq!(body.reads, 1);
+    }
+
+    #[test]
+    fn enabled_download_preserves_the_complete_response() {
+        let bytes = vec![42; 150_000];
+        assert_eq!(
+            read_download(&mut Cursor::new(&bytes), || true).unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn resuming_an_update_removes_stale_files_from_previous_manifests() {
+        let base = std::env::temp_dir();
+        let root = base.join(format!(
+            "huddle-updater-stage-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("nested")).unwrap();
+        fs::write(root.join("Huddle.exe"), b"needed").unwrap();
+        fs::write(root.join("nested/old.dll"), b"stale").unwrap();
+        fs::write(root.join(".huddle-update-version"), b"old").unwrap();
+        prune_stage(&root, &[PathBuf::from("Huddle.exe")].into()).unwrap();
+        assert_eq!(fs::read(root.join("Huddle.exe")).unwrap(), b"needed");
+        assert!(!root.join("nested/old.dll").exists());
+        assert!(!root.join(".huddle-update-version").exists());
+        assert!(root.starts_with(&base));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ready_update_does_not_restart_without_confirmation_or_repeat_the_prompt() {
+        STATE.store(State::Ready as u8, Ordering::Relaxed);
+        AUTO_ENABLED.store(true, Ordering::Relaxed);
+        DOWNLOADS.set(true);
+        PROMPT_REQUESTED.store(true, Ordering::Relaxed);
+        WANT_QUIT.store(false, Ordering::Relaxed);
+        tick();
+        assert_eq!(state() as u8, State::Ready as u8);
+        assert!(!wants_quit_for_apply());
+        assert!(take_restart_prompt());
+        assert!(!take_restart_prompt());
+        // Choosing Later only dismisses the prompt. Periodic ticks must leave
+        // the staged update ready until the explicit apply_ready entry point.
+        for _ in 0..3 {
+            tick();
+        }
+        assert_eq!(state() as u8, State::Ready as u8);
+        assert!(!wants_quit_for_apply());
+        STATE.store(State::Idle as u8, Ordering::Relaxed);
+    }
 }

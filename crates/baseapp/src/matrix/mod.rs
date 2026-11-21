@@ -2,6 +2,7 @@ mod backend;
 mod photo;
 mod playback;
 mod rich;
+mod room_settings;
 mod upload;
 
 use crate::cache::Cache;
@@ -473,6 +474,7 @@ pub struct MatrixClient {
     room_name: Entity<Input>,
     room_topic: Entity<Input>,
     room_settings_busy: bool,
+    admin: room_settings::Panel,
     mark: Option<Mark>,
     _updates: Task<()>,
 }
@@ -603,6 +605,7 @@ impl MatrixClient {
             room_name: cx.new(|cx| Input::new("Room name", cx)),
             room_topic: cx.new(|cx| Input::new("Room topic", cx).growing()),
             room_settings_busy: false,
+            admin: room_settings::Panel::new(cx),
             mark: None,
             _updates: listener,
         };
@@ -637,6 +640,30 @@ impl MatrixClient {
             return;
         }
         match update {
+            Update::RoomAdminLoaded { room, result } => {
+                if self.settings_room.as_ref() != Some(&room) {
+                    return;
+                }
+                self.admin.loading = false;
+                match result {
+                    Ok(snapshot) => {
+                        self.admin.load(snapshot, cx);
+                    }
+                    Err(error) => {
+                        self.admin.snapshot = None;
+                        self.admin.status = Some(error);
+                    }
+                }
+            }
+            Update::RoomAdminDone { room, error } => {
+                if self.settings_room.as_ref() != Some(&room) {
+                    return;
+                }
+                self.room_settings_busy = false;
+                self.admin.loading = true;
+                self.admin.confirm = None;
+                self.admin.status = Some(error.unwrap_or_else(|| "Settings updated.".into()));
+            }
             Update::RoomSettingsSaved {
                 room,
                 name,
@@ -661,12 +688,11 @@ impl MatrixClient {
                             summary.topic = (!topic.is_empty()).then_some(topic);
                         }
                     }
-                    self.dialog = None;
-                    self.settings_room = None;
                     self.notify("Room settings saved.", false, cx);
                 }
             }
             Update::SignedOut => {
+                self.admin.reset();
                 self.settings_room = None;
                 self.room_settings_busy = false;
                 self.cache_clearing = false;
@@ -2457,11 +2483,20 @@ impl MatrixClient {
     }
 
     fn open_room_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.room.clone() {
+            self.open_room_settings_for(id, window, cx);
+        }
+    }
+
+    fn open_room_settings_for(
+        &mut self,
+        id: OwnedRoomId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(room) = self
-            .room
-            .as_ref()
-            .and_then(|id| self.summary(id))
-            .filter(|room| !room.invite && (room.can_edit_name || room.can_edit_topic))
+            .summary(&id)
+            .filter(|room| !room.invite && room.can_manage)
         else {
             return;
         };
@@ -2471,7 +2506,10 @@ impl MatrixClient {
             room.topic.clone().unwrap_or_default(),
             room.can_edit_name,
         );
-        self.settings_room = Some(id);
+        self.settings_room = Some(id.clone());
+        self.admin.begin(cx);
+        self.admin.loading = true;
+        self.command(Command::LoadRoomAdmin(id));
         self.room_settings_busy = false;
         self.room_name
             .update(cx, |input, cx| input.set_text(name, cx));
@@ -2579,6 +2617,7 @@ impl MatrixClient {
         }
         self.dialog = None;
         self.settings_room = None;
+        self.admin.reset();
         self.removing_space = None;
         cx.notify();
     }
@@ -3926,18 +3965,42 @@ impl MatrixClient {
             )
             .when_some(space, |sidebar, space| {
                 let id = space.id.clone();
+                let settings_id = id.clone();
                 sidebar.child(
-                    div().px_2().py_2().child(
-                        Button::new("remove-space")
-                            .ghost()
-                            .small()
-                            .w_full()
-                            .icon("icons/log-out.svg")
-                            .label("Remove space")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.remove_space(id.clone(), window, cx)
-                            })),
-                    ),
+                    div()
+                        .px_2()
+                        .py_2()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .when(space.can_manage, |body| {
+                            body.child(
+                                Button::new("space-settings")
+                                    .ghost()
+                                    .small()
+                                    .w_full()
+                                    .icon("icons/settings.svg")
+                                    .label("Space settings")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.open_room_settings_for(
+                                            settings_id.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    })),
+                            )
+                        })
+                        .child(
+                            Button::new("remove-space")
+                                .ghost()
+                                .small()
+                                .w_full()
+                                .icon("icons/log-out.svg")
+                                .label("Remove space")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.remove_space(id.clone(), window, cx)
+                                })),
+                        ),
                 )
             })
             .child(list)
@@ -5908,7 +5971,7 @@ impl MatrixClient {
                     )
             })
             .child(div().flex_1())
-            .when(room.can_edit_name || room.can_edit_topic, |header| {
+            .when(room.can_manage, |header| {
                 header.child(
                     Button::new("room-settings")
                         .ghost()
@@ -6628,62 +6691,6 @@ impl MatrixClient {
                     .label(if busy { "Saving…" } else { "Save" })
                     .disabled(busy)
                     .on_click(cx.listener(|this, _, _, cx| this.save_profile(cx))),
-            )
-            .into_any_element()
-    }
-
-    fn render_room_settings(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = *cx.theme();
-        let room = self.settings_room.as_ref().and_then(|id| self.summary(id));
-        let can_name = room.is_some_and(|room| !room.invite && room.can_edit_name);
-        let can_topic = room.is_some_and(|room| !room.invite && room.can_edit_topic);
-        let busy = self.room_settings_busy;
-        let row = |title: &'static str, input: &Entity<Input>, editable: bool| {
-            div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child(
-                    div()
-                        .text_size(theme.text(Text::Small))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(title),
-                )
-                .child(if editable && !busy {
-                    div().min_h(px(40.)).child(input.clone()).into_any_element()
-                } else {
-                    div()
-                        .text_color(theme.muted_foreground)
-                        .child(input.read(cx).text().to_owned())
-                        .into_any_element()
-                })
-        };
-        Modal::new("dialog-room-settings", "Room settings")
-            .w(px(460.))
-            .close_button()
-            .on_dismiss(cx.listener(|this, _: &(), _, cx| this.close_dialog(cx)))
-            .child(row("Name", &self.room_name, can_name))
-            .child(row("Topic", &self.room_topic, can_topic))
-            .when(!can_name && !can_topic, |modal| {
-                modal.child(
-                    div()
-                        .text_color(theme.muted_foreground)
-                        .child("You no longer have permission to edit this room."),
-                )
-            })
-            .action(
-                Button::new("room-settings-cancel")
-                    .ghost()
-                    .label("Cancel")
-                    .disabled(busy)
-                    .on_click(cx.listener(|this, _, _, cx| this.close_dialog(cx))),
-            )
-            .action(
-                Button::new("room-settings-save")
-                    .primary()
-                    .label(if busy { "Saving…" } else { "Save" })
-                    .disabled(busy || (!can_name && !can_topic))
-                    .on_click(cx.listener(|this, _, _, cx| this.save_room_settings(cx))),
             )
             .into_any_element()
     }

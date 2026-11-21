@@ -96,6 +96,23 @@ Windows releases ship it as `Huddle.exe`. Build an installer with
 The installer uses `assets/windows/huddle.ico`; after changing that icon, run
 `python scripts/generate-windows-wizard.py` to refresh its wizard panels (requires Pillow).
 
+## Updates
+
+On Windows, **Updates > Download updates** controls background update downloads
+independently of automatic version checks. Turning it off cancels the current
+download. Downloaded updates ask before restarting: choose **Restart now** or
+**Later**, then use **Updates > Install update** when ready.
+
+## Room and space settings
+
+Use the settings button in a room header, or **Space settings** in a space sidebar.
+The panel manages the name, topic, icon, addresses, join rules, allowed spaces,
+history visibility, guest access, public directory listing, and encryption.
+Administrators can change default permission levels and member roles, invite,
+remove, ban, and unban users. Space settings also manage linked rooms, their order,
+and whether they are suggested, and can create new rooms. Actions use current Matrix permissions; enabling
+encryption is permanent. Room IDs and room versions are shown as information.
+
 ## Media notes
 
 Chat attachments support images plus MP4/M4V, MOV, MKV, WebM, MP3, M4A, AAC, WAV, FLAC, and Ogg/OGA (up to 20 MB). Playback uses native Rust decoders, GPUI video rendering, and system audio. Video containers support H.264, 8-bit HEVC, and VP9 with AAC, MP3, FLAC, PCM, or Opus audio.

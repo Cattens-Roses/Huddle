@@ -176,6 +176,8 @@ struct Huddle {
     matrix: Entity<matrix::MatrixClient>,
     in_tray: bool,
     auto_update: bool,
+    download_updates: bool,
+    restart_prompt: bool,
     _updater: Option<gpui::Task<()>>,
 }
 
@@ -198,6 +200,7 @@ struct Preferences {
     photo_size: PhotoSize,
     notifications: NotificationPreferences,
     auto_update: bool,
+    download_updates: bool,
 }
 
 impl Default for Preferences {
@@ -220,6 +223,7 @@ impl Default for Preferences {
             photo_size: PhotoSize::Balanced,
             notifications: NotificationPreferences::default(),
             auto_update: true,
+            download_updates: true,
         }
     }
 }
@@ -289,6 +293,9 @@ impl Preferences {
                     prefs.notifications = serde_json::from_str(value).unwrap_or(prefs.notifications)
                 }
                 "auto_update" => prefs.auto_update = value.parse().unwrap_or(prefs.auto_update),
+                "download_updates" => {
+                    prefs.download_updates = value.parse().unwrap_or(prefs.download_updates)
+                }
                 _ => {}
             }
         }
@@ -309,7 +316,7 @@ impl Preferences {
     }
     fn encode(self) -> String {
         format!(
-            "theme={}\nrounding={}\nblur={}\nblur_window={}\nfont_size={}\nicon_pack={}\ntransparent={}\ntransparency={}\nstillness={}\npace={}\nambient={}\nambient_style={}\nambient_motion={}\nphoto_compress={}\nphoto_size={}\nnotifications={}\nauto_update={}\n",
+            "theme={}\nrounding={}\nblur={}\nblur_window={}\nfont_size={}\nicon_pack={}\ntransparent={}\ntransparency={}\nstillness={}\npace={}\nambient={}\nambient_style={}\nambient_motion={}\nphoto_compress={}\nphoto_size={}\nnotifications={}\nauto_update={}\ndownload_updates={}\n",
             self.theme.id(),
             self.rounding.id(),
             self.blur,
@@ -326,7 +333,8 @@ impl Preferences {
             self.photo_compress,
             self.photo_size.id(),
             serde_json::to_string(&self.notifications).expect("notification preferences serialize"),
-            self.auto_update
+            self.auto_update,
+            self.download_updates
         )
     }
 }
@@ -348,6 +356,20 @@ fn preferences_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod notification_preferences_tests {
     use super::*;
+
+    #[test]
+    fn update_download_preference_round_trips_and_old_configs_keep_the_default() {
+        let prefs = Preferences {
+            download_updates: false,
+            auto_update: false,
+            ..Default::default()
+        };
+        let restored = Preferences::parse(&prefs.encode());
+        assert!(!restored.download_updates);
+        assert!(!restored.auto_update);
+        assert!(Preferences::parse("font_size=16\n").download_updates);
+        assert!(Preferences::parse("download_updates=invalid\n").download_updates);
+    }
 
     #[test]
     fn notifications_round_trip_with_existing_preferences() {
@@ -385,7 +407,7 @@ mod notification_preferences_tests {
 impl Huddle {
     fn new(prefs: Preferences, cx: &mut Context<Self>) -> Self {
         let owner = cx.entity_id();
-        updater::init(prefs.auto_update);
+        updater::init(prefs.auto_update, prefs.download_updates);
         let updater_tick = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
@@ -394,6 +416,17 @@ impl Huddle {
                 if this
                     .update(cx, |this, cx| {
                         updater::tick();
+                        if updater::take_restart_prompt() {
+                            this.restart_prompt = true;
+                            cx.notify();
+                        }
+                        if this.restart_prompt
+                            && (updater::state() != updater::State::Ready
+                                || !updater::downloads_enabled())
+                        {
+                            this.restart_prompt = false;
+                            cx.notify();
+                        }
                         if updater::wants_quit_for_apply() {
                             cx.quit();
                             return true;
@@ -443,6 +476,8 @@ impl Huddle {
             activation_observer: None,
             in_tray: false,
             auto_update: prefs.auto_update,
+            download_updates: prefs.download_updates,
+            restart_prompt: false,
             _updater: Some(updater_tick),
             matrix: {
                 let matrix = cx.new(|cx| {
@@ -516,6 +551,7 @@ impl Huddle {
             photo_size: self.photo_size,
             notifications: self.notifications,
             auto_update: self.auto_update,
+            download_updates: self.download_updates,
         }
     }
 
@@ -565,8 +601,9 @@ impl Huddle {
         let percent = updater::download_percent();
         let state = updater::state();
         let version = updater::current_version();
-        let auto =
-            Switch::new("auto-update", self.auto_update).on_click(cx.listener(|this, _, _, cx| {
+        let auto = Switch::new("auto-update", self.auto_update)
+            .disabled(state == updater::State::Applying)
+            .on_click(cx.listener(|this, _, _, cx| {
                 this.auto_update = !this.auto_update;
                 updater::set_auto_enabled(this.auto_update);
                 this.save();
@@ -608,9 +645,9 @@ impl Huddle {
             )
             .into_any_element(),
             self.row(
-                "Automatic updates",
+                "Automatic checks",
                 #[cfg(target_os = "windows")]
-                "Download changed files from the rolling beta channel and apply them in place",
+                "Check the rolling beta channel for new versions automatically",
                 #[cfg(not(target_os = "windows"))]
                 "Watch the rolling beta channel; install upgrades with apt when available",
                 auto.into_any_element(),
@@ -648,12 +685,33 @@ impl Huddle {
                     .flex()
                     .gap_2()
                     .child(check)
+                    .when(state == updater::State::Ready, |body| {
+                        body.child(
+                            Button::new("review-update-restart")
+                                .primary()
+                                .label("Install update")
+                                .disabled(!self.download_updates)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.restart_prompt = true;
+                                    cx.notify();
+                                })),
+                        )
+                    })
                     .child(open_release)
                     .into_any_element(),
                 cx,
             )
             .into_any_element(),
         ];
+        #[cfg(target_os = "windows")]
+        rows.insert(2, self.row("Download updates", "Download update files in the background. Restart always requires your confirmation.",
+            Switch::new("download-updates", self.download_updates).disabled(state == updater::State::Applying)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.download_updates = !this.download_updates;
+                    updater::set_downloads_enabled(this.download_updates);
+                    if !this.download_updates { this.restart_prompt = false; }
+                    this.save(); cx.notify();
+                })).into_any_element(), cx).into_any_element());
         #[cfg(not(target_os = "windows"))]
         rows.push(
             self.row(
@@ -1579,6 +1637,16 @@ impl Render for Huddle {
                     .child(sidebar)
                     .child(content)
             })
+            .when(self.restart_prompt && updater::state() == updater::State::Ready, |body| body.child(
+                ui::Modal::new("update-restart-confirm", "Restart to install the update?")
+                    .detail("The update is downloaded. Restart Huddle now, or keep working and install it later from Updates.")
+                    .w(px(460.)).close_button()
+                    .on_dismiss(cx.listener(|this, _: &(), _, cx| { this.restart_prompt = false; cx.notify(); }))
+                    .action(Button::new("update-restart-later").ghost().label("Later")
+                        .on_click(cx.listener(|this, _, _, cx| { this.restart_prompt = false; cx.notify(); })))
+                    .action(Button::new("update-restart-now").primary().label("Restart now")
+                        .on_click(cx.listener(|this, _, _, cx| { this.restart_prompt = false; updater::apply_ready(); cx.notify(); })))
+            ))
             .into_any_element()
     }
 }

@@ -61,6 +61,9 @@ mod media_tests;
 #[path = "call.rs"]
 mod call;
 
+#[path = "room_admin.rs"]
+pub mod admin;
+
 const DEVICE_NAME: &str = "Huddle";
 const HISTORY: u32 = 60;
 const PAGE: usize = 20;
@@ -80,6 +83,7 @@ pub enum RoomKind {
 
 #[derive(Clone)]
 pub struct RoomSummary {
+    pub can_manage: bool,
     pub id: OwnedRoomId,
     pub name: String,
     pub explicit_name: Option<String>,
@@ -204,6 +208,11 @@ pub enum Answer {
 }
 
 pub enum Command {
+    LoadRoomAdmin(OwnedRoomId),
+    RoomAdmin {
+        room: OwnedRoomId,
+        action: admin::Action,
+    },
     RoomSettings {
         room: OwnedRoomId,
         name: Option<String>,
@@ -318,6 +327,14 @@ pub enum Command {
 }
 
 pub enum Update {
+    RoomAdminLoaded {
+        room: OwnedRoomId,
+        result: std::result::Result<Box<admin::Snapshot>, String>,
+    },
+    RoomAdminDone {
+        room: OwnedRoomId,
+        error: Option<String>,
+    },
     RoomSettingsSaved {
         room: OwnedRoomId,
         name: Option<String>,
@@ -1059,6 +1076,33 @@ async fn handle(
     command: Command,
 ) -> Result<()> {
     match command {
+        Command::LoadRoomAdmin(room) => {
+            let result = admin::load(client, &room)
+                .await
+                .map(Box::new)
+                .map_err(|error| problem(&error));
+            post(outbox, Update::RoomAdminLoaded { room, result });
+        }
+        Command::RoomAdmin { room, action } => {
+            let result = admin::apply(client, &room, action).await;
+            let error = result.err().map(|error| {
+                log::warn!("room settings: {error:#}");
+                problem(&error)
+            });
+            post(outbox, Update::Rooms(summaries(client).await));
+            post(
+                outbox,
+                Update::RoomAdminDone {
+                    room: room.clone(),
+                    error,
+                },
+            );
+            let result = admin::load(client, &room)
+                .await
+                .map(Box::new)
+                .map_err(|error| problem(&error));
+            post(outbox, Update::RoomAdminLoaded { room, result });
+        }
         Command::RoomSettings { room, name, topic } => {
             let result = save_room_settings(client, &room, name.as_deref(), topic.as_deref()).await;
             if result.is_err() {
@@ -1818,7 +1862,7 @@ async fn save_room_settings(
 ) -> Result<()> {
     let room = joined(client, id)?;
     let user = client.user_id().ok_or_else(|| anyhow!("not signed in"))?;
-    let levels = room.power_levels().await?;
+    let levels = admin::fresh_levels(client, &room).await?;
     let (can_name, can_topic) = room_edit_permissions(&levels, user);
     anyhow::ensure!(
         (name.is_none() || can_name) && (topic.is_none() || can_topic),
@@ -1868,18 +1912,19 @@ async fn summaries(client: &Client) -> Vec<RoomSummary> {
         let counts = room.unread_notification_counts();
         let permissions = if state == RoomState::Joined {
             match (client.user_id(), room.power_levels().await) {
-                (Some(user), Ok(levels)) => room_edit_permissions(&levels, user),
-                _ => (false, false),
+                (Some(user), Ok(levels)) => admin::Permissions::new(&levels, user),
+                _ => admin::Permissions::default(),
             }
         } else {
-            (false, false)
+            admin::Permissions::default()
         };
         rooms.push(RoomSummary {
+            can_manage: permissions.any(),
             id: room.room_id().to_owned(),
             name,
             explicit_name: room.name(),
-            can_edit_name: permissions.0,
-            can_edit_topic: permissions.1,
+            can_edit_name: permissions.name,
+            can_edit_topic: permissions.topic,
             topic: room.topic().filter(|topic| !topic.trim().is_empty()),
             avatar: room.avatar_url(),
             kind,
@@ -2286,6 +2331,15 @@ fn problem(error: &anyhow::Error) -> String {
         "The comparison has",
         "The call",
         "You don't have permission",
+        "Enter a ",
+        "Choose ",
+        "That address ",
+        "Room permissions ",
+        "Invalid ",
+        "Unsupported room ",
+        "Spaces cannot ",
+        "Join this room ",
+        "Room was created, ",
     ];
     if let Some(message) = error.chain().find_map(|cause| {
         let text = cause.to_string();
