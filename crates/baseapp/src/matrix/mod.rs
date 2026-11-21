@@ -2,6 +2,7 @@ mod backend;
 mod photo;
 mod playback;
 mod rich;
+mod upload;
 
 use crate::cache::Cache;
 use crate::notifications::NotificationPreferences;
@@ -17,9 +18,9 @@ use futures::StreamExt as _;
 use gpui::prelude::*;
 use gpui::{
     Anchor, AnimationExt as _, AnyElement, App, ClickEvent, ClipboardItem, Context, Div, ElementId,
-    Entity, EventEmitter, FontWeight, Hsla, Image, ImageFormat, ListAlignment, ListState,
-    MouseButton, ObjectFit, Pixels, SharedString, SpringAnimation, Task, WeakEntity, Window,
-    anchored, deferred, div, img, list, point, px, svg,
+    Entity, EventEmitter, ExternalPaths, FontWeight, Hsla, Image, ImageFormat, ListAlignment,
+    ListState, MouseButton, ObjectFit, Pixels, SharedString, SpringAnimation, Task, WeakEntity,
+    Window, anchored, deferred, div, img, list, point, px, svg,
 };
 use matrix_sdk::ruma::events::room::MediaSource;
 use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedUserId};
@@ -1543,6 +1544,7 @@ impl MatrixClient {
                 .flatten();
         }
         if self.room.as_ref() != Some(&id) {
+            self.cancel_compress();
             self.thread = None;
             self.replying = None;
             self.editing = None;
@@ -1841,13 +1843,75 @@ impl MatrixClient {
             let Some(path) = paths.into_iter().next() else {
                 return;
             };
-            let name = path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "image".into());
-            let bytes = std::fs::read(&path).ok();
-            this.update(cx, |this, cx| this.attach(spot, name, bytes, cx))
+            this.update(cx, |this, cx| this.attach_file(spot, path, cx))
                 .ok();
+        })
+        .detach();
+    }
+
+    fn drop_files(
+        &mut self,
+        spot: Spot,
+        paths: &ExternalPaths,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        let [path] = paths.paths() else {
+            self.notify("Drop one file at a time.", true, cx);
+            return;
+        };
+        self.attach_file(spot, path.clone(), cx);
+        let input = match spot {
+            Spot::Main => &self.draft,
+            Spot::Thread => &self.thread_draft,
+        };
+        focus(input, window, cx);
+    }
+
+    fn attach_file(&mut self, spot: Spot, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        if matches!(&self.editing, Some((_, at)) if *at == spot) {
+            self.notify("Finish editing before adding a file.", true, cx);
+            return;
+        }
+        let Some(room) = self.room.clone() else {
+            return;
+        };
+        if self.summary(&room).is_none_or(|room| room.invite) {
+            return;
+        }
+        let thread = (spot == Spot::Thread)
+            .then(|| self.thread.clone())
+            .flatten();
+        if spot == Spot::Thread && thread.is_none() {
+            return;
+        }
+        self.cancel_compress();
+        let ticket = self.attach_ticket;
+        self.compressing = Some(spot);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { upload::read(&path) })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.attach_ticket != ticket {
+                    return;
+                }
+                this.compressing = None;
+                if this.room.as_ref() != Some(&room)
+                    || (spot == Spot::Thread && this.thread != thread)
+                    || matches!(&this.editing, Some((_, at)) if *at == spot)
+                {
+                    cx.notify();
+                    return;
+                }
+                match result {
+                    Ok((name, bytes)) => this.attach(spot, name, Some(bytes), cx),
+                    Err(error) => this.notify(error, true, cx),
+                }
+            })
+            .ok();
         })
         .detach();
     }
@@ -1899,6 +1963,8 @@ impl MatrixClient {
                 self.attachment = None;
                 self.compressing = Some(spot);
                 let ticket = self.attach_ticket;
+                let room = self.room.clone();
+                let thread = self.thread.clone();
                 cx.spawn(async move |this, cx| {
                     let (bytes, result) = cx
                         .background_spawn(async move {
@@ -1911,6 +1977,10 @@ impl MatrixClient {
                             return;
                         }
                         this.compressing = None;
+                        if this.room != room || (spot == Spot::Thread && this.thread != thread) {
+                            cx.notify();
+                            return;
+                        }
                         match result {
                             Ok(info) => {
                                 this.attachment = Some((
@@ -1962,6 +2032,8 @@ impl MatrixClient {
             self.attachment = None;
         }
         self.compressing = Some(spot);
+        let room = self.room.clone();
+        let thread = self.thread.clone();
         cx.notify();
         cx.spawn(async move |this, cx| {
             let prepared = cx
@@ -1972,6 +2044,10 @@ impl MatrixClient {
                     return;
                 }
                 this.compressing = None;
+                if this.room != room || (spot == Spot::Thread && this.thread != thread) {
+                    cx.notify();
+                    return;
+                }
                 this.place_upload(spot, prepared.name, prepared.bytes, cx);
             })
             .ok();
@@ -2255,12 +2331,7 @@ impl MatrixClient {
                 self.attach(spot, name, Some(image.bytes), cx);
             }
             PastedPicture::File(path) => {
-                let name = path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "image".into());
-                let bytes = std::fs::read(&path).ok();
-                self.attach(spot, name, bytes, cx);
+                self.attach_file(spot, path, cx);
             }
         }
     }
@@ -5470,6 +5541,31 @@ impl MatrixClient {
         )
     }
 
+    fn media_drop_zone(&self, spot: Spot, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+        let color = cx.theme().primary;
+        let enabled = self.phase == Phase::SignedIn
+            && self
+                .room
+                .as_ref()
+                .and_then(|id| self.summary(id))
+                .is_some_and(|room| !room.invite)
+            && (spot == Spot::Main || self.thread.is_some())
+            && !matches!(&self.editing, Some((_, at)) if *at == spot);
+        div()
+            .id(if spot == Spot::Main {
+                "room-file-drop"
+            } else {
+                "thread-file-drop"
+            })
+            .can_drop(move |value, _, _| enabled && value.is::<ExternalPaths>())
+            .when(enabled, |zone| {
+                zone.drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(color.opacity(0.08)))
+            })
+            .on_drop(cx.listener(move |this, paths: &ExternalPaths, window, cx| {
+                this.drop_files(spot, paths, window, cx)
+            }))
+    }
+
     fn render_composer(&self, spot: Spot, cx: &mut Context<Self>) -> AnyElement {
         let theme = *cx.theme();
         let input = match spot {
@@ -5628,6 +5724,11 @@ impl MatrixClient {
                     .bg(theme.secondary)
                     .border_1()
                     .border_color(theme.border)
+                    .when(!editing, |composer| {
+                        composer.drag_over::<ExternalPaths>(move |style, _, _, _| {
+                            style.border_color(theme.primary)
+                        })
+                    })
                     .on_action(
                         cx.listener(move |this, _: &Submit, window, cx| {
                             this.send(spot, window, cx)
@@ -5918,7 +6019,8 @@ impl MatrixClient {
                 .into_any_element()
         };
 
-        let chat = div()
+        let chat = self
+            .media_drop_zone(Spot::Main, cx)
             .flex()
             .flex_col()
             .flex_1()
@@ -5962,7 +6064,7 @@ impl MatrixClient {
 
     fn render_thread_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.theme();
-        div()
+        self.media_drop_zone(Spot::Thread, cx)
             .flex()
             .flex_col()
             .flex_none()
