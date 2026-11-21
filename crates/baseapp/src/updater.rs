@@ -332,12 +332,28 @@ fn updates_supported() -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        dir_writable(install_dir())
+        installed_windows_build() && dir_writable(install_dir())
     }
     #[cfg(not(target_os = "windows"))]
     {
         true
     }
+}
+
+#[cfg(target_os = "windows")]
+fn installed_windows_build() -> bool {
+    let dir = install_dir();
+    let text = dir.to_string_lossy().to_ascii_lowercase();
+    // Never self-update cargo/dev builds (that spawned the stuck find/cmd loop).
+    if text.contains(r"\target\debug")
+        || text.contains(r"\target\release")
+        || text.contains("/target/debug")
+        || text.contains("/target/release")
+    {
+        return false;
+    }
+    dir.join("Huddle.exe").is_file()
+        && (dir.join("unins000.exe").is_file() || text.contains(r"\programs\huddle"))
 }
 
 fn environment_disabled() -> bool {
@@ -714,66 +730,82 @@ fn begin_apply_windows() {
     use std::os::windows::process::CommandExt;
 
     set_status(State::Applying, "Applying update…");
-    let pid = std::process::id().to_string();
-    let script = dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("Huddle")
-        .join("apply-update.cmd");
-    if let Some(parent) = script.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    // Keep the apply helper self-contained: never rely on `start "" …` from Rust,
-    // because empty-title quoting collapses and the PID becomes the "command".
-    let body = "@echo off\r\n\
-         setlocal EnableExtensions\r\n\
-         set \"PID=%~1\"\r\n\
-         set \"STAGE=%~2\"\r\n\
-         set \"DEST=%~3\"\r\n\
-         set \"LOG=%TEMP%\\huddle-update-apply.log\"\r\n\
-         echo apply start %DATE% %TIME% > \"%LOG%\"\r\n\
-         echo PID=%PID%>> \"%LOG%\"\r\n\
-         echo STAGE=%STAGE%>> \"%LOG%\"\r\n\
-         echo DEST=%DEST%>> \"%LOG%\"\r\n\
-         :wait\r\n\
-         tasklist /FI \"PID eq %PID%\" 2>nul | find \"%PID%\" >nul\r\n\
-         if not errorlevel 1 (\r\n\
-           timeout /t 1 /nobreak >nul\r\n\
-           goto wait\r\n\
-         )\r\n\
-         timeout /t 2 /nobreak >nul\r\n\
-         if not exist \"%STAGE%\\Huddle.exe\" (\r\n\
-           echo missing STAGE or Huddle.exe>> \"%LOG%\"\r\n\
-           exit /b 1\r\n\
-         )\r\n\
-         robocopy \"%STAGE%\" \"%DEST%\" /E /IS /IT /R:5 /W:1 /NFL /NDL /NJH /NJS /NC /NS /XF .huddle-update-version >> \"%LOG%\" 2>&1\r\n\
-         if errorlevel 8 (\r\n\
-           echo copy failed>> \"%LOG%\"\r\n\
-           exit /b 1\r\n\
-         )\r\n\
-         if not exist \"%DEST%\\Huddle.exe\" (\r\n\
-           echo missing Huddle.exe after copy>> \"%LOG%\"\r\n\
-           exit /b 1\r\n\
-         )\r\n\
-         rmdir /S /Q \"%STAGE%\" 2>nul\r\n\
-         echo ok, restarting>> \"%LOG%\"\r\n\
-         start \"Huddle\" /D \"%DEST%\" \"%DEST%\\Huddle.exe\"\r\n\
-         del \"%~f0\" 2>nul\r\n\
-         exit /b 0\r\n";
+    let app_pid = std::process::id().to_string();
+    let data = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
+    let huddle_data = data.join("Huddle");
+    let _ = fs::create_dir_all(&huddle_data);
+    // Remove the old cmd waiter that spawned visible `find` consoles in a loop.
+    let _ = fs::remove_file(huddle_data.join("apply-update.cmd"));
+    let script = huddle_data.join("apply-update.ps1");
+    // PowerShell Wait-Process avoids tasklist|find console spam.
+    // Do not name a parameter $Pid — that is an automatic variable.
+    let body = r#"param(
+  [Parameter(Mandatory = $true)][int]$AppPid,
+  [Parameter(Mandatory = $true)][string]$Stage,
+  [Parameter(Mandatory = $true)][string]$Dest
+)
+$ErrorActionPreference = 'Stop'
+$log = Join-Path $env:TEMP 'huddle-update-apply.log'
+function Write-Log([string]$Message) {
+  Add-Content -LiteralPath $log -Value $Message
+}
+Set-Content -LiteralPath $log -Value ("apply start " + (Get-Date -Format o))
+Write-Log ("AppPid=" + $AppPid)
+Write-Log ("Stage=" + $Stage)
+Write-Log ("Dest=" + $Dest)
+try {
+  Wait-Process -Id $AppPid -ErrorAction SilentlyContinue
+} catch {}
+Start-Sleep -Seconds 2
+$staged = Join-Path $Stage 'Huddle.exe'
+if (-not (Test-Path -LiteralPath $staged)) {
+  Write-Log 'missing STAGE or Huddle.exe'
+  exit 1
+}
+Get-ChildItem -LiteralPath $Stage -Force | Where-Object {
+  $_.Name -ne '.huddle-update-version'
+} | ForEach-Object {
+  $target = Join-Path $Dest $_.Name
+  if ($_.PSIsContainer) {
+    Copy-Item -LiteralPath $_.FullName -Destination $target -Recurse -Force
+  } else {
+    Copy-Item -LiteralPath $_.FullName -Destination $target -Force
+  }
+}
+$exe = Join-Path $Dest 'Huddle.exe'
+if (-not (Test-Path -LiteralPath $exe)) {
+  Write-Log 'missing Huddle.exe after copy'
+  exit 1
+}
+Remove-Item -LiteralPath $Stage -Recurse -Force -ErrorAction SilentlyContinue
+Write-Log 'ok, restarting'
+Start-Process -FilePath $exe -WorkingDirectory $Dest
+Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+exit 0
+"#;
     if fs::write(&script, body).is_err() {
         set_status(State::Error, "Could not write apply script.");
         return;
     }
     let stage = win_path(stage());
     let dest = win_path(install_dir());
-    // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
-    // Spawn the .cmd directly so Rust's Windows Command path quotes %1/%2/%3 correctly
-    // (unlike `start "" …`, which ate the empty title and treated the PID as a program).
-    const FLAGS: u32 = 0x00000008 | 0x00000200 | 0x08000000;
-    let ok = Command::new(&script)
-        .arg(&pid)
+    // CREATE_NO_WINDOW only. DETACHED_PROCESS makes console children (find/timeout)
+    // allocate visible windows — that was the stuck "find" terminal storm.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let ok = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-WindowStyle",
+            "Hidden",
+            "-File",
+        ])
+        .arg(&script)
+        .arg(&app_pid)
         .arg(&stage)
         .arg(&dest)
-        .creation_flags(FLAGS)
+        .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .is_ok();
     if !ok {
