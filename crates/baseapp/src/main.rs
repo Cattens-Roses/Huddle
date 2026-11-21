@@ -582,6 +582,7 @@ impl BaseApp {
                 cx.open_url(updater::apt_setup_url());
             }))
             .into_any_element();
+        #[allow(unused_mut)]
         let mut rows = vec![
             self.row(
                 "Installed version",

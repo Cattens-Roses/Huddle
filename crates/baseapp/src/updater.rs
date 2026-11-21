@@ -6,16 +6,20 @@
 //!   the package manager (mdsys-style).
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
+
+#[cfg(target_os = "windows")]
 use sha2::{Digest, Sha256};
+#[cfg(target_os = "windows")]
+use std::io::Write;
+#[cfg(target_os = "windows")]
+use std::process::Command;
 
 const UPDATE_REPO: &str = "Cattens-Roses/Huddle";
 const UPDATE_CHANNEL: &str = "beta";
@@ -154,6 +158,7 @@ pub fn init(auto: bool) {
         Some(Instant::now() + Duration::from_secs(6));
 }
 
+#[allow(dead_code)]
 pub fn shutdown() {
     STOP.store(true, Ordering::Relaxed);
 }
@@ -267,6 +272,7 @@ fn exe_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+#[cfg(target_os = "windows")]
 fn install_dir() -> &'static Path {
     INSTALL_DIR.get_or_init(exe_dir)
 }
@@ -278,10 +284,12 @@ fn stage_dir() -> PathBuf {
         .join("update-stage")
 }
 
+#[cfg(target_os = "windows")]
 fn stage() -> &'static Path {
     STAGE_DIR.get_or_init(stage_dir)
 }
 
+#[cfg(target_os = "windows")]
 fn dir_writable(dir: &Path) -> bool {
     if !dir.exists() {
         return false;
@@ -325,6 +333,7 @@ fn http_get(url: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| e.to_string())
 }
 
+#[cfg(target_os = "windows")]
 fn http_get_long(url: &str) -> Result<Vec<u8>, String> {
     let client = reqwest::blocking::Client::builder()
         .user_agent(USER_AGENT)
@@ -341,17 +350,20 @@ fn http_get_long(url: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| e.to_string())
 }
 
+#[cfg(target_os = "windows")]
 fn sha256_bytes(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     hex::encode(hasher.finalize())
 }
 
+#[cfg(target_os = "windows")]
 fn sha256_file(path: &Path) -> Option<String> {
     let data = fs::read(path).ok()?;
     Some(sha256_bytes(&data))
 }
 
+#[cfg(target_os = "windows")]
 #[derive(Deserialize)]
 struct Manifest {
     version: String,
@@ -362,6 +374,7 @@ struct Manifest {
     files: Vec<ManifestFile>,
 }
 
+#[cfg(target_os = "windows")]
 #[derive(Deserialize)]
 struct ManifestFile {
     path: String,
@@ -370,16 +383,19 @@ struct ManifestFile {
     size: i64,
 }
 
+#[cfg(target_os = "windows")]
 fn manifest_url() -> String {
     format!(
         "https://github.com/{UPDATE_REPO}/releases/download/{UPDATE_CHANNEL}/update-manifest-windows-x64.json"
     )
 }
 
+#[cfg(target_os = "windows")]
 fn normalize_rel(path: &str) -> String {
     path.replace('\\', "/").trim_start_matches('/').to_string()
 }
 
+#[cfg(target_os = "windows")]
 fn write_atomic(path: &Path, data: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -632,6 +648,7 @@ fn worker_linux() {
     );
 }
 
+#[cfg(not(target_os = "windows"))]
 pub fn apt_setup_url() -> &'static str {
     "https://cattens-roses.github.io/Huddle/"
 }
