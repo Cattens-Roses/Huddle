@@ -17,7 +17,7 @@ Please **do not** open a public GitHub issue for security vulnerabilities.
 
 Prefer one of these private channels:
 
-1. **GitHub Security Advisories** — [Report a vulnerability](https://github.com/Cattens-Roses/Huddle/security/advisories/new)
+1. **GitHub Security Advisories** - [Report a vulnerability](https://github.com/Cattens-Roses/Huddle/security/advisories/new)
 2. Contact the maintainers privately via GitHub
 
 Include as much detail as you can:

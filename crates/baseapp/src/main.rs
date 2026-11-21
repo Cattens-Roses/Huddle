@@ -21,6 +21,7 @@ use ui::{
 mod cache;
 mod matrix;
 mod notifications;
+mod updater;
 
 use notifications::NotificationPreferences;
 mod presence;
@@ -46,6 +47,7 @@ enum Page {
     Appearance,
     Notifications,
     Cache,
+    Updates,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -172,6 +174,8 @@ struct BaseApp {
     appearance_observer: Option<gpui::Subscription>,
     activation_observer: Option<gpui::Subscription>,
     matrix: Entity<matrix::MatrixClient>,
+    auto_update: bool,
+    _updater: Option<gpui::Task<()>>,
 }
 
 #[derive(Clone, Copy)]
@@ -192,6 +196,7 @@ struct Preferences {
     photo_compress: bool,
     photo_size: PhotoSize,
     notifications: NotificationPreferences,
+    auto_update: bool,
 }
 
 impl Default for Preferences {
@@ -213,6 +218,7 @@ impl Default for Preferences {
             photo_compress: true,
             photo_size: PhotoSize::Balanced,
             notifications: NotificationPreferences::default(),
+            auto_update: true,
         }
     }
 }
@@ -270,6 +276,7 @@ impl Preferences {
                 "notifications" => {
                     prefs.notifications = serde_json::from_str(value).unwrap_or(prefs.notifications)
                 }
+                "auto_update" => prefs.auto_update = value.parse().unwrap_or(prefs.auto_update),
                 _ => {}
             }
         }
@@ -290,7 +297,7 @@ impl Preferences {
     }
     fn encode(self) -> String {
         format!(
-            "theme={}\nrounding={}\nblur={}\nblur_window={}\nfont_size={}\nicon_pack={}\ntransparent={}\ntransparency={}\nstillness={}\npace={}\nambient={}\nambient_style={}\nambient_motion={}\nphoto_compress={}\nphoto_size={}\nnotifications={}\n",
+            "theme={}\nrounding={}\nblur={}\nblur_window={}\nfont_size={}\nicon_pack={}\ntransparent={}\ntransparency={}\nstillness={}\npace={}\nambient={}\nambient_style={}\nambient_motion={}\nphoto_compress={}\nphoto_size={}\nnotifications={}\nauto_update={}\n",
             self.theme.id(),
             self.rounding.id(),
             self.blur,
@@ -306,7 +313,8 @@ impl Preferences {
             self.ambient_motion,
             self.photo_compress,
             self.photo_size.id(),
-            serde_json::to_string(&self.notifications).expect("notification preferences serialize")
+            serde_json::to_string(&self.notifications).expect("notification preferences serialize"),
+            self.auto_update
         )
     }
 }
@@ -365,6 +373,30 @@ mod notification_preferences_tests {
 impl BaseApp {
     fn new(prefs: Preferences, cx: &mut Context<Self>) -> Self {
         let owner = cx.entity_id();
+        updater::init(prefs.auto_update);
+        let updater_tick = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(1))
+                    .await;
+                if this
+                    .update(cx, |this, cx| {
+                        updater::tick();
+                        if updater::wants_quit_for_apply() {
+                            cx.quit();
+                            return true;
+                        }
+                        if this.page == Page::Updates {
+                            cx.notify();
+                        }
+                        false
+                    })
+                    .unwrap_or(true)
+                {
+                    break;
+                }
+            }
+        });
         Self {
             page: Page::Home,
             theme: prefs.theme,
@@ -397,6 +429,8 @@ impl BaseApp {
                 .new(|_| Scrollbar::new(ScrollHandle::new()).watching(owner)),
             appearance_observer: None,
             activation_observer: None,
+            auto_update: prefs.auto_update,
+            _updater: Some(updater_tick),
             matrix: {
                 let matrix = cx.new(|cx| {
                     let mut client = matrix::MatrixClient::new(cx);
@@ -468,6 +502,7 @@ impl BaseApp {
             photo_compress: self.photo_compress,
             photo_size: self.photo_size,
             notifications: self.notifications,
+            auto_update: self.auto_update,
         }
     }
 
@@ -494,6 +529,7 @@ impl BaseApp {
                     "Notifications",
                 ),
                 (Page::Cache, "settings-cache", "Cache"),
+                (Page::Updates, "settings-updates", "Updates"),
             ]
             .into_iter()
             .map(|(page, id, label)| {
@@ -507,6 +543,150 @@ impl BaseApp {
                     }))
             }),
         )
+    }
+
+    fn update_settings(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = *cx.theme();
+        let status = updater::status_text();
+        let remote = updater::remote_version();
+        let percent = updater::download_percent();
+        let state = updater::state();
+        let version = updater::current_version();
+        let auto = Switch::new("auto-update", self.auto_update).on_click(cx.listener(
+            |this, _, _, cx| {
+                this.auto_update = !this.auto_update;
+                updater::set_auto_enabled(this.auto_update);
+                this.save();
+                cx.notify();
+            },
+        ));
+        let check = Button::new("check-updates")
+            .secondary()
+            .label("Check now")
+            .on_click(cx.listener(|_, _, _, cx| {
+                updater::check_now();
+                cx.notify();
+            }))
+            .into_any_element();
+        let open_release = Button::new("open-beta-release")
+            .ghost()
+            .label("Open beta release")
+            .on_click(cx.listener(|_, _, _, cx| {
+                cx.open_url(&updater::releases_url());
+            }))
+            .into_any_element();
+        #[cfg(not(target_os = "windows"))]
+        let open_apt = Button::new("open-apt-repo")
+            .ghost()
+            .label("Apt repository")
+            .on_click(cx.listener(|_, _, _, cx| {
+                cx.open_url(updater::apt_setup_url());
+            }))
+            .into_any_element();
+        let mut rows = vec![
+            self.row(
+                "Installed version",
+                "Build reported by this app binary",
+                div()
+                    .text_color(theme.muted_foreground)
+                    .child(version.to_string())
+                    .into_any_element(),
+                cx,
+            )
+            .into_any_element(),
+            self.row(
+                "Automatic updates",
+                #[cfg(target_os = "windows")]
+                "Download changed files from the rolling beta channel and apply them in place",
+                #[cfg(not(target_os = "windows"))]
+                "Watch the rolling beta channel; install upgrades with apt when available",
+                auto.into_any_element(),
+                cx,
+            )
+            .into_any_element(),
+            self.row(
+                "Status",
+                "Latest check result",
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .items_end()
+                    .child(div().text_color(theme.muted_foreground).child(status))
+                    .when(
+                        matches!(state, updater::State::Downloading) && percent > 0,
+                        |el| el.child(format!("{percent}%")),
+                    )
+                    .when(!remote.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .text_color(theme.muted_foreground)
+                                .child(format!("Remote: {remote}")),
+                        )
+                    })
+                    .into_any_element(),
+                cx,
+            )
+            .into_any_element(),
+            self.row(
+                "Actions",
+                "Check the channel now or open release notes",
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(check)
+                    .child(open_release)
+                    .into_any_element(),
+                cx,
+            )
+            .into_any_element(),
+        ];
+        #[cfg(not(target_os = "windows"))]
+        rows.push(
+            self.row(
+                "Linux packages",
+                "Add the apt repository once; then system updates keep Huddle current",
+                open_apt,
+                cx,
+            )
+            .into_any_element(),
+        );
+        Scroller::new("update-settings", &self.notifications_scrollbar)
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .flex_col()
+            .items_center()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_5()
+                    .w_full()
+                    .max_w(px(860.))
+                    .p_6()
+                    .child(self.settings_tabs(cx))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(theme.text(ui::Text::Title))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme.foreground)
+                                    .child("Updates"),
+                            )
+                            .child(
+                                div().text_color(theme.muted_foreground).child(
+                                    "Keep Huddle current from the rolling beta channel.",
+                                ),
+                            ),
+                    )
+                    .child(self.settings_card("App updates", rows, cx)),
+            )
+            .into_any_element()
     }
 
     fn cache_settings(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -772,6 +952,7 @@ impl Render for BaseApp {
             Page::Home => self.matrix.clone().into_any_element(),
             Page::Notifications => self.notification_settings(cx),
             Page::Cache => self.cache_settings(cx),
+            Page::Updates => self.update_settings(cx),
             Page::Appearance => {
                 let packs = icons::packs().collect::<Vec<_>>();
                 let pack = packs.get(self.icon_pack % packs.len().max(1));

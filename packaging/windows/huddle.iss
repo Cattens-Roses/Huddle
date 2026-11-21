@@ -11,7 +11,8 @@ AppId={{A7C3E1B2-4F58-4D1A-9C6E-2B8F0A1D7E44}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}
-DefaultDirName={autopf}\{#AppName}
+; Per-user install so the folder stays writable for in-app differential updates.
+DefaultDirName={localappdata}\Programs\{#AppName}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 UninstallDisplayIcon={app}\{#AppExeName}

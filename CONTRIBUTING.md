@@ -6,10 +6,10 @@ By participating, you agree to follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Ways to contribute
 
-- **Bugs and UX issues** — open a [bug report](https://github.com/Cattens-Roses/Huddle/issues/new/choose)
-- **Ideas** — open a [feature request](https://github.com/Cattens-Roses/Huddle/issues/new/choose)
-- **Code** — fix issues or polish the desktop UI (Rust / GPUI)
-- **Security** — report privately via [SECURITY.md](SECURITY.md); do not open a public issue for vulnerabilities
+- **Bugs and UX issues** - open a [bug report](https://github.com/Cattens-Roses/Huddle/issues/new/choose)
+- **Ideas** - open a [feature request](https://github.com/Cattens-Roses/Huddle/issues/new/choose)
+- **Code** - fix issues or polish the desktop UI (Rust / GPUI)
+- **Security** - report privately via [SECURITY.md](SECURITY.md); do not open a public issue for vulnerabilities
 
 ## Development setup
 

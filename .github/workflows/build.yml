@@ -11,9 +11,16 @@ concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_PROFILE_RELEASE_STRIP: symbols
+  HUDDLE_UPDATE_CHANNEL: beta
+  HUDDLE_UPDATE_REPO: Cattens-Roses/Huddle
 
 jobs:
   build:
@@ -35,6 +42,22 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Version
+        id: ver
+        shell: bash
+        run: |
+          BASE="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          SHORT="${GITHUB_SHA:0:7}"
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VER="$BASE"
+          else
+            VER="${BASE}+${SHORT}"
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          echo "HUDDLE_BUILD_VERSION=$VER" >> "$GITHUB_ENV"
+          echo "HUDDLE_VERSION=$VER" >> "$GITHUB_ENV"
+
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: |
@@ -54,7 +77,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.target }}-${{ steps.ver.outputs.version }}
 
       - name: Build baseapp
         run: cargo build --release --locked -p baseapp --target ${{ matrix.target }}
@@ -64,6 +87,7 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
           DEB_ARCH: amd64
+          HUDDLE_VERSION: ${{ steps.ver.outputs.version }}
         run: bash packaging/linux/build-deb.sh
 
       - name: Upload the Debian package
@@ -81,6 +105,10 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/baseapp.exe" dist/Huddle.exe
+          New-Item -ItemType Directory -Force -Path dist/huddle-portable | Out-Null
+          Copy-Item dist/Huddle.exe dist/huddle-portable/Huddle.exe
+          Copy-Item COPYING dist/huddle-portable/LICENSE
+          Copy-Item THIRD-PARTY.md dist/huddle-portable/THIRD-PARTY.md
 
       - name: Install Inno Setup
         if: runner.os == 'Windows'
@@ -93,11 +121,26 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
-          $env:HUDDLE_VERSION = $version
+          $env:HUDDLE_VERSION = "${{ steps.ver.outputs.version }}"
           $env:HUDDLE_EXE = (Resolve-Path "dist/Huddle.exe").Path
           $env:HUDDLE_DIST = (Resolve-Path "dist").Path
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" packaging\windows\huddle.iss
+
+      - name: Build Windows update manifest
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          VER="${{ steps.ver.outputs.version }}"
+          bash packaging/make-update-manifest.sh dist/huddle-portable windows-x64 "$VER" dist/update-windows
+          (
+            cd dist
+            rm -f "huddle-update-windows-${VER}.zip"
+            if command -v zip >/dev/null 2>&1; then
+              zip -r "huddle-update-windows-${VER}.zip" update-windows
+            else
+              powershell -NoProfile -Command "Compress-Archive -Path update-windows -DestinationPath huddle-update-windows-${VER}.zip -Force"
+            fi
+          )
 
       - name: Upload the Windows executable
         if: runner.os == 'Windows'
@@ -117,6 +160,17 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - name: Upload Windows update pack
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: huddle-update-windows
+          path: |
+            dist/update-windows/**
+            dist/huddle-update-windows-*.zip
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Upload build artifact
         if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
@@ -125,3 +179,192 @@ jobs:
           path: target/${{ matrix.target }}/release/baseapp
           if-no-files-found: error
           retention-days: 14
+
+  beta:
+    name: Publish beta release
+    if: |
+      always() &&
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') &&
+      needs.build.result == 'success'
+    needs: [build]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Version
+        id: ver
+        shell: bash
+        run: |
+          BASE="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          SHORT="${GITHUB_SHA:0:7}"
+          echo "version=${BASE}+${SHORT}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Stage release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist update-windows
+          cp -f artifacts/huddle-linux-deb/*.deb dist/
+          cp -f artifacts/huddle-windows-setup/Huddle-Setup.exe dist/
+          cp -f artifacts/huddle-windows-exe/Huddle.exe dist/
+          MANIFEST="$(find artifacts/huddle-update-windows -name 'update-manifest-windows-x64.json' | head -n 1)"
+          if [[ -z "$MANIFEST" ]]; then
+            echo "Missing Windows update manifest in artifacts" >&2
+            find artifacts -maxdepth 4 -type f | head -n 200
+            exit 1
+          fi
+          UPDATE_ROOT="$(dirname "$MANIFEST")"
+          cp -a "$UPDATE_ROOT"/. update-windows/
+          test -f update-windows/update-manifest-windows-x64.json
+          test -d update-windows/blobs
+          ls -lah dist update-windows
+
+      - name: Write beta release notes
+        shell: bash
+        run: |
+          VER="${{ steps.ver.outputs.version }}"
+          SHORT="${GITHUB_SHA:0:7}"
+          cat > beta-notes.md <<EOF
+          **Rolling beta** built from \`main\` at \`${SHORT}\`.
+
+          Package version: ${VER}
+
+          This is an automated prerelease. Prefer a tagged \`v*\` release for day-to-day use when available.
+
+          ### Auto-updates
+          - **Windows** - in-app differential updates from this \`beta\` channel
+          - **Linux** - apt repository at https://cattens-roses.github.io/Huddle/
+          EOF
+
+      - name: Replace previous beta release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete beta --yes --cleanup-tag || true
+
+      - name: Publish GitHub beta release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: beta
+          name: Beta (rolling)
+          body_path: beta-notes.md
+          prerelease: true
+          make_latest: false
+          target_commitish: ${{ github.sha }}
+          files: |
+            dist/*.deb
+            dist/Huddle-Setup.exe
+            dist/Huddle.exe
+
+      - name: Publish Windows update assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HUDDLE_UPDATE_CHANNEL: beta
+        run: |
+          if [ -f update-windows/update-manifest-windows-x64.json ]; then
+            bash packaging/publish-update-assets.sh update-windows windows-x64
+          else
+            echo "No Windows update manifest found; skipping blob publish"
+            find . -name 'update-manifest*.json' -o -name 'b_*' | head
+            exit 1
+          fi
+
+  apt-repo:
+    name: Publish apt repository
+    if: |
+      always() &&
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) &&
+      needs.build.result == 'success'
+    needs: [build]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: huddle-linux-deb
+          path: artifacts/deb
+
+      - name: Checkout gh-pages
+        uses: actions/checkout@v5
+        with:
+          ref: gh-pages
+          path: gh-pages
+        continue-on-error: true
+
+      - name: Init gh-pages if missing
+        run: |
+          if [ ! -d gh-pages/.git ]; then
+            rm -rf gh-pages
+            mkdir gh-pages
+            cd gh-pages
+            git init
+            git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+            git checkout -b gh-pages
+          fi
+
+      - name: Install repo tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev apt-utils
+
+      - name: Publish apt repo
+        run: |
+          mkdir -p gh-pages/pool/main
+          cp -f artifacts/deb/*.deb gh-pages/pool/main/
+          cd gh-pages
+          dpkg-scanpackages --multiversion pool/ > Packages
+          gzip -k -f Packages
+          cat > Release <<'EOF'
+          Origin: huddle
+          Label: huddle
+          Suite: stable
+          Codename: stable
+          Architectures: amd64
+          Components: main
+          Description: Huddle apt repository
+          EOF
+          apt-ftparchive release . >> Release || true
+
+      - name: Write install page
+        run: |
+          cat > gh-pages/index.html <<'EOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <title>Huddle packages</title>
+            <style>
+              body{font-family:monospace;max-width:820px;margin:40px auto;background:#0d1117;color:#c9d1d9;line-height:1.5}
+              h1,h2{color:#58a6ff} pre{background:#161b22;padding:16px;border-radius:6px;overflow-x:auto}
+              a{color:#79c0ff}
+            </style>
+          </head>
+          <body>
+            <h1>Huddle packages</h1>
+            <p>Source: <a href="https://github.com/Cattens-Roses/Huddle">github.com/Cattens-Roses/Huddle</a></p>
+
+            <h2>Debian / Ubuntu (apt)</h2>
+            <pre>echo "deb [trusted=yes] https://cattens-roses.github.io/Huddle ./" \
+              | sudo tee /etc/apt/sources.list.d/huddle.list
+            sudo apt update
+            sudo apt install huddle</pre>
+
+            <p>After that, system updates keep Huddle current. Rolling builds also publish to the
+            <a href="https://github.com/Cattens-Roses/Huddle/releases/tag/beta">beta</a> GitHub release.</p>
+          </body>
+          </html>
+          EOF
+
+      - name: Commit & push gh-pages
+        run: |
+          cd gh-pages
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet || git commit -m "packages: apt repo"
+          git push origin HEAD:gh-pages --force

@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Native Matrix desktop client</strong><br>
-  Encrypted chat, rooms, threads, calls, and media — built with Rust and GPUI.
+  Encrypted chat, rooms, threads, calls, and media - built with Rust and GPUI.
 </p>
 
 <p align="center">
@@ -20,20 +20,36 @@
 
 ## Features
 
-- **Rooms & DMs** — join rooms, message people directly, and follow threads
-- **Encryption** — end-to-end encrypted messaging with Matrix
-- **Calls** — voice and video calling from the desktop client
-- **Native media** — upload and play images plus common audio/video formats without a browser or FFmpeg install
-- **Notifications** — per-category desktop alerts, previews, and taskbar attention
-- **Cache** — disk and memory media caches with size limits and one-click clear
-- **Appearance** — customizable UI using the shared GPUI design system
-- **Desktop extras** — system tray, background presence, and packaged Linux/Windows builds
+- **Rooms & DMs** - join rooms, message people directly, and follow threads
+- **Encryption** - end-to-end encrypted messaging with Matrix
+- **Calls** - voice and video calling from the desktop client
+- **Native media** - upload and play images plus common audio/video formats without a browser or FFmpeg install
+- **Notifications** - per-category desktop alerts, previews, and taskbar attention
+- **Cache** - disk and memory media caches with size limits and one-click clear
+- **Appearance** - customizable UI using the shared GPUI design system
+- **Desktop extras** - system tray, background presence, and packaged Linux/Windows builds
+- **Auto-updates** - Windows in-app differential updates; Linux apt repository updates
 
 ## Install
 
-Grab Linux (`.deb`) or Windows packages from the
-[latest CI artifacts / releases](https://github.com/Cattens-Roses/Huddle/actions/workflows/build.yml)
-when available, or build from source below.
+### Linux (apt)
+
+```sh
+echo "deb [trusted=yes] https://cattens-roses.github.io/Huddle ./" \
+  | sudo tee /etc/apt/sources.list.d/huddle.list
+sudo apt update
+sudo apt install huddle
+```
+
+Details: [cattens-roses.github.io/Huddle](https://cattens-roses.github.io/Huddle/).
+
+### Windows
+
+Install [Huddle-Setup.exe](https://github.com/Cattens-Roses/Huddle/releases/tag/beta) (per-user). The app checks the rolling `beta` channel and applies changed files in place.
+
+### Beta builds
+
+Every push to `main` refreshes the rolling [beta](https://github.com/Cattens-Roses/Huddle/releases/tag/beta) prerelease (`.deb`, Windows setup/exe, and update blobs).
 
 ## How to run
 
@@ -44,7 +60,7 @@ cargo run -p baseapp
 1. Launch Huddle.
 2. Sign in to your Matrix homeserver.
 3. Open rooms, DMs, or threads and chat as usual.
-4. Optional: configure **Settings → Notifications**, **Cache**, and appearance.
+4. Optional: configure **Settings → Notifications**, **Cache**, **Updates**, and appearance.
 
 ## Building from source
 
@@ -66,13 +82,13 @@ cargo test -p baseapp system_audio_and_video_playback_smoke -- --ignored
 
 ## Project layout
 
-- `crates/baseapp` — app shell, Matrix client, media, calls, settings
-- `crates/ui` — GPUI components and theme tokens
-- `crates/icons` / `crates/i18n` / `crates/embed` — icons, localization, embedding helpers
-- `assets` — app icon and UI icon sets
-- `packaging` — Linux `.deb` / desktop entry and Windows installer scripts
-- `flatpak` / `nix` — packaging and Nix flake support
-- `.github` — CI, issue templates, and automation
+- `crates/baseapp` - app shell, Matrix client, media, calls, settings, updater
+- `crates/ui` - GPUI components and theme tokens
+- `crates/icons` / `crates/i18n` / `crates/embed` - icons, localization, embedding helpers
+- `assets` - app icon and UI icon sets
+- `packaging` - Linux `.deb`, Windows installer, and update manifest scripts
+- `flatpak` / `nix` - packaging and Nix flake support
+- `.github` - CI, beta release, apt repo publish, issue templates
 
 ## Media notes
 

@@ -5,7 +5,7 @@ root="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$root"
 
 target="${TARGET:-x86_64-unknown-linux-gnu}"
-version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+version="${HUDDLE_VERSION:-$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)}"
 arch="${DEB_ARCH:-amd64}"
 stage="dist/deb-root"
 package="dist/huddle_${version}_${arch}.deb"
