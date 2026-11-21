@@ -85,6 +85,7 @@ enum Dialog {
     Create,
     Talk,
     Leave,
+    RemoveSpace,
     Security,
     Profile,
 }
@@ -408,6 +409,7 @@ pub struct MatrixClient {
     me: Option<Me>,
     rooms: Vec<RoomSummary>,
     space: Option<OwnedRoomId>,
+    removing_space: Option<(OwnedRoomId, String)>,
     room: Option<OwnedRoomId>,
     focused: bool,
     notifications: NotificationPreferences,
@@ -505,6 +507,7 @@ impl MatrixClient {
             me: None,
             rooms: Vec::new(),
             space: None,
+            removing_space: None,
             room: None,
             focused: true,
             notifications: NotificationPreferences::default(),
@@ -610,6 +613,7 @@ impl MatrixClient {
                 self.members.clear();
                 self.room = None;
                 self.space = None;
+                self.removing_space = None;
                 self.thread = None;
                 self.dialog = None;
                 self.security = None;
@@ -2261,13 +2265,28 @@ impl MatrixClient {
             }))
     }
 
+    fn remove_space(&mut self, id: OwnedRoomId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(space) = self
+            .summary(&id)
+            .filter(|space| space.kind == RoomKind::Space && !space.invite)
+        else {
+            return;
+        };
+        self.removing_space = Some((id, space.name.clone()));
+        self.show_dialog(Dialog::RemoveSpace, window, cx);
+    }
+
     fn show_dialog(&mut self, dialog: Dialog, window: &mut Window, cx: &mut Context<Self>) {
         self.dialog = Some(dialog);
         let hint = match dialog {
             Dialog::Join => "huddle-join-hint",
             Dialog::Create => "huddle-create-hint",
             Dialog::Talk => "huddle-talk-hint",
-            Dialog::Choose | Dialog::Leave | Dialog::Security | Dialog::Profile => "",
+            Dialog::Choose
+            | Dialog::Leave
+            | Dialog::RemoveSpace
+            | Dialog::Security
+            | Dialog::Profile => "",
         };
         if dialog == Dialog::Profile {
             self.profile_busy = false;
@@ -2303,41 +2322,58 @@ impl MatrixClient {
             self.command(Command::CancelVerify);
         }
         self.dialog = None;
+        self.removing_space = None;
         cx.notify();
     }
 
     fn confirm(&mut self, cx: &mut Context<Self>) {
         let Some(dialog) = self.dialog else { return };
         let text = self.field.read(cx).text().trim().to_owned();
-        let command = match dialog {
-            Dialog::Choose => return,
-            Dialog::Profile => {
-                self.save_profile(cx);
-                return;
-            }
-            Dialog::Security => {
-                if self.guard == Guard::Key && !text.is_empty() {
-                    self.guard = Guard::Recovering;
-                    self.command(Command::Recover(text));
-                    cx.notify();
+        let command =
+            match dialog {
+                Dialog::Choose => return,
+                Dialog::Profile => {
+                    self.save_profile(cx);
+                    return;
                 }
-                return;
-            }
-            Dialog::Leave => match self.room.clone() {
-                Some(room) => {
-                    self.room = None;
-                    self.thread = None;
-                    self.list.reset(0);
+                Dialog::Security => {
+                    if self.guard == Guard::Key && !text.is_empty() {
+                        self.guard = Guard::Recovering;
+                        self.command(Command::Recover(text));
+                        cx.notify();
+                    }
+                    return;
+                }
+                Dialog::RemoveSpace => {
+                    let Some((space, _)) = self.removing_space.take() else {
+                        return;
+                    };
                     self.dialog = None;
-                    Command::Leave(room)
+                    if !self.rooms.iter().any(|room| {
+                        room.id == space && room.kind == RoomKind::Space && !room.invite
+                    }) {
+                        self.notify("That space is no longer joined.", true, cx);
+                        return;
+                    }
+                    self.command(Command::Leave(space));
+                    self.notify("Removing space…", false, cx);
+                    return;
                 }
-                None => return,
-            },
-            _ if text.is_empty() => return,
-            Dialog::Join => Command::Join(text),
-            Dialog::Create => Command::Create(text),
-            Dialog::Talk => Command::Talk(text),
-        };
+                Dialog::Leave => match self.room.clone() {
+                    Some(room) => {
+                        self.room = None;
+                        self.thread = None;
+                        self.list.reset(0);
+                        self.dialog = None;
+                        Command::Leave(room)
+                    }
+                    None => return,
+                },
+                _ if text.is_empty() => return,
+                Dialog::Join => Command::Join(text),
+                Dialog::Create => Command::Create(text),
+                Dialog::Talk => Command::Talk(text),
+            };
         self.command(command);
         if dialog != Dialog::Leave {
             self.notify(
@@ -3627,6 +3663,22 @@ impl MatrixClient {
                     .text_color(theme.foreground)
                     .child(div().truncate().child(title)),
             )
+            .when_some(space, |sidebar, space| {
+                let id = space.id.clone();
+                sidebar.child(
+                    div().px_2().py_2().child(
+                        Button::new("remove-space")
+                            .ghost()
+                            .small()
+                            .w_full()
+                            .icon("icons/log-out.svg")
+                            .label("Remove space")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.remove_space(id.clone(), window, cx)
+                            })),
+                    ),
+                )
+            })
             .child(list)
             .child(self.render_user_panel(cx))
     }
@@ -6366,6 +6418,15 @@ impl MatrixClient {
                 .action(confirm("Start chatting", cx))
                 .into_any_element(),
             Dialog::Profile => self.render_profile(cx),
+            Dialog::RemoveSpace => {
+                let name = self.removing_space.as_ref().map(|(_, name)| name.as_str()).unwrap_or("this space");
+                Modal::new("dialog-remove-space", format!("Remove {name}?"))
+                    .detail("You'll leave this space and remove it from your sidebar. You'll stay joined to its rooms. Rejoining a private space may require an invitation.")
+                    .on_dismiss(close).action(cancel)
+                    .action(Button::new("dialog-remove-space-confirm").destructive().label("Remove space")
+                        .on_click(cx.listener(|this, _, _, cx| this.confirm(cx))))
+                    .into_any_element()
+            }
             Dialog::Leave => {
                 let name = self
                     .room

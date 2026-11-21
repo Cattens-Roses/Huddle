@@ -14,6 +14,74 @@ struct Traffic {
     files: HashMap<String, Vec<u8>>,
     downloads: Vec<String>,
     reject_uploads: bool,
+    created_rooms: usize,
+    leaves: Vec<String>,
+    reject_leaves: bool,
+}
+
+#[tokio::test]
+async fn leaving_a_space_keeps_child_rooms_joined_and_preserves_membership_on_failure() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let server = Server::new();
+        let client = Client::builder()
+            .homeserver_url(&server.url)
+            .server_versions([matrix_sdk::ruma::api::MatrixVersion::V1_11])
+            .build()
+            .await
+            .unwrap();
+        let session: MatrixSession = serde_json::from_value(serde_json::json!({
+            "user_id":"@tester:example.org", "device_id":"SPACE", "access_token":"test-token"
+        }))
+        .unwrap();
+        client.restore_session(session).await.unwrap();
+        let mut request = create_room::v3::Request::new();
+        request.creation_content =
+            Some(serde_json::from_value(serde_json::json!({"type":"m.space"})).unwrap());
+        let space = client.create_room(request).await.unwrap();
+        let child = client
+            .create_room(create_room::v3::Request::new())
+            .await
+            .unwrap();
+        let (outbox, mut updates) = ui::unbounded();
+        let shared = Arc::new(Shared::default());
+        handle(
+            &client,
+            &outbox,
+            &shared,
+            Command::Leave(space.room_id().to_owned()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(space.state(), RoomState::Left);
+        assert_eq!(child.state(), RoomState::Joined);
+        match updates.next().await.unwrap() {
+            Update::Rooms(rooms) => {
+                assert!(!rooms.iter().any(|room| room.id == space.room_id()));
+                assert!(rooms.iter().any(|room| room.id == child.room_id()));
+            }
+            _ => panic!("Expected updated room list after leaving the space"),
+        }
+        assert_eq!(server.traffic.lock().unwrap().leaves.len(), 1);
+        let another = client
+            .create_room(create_room::v3::Request::new())
+            .await
+            .unwrap();
+        server.traffic.lock().unwrap().reject_leaves = true;
+        assert!(
+            handle(
+                &client,
+                &outbox,
+                &shared,
+                Command::Leave(another.room_id().to_owned())
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(another.state(), RoomState::Joined);
+        assert_eq!(child.state(), RoomState::Joined);
+    })
+    .await
+    .expect("Space removal test timed out");
 }
 
 #[tokio::test]
@@ -205,7 +273,21 @@ impl Server {
                 } else if path.contains("/config") {
                     br#"{"m.upload.size":20971520}"#.to_vec()
                 } else if path.contains("/createRoom") {
-                    br#"{"room_id":"!media:example.org"}"#.to_vec()
+                    let id = if traffic.created_rooms == 0 {
+                        "!media:example.org".to_owned()
+                    } else {
+                        format!("!room-{}:example.org", traffic.created_rooms)
+                    };
+                    traffic.created_rooms += 1;
+                    serde_json::to_vec(&serde_json::json!({"room_id":id})).unwrap()
+                } else if path.split('?').next().unwrap().ends_with("/leave") {
+                    traffic.leaves.push(path.to_owned());
+                    if traffic.reject_leaves {
+                        status = "400 Bad Request";
+                        br#"{"errcode":"M_UNKNOWN","error":"Leaving unavailable"}"#.to_vec()
+                    } else {
+                        b"{}".to_vec()
+                    }
                 } else if path.contains("/state/") {
                     status = "404 Not Found";
                     br#"{"errcode":"M_NOT_FOUND","error":"No state"}"#.to_vec()
