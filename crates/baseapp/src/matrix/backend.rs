@@ -82,6 +82,9 @@ pub enum RoomKind {
 pub struct RoomSummary {
     pub id: OwnedRoomId,
     pub name: String,
+    pub explicit_name: Option<String>,
+    pub can_edit_name: bool,
+    pub can_edit_topic: bool,
     pub topic: Option<String>,
     pub avatar: Option<OwnedMxcUri>,
     pub kind: RoomKind,
@@ -201,6 +204,11 @@ pub enum Answer {
 }
 
 pub enum Command {
+    RoomSettings {
+        room: OwnedRoomId,
+        name: Option<String>,
+        topic: Option<String>,
+    },
     SignIn {
         server: String,
         username: String,
@@ -310,6 +318,12 @@ pub enum Command {
 }
 
 pub enum Update {
+    RoomSettingsSaved {
+        room: OwnedRoomId,
+        name: Option<String>,
+        topic: Option<String>,
+        error: Option<String>,
+    },
     SignedOut,
     SigningIn,
     SignInFailed(String),
@@ -1045,6 +1059,23 @@ async fn handle(
     command: Command,
 ) -> Result<()> {
     match command {
+        Command::RoomSettings { room, name, topic } => {
+            let result = save_room_settings(client, &room, name.as_deref(), topic.as_deref()).await;
+            if result.is_err() {
+                // A server may accept the name and reject the topic. Reconcile
+                // any partial change instead of claiming the save was atomic.
+                post(outbox, Update::Rooms(summaries(client).await));
+            }
+            post(
+                outbox,
+                Update::RoomSettingsSaved {
+                    room,
+                    name,
+                    topic,
+                    error: result.err().map(|error| problem(&error)),
+                },
+            );
+        }
         Command::Open { room: id, history } => {
             let room = joined(client, &id)?;
             if history {
@@ -1779,6 +1810,40 @@ fn user_address(client: &Client, input: &str) -> Result<OwnedUserId> {
     })
 }
 
+async fn save_room_settings(
+    client: &Client,
+    id: &OwnedRoomId,
+    name: Option<&str>,
+    topic: Option<&str>,
+) -> Result<()> {
+    let room = joined(client, id)?;
+    let user = client.user_id().ok_or_else(|| anyhow!("not signed in"))?;
+    let levels = room.power_levels().await?;
+    let (can_name, can_topic) = room_edit_permissions(&levels, user);
+    anyhow::ensure!(
+        (name.is_none() || can_name) && (topic.is_none() || can_topic),
+        "You don't have permission to change these room settings."
+    );
+    if let Some(name) = name {
+        room.set_name(name.to_owned()).await?;
+    }
+    if let Some(topic) = topic {
+        room.set_room_topic(topic).await?;
+    }
+    Ok(())
+}
+
+fn room_edit_permissions(
+    levels: &matrix_sdk::ruma::events::room::power_levels::RoomPowerLevels,
+    user: &UserId,
+) -> (bool, bool) {
+    use matrix_sdk::ruma::events::StateEventType;
+    (
+        levels.user_can_send_state(user, StateEventType::RoomName),
+        levels.user_can_send_state(user, StateEventType::RoomTopic),
+    )
+}
+
 async fn summaries(client: &Client) -> Vec<RoomSummary> {
     let mut rooms = Vec::new();
     for room in client.rooms() {
@@ -1801,9 +1866,20 @@ async fn summaries(client: &Client) -> Vec<RoomSummary> {
             _ => Vec::new(),
         };
         let counts = room.unread_notification_counts();
+        let permissions = if state == RoomState::Joined {
+            match (client.user_id(), room.power_levels().await) {
+                (Some(user), Ok(levels)) => room_edit_permissions(&levels, user),
+                _ => (false, false),
+            }
+        } else {
+            (false, false)
+        };
         rooms.push(RoomSummary {
             id: room.room_id().to_owned(),
             name,
+            explicit_name: room.name(),
+            can_edit_name: permissions.0,
+            can_edit_topic: permissions.1,
             topic: room.topic().filter(|topic| !topic.trim().is_empty()),
             avatar: room.avatar_url(),
             kind,
@@ -2209,6 +2285,7 @@ fn problem(error: &anyhow::Error) -> String {
         "The request has",
         "The comparison has",
         "The call",
+        "You don't have permission",
     ];
     if let Some(message) = error.chain().find_map(|cause| {
         let text = cause.to_string();

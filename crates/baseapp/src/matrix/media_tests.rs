@@ -9,6 +9,8 @@ use std::{
 
 #[derive(Default)]
 struct Traffic {
+    sync: Option<serde_json::Value>,
+    state_writes: Vec<(String, serde_json::Value)>,
     uploads: Vec<(String, Vec<u8>)>,
     sent: Vec<serde_json::Value>,
     files: HashMap<String, Vec<u8>>,
@@ -17,6 +19,63 @@ struct Traffic {
     created_rooms: usize,
     leaves: Vec<String>,
     reject_leaves: bool,
+}
+
+#[tokio::test]
+async fn room_settings_save_for_admins_and_recheck_revoked_permissions() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let server = Server::new();
+        let client = Client::builder().homeserver_url(&server.url)
+            .server_versions([matrix_sdk::ruma::api::MatrixVersion::V1_11])
+            .build().await.unwrap();
+        let session: MatrixSession = serde_json::from_value(serde_json::json!({
+            "user_id":"@tester:example.org", "device_id":"SETTINGS", "access_token":"test-token"
+        })).unwrap();
+        client.restore_session(session).await.unwrap();
+        let id: OwnedRoomId = "!settings:example.org".parse().unwrap();
+        let sync = |level: i64, token: &str| serde_json::json!({
+            "next_batch":token,
+            "rooms":{"join":{id.as_str():{
+                "state":{"events":[
+                    {"type":"m.room.create","state_key":"","event_id":"$create","sender":"@tester:example.org","origin_server_ts":1,"content":{"creator":"@tester:example.org","room_version":"11"}},
+                    {"type":"m.room.member","state_key":"@tester:example.org","event_id":"$member","sender":"@tester:example.org","origin_server_ts":2,"content":{"membership":"join"}},
+                    {"type":"m.room.power_levels","state_key":"","event_id":format!("$power{token}"),"sender":"@tester:example.org","origin_server_ts":3,"content":{"users":{"@tester:example.org":level},"state_default":50}},
+                    {"type":"m.room.name","state_key":"","event_id":"$name","sender":"@tester:example.org","origin_server_ts":4,"content":{"name":"Old room"}}
+                ]},
+                "timeline":{"events":[],"limited":false,"prev_batch":"history"}
+            }}}
+        });
+        server.traffic.lock().unwrap().sync = Some(sync(100, "admin"));
+        client.sync_once(SyncSettings::default()).await.unwrap();
+        let summary = summaries(&client).await.into_iter().find(|room| room.id == id).unwrap();
+        assert!(summary.can_edit_name && summary.can_edit_topic);
+        assert_eq!(summary.explicit_name.as_deref(), Some("Old room"));
+        let (outbox, mut updates) = ui::unbounded();
+        let shared = Arc::new(Shared::default());
+        handle(&client, &outbox, &shared, Command::RoomSettings {
+            room: id.clone(), name: Some("New room".into()), topic: Some("Room description".into()),
+        }).await.unwrap();
+        assert!(matches!(updates.next().await, Some(Update::RoomSettingsSaved { error: None, .. })));
+        {
+            let traffic = server.traffic.lock().unwrap();
+            assert_eq!(traffic.state_writes.len(), 2);
+            assert!(traffic.state_writes[0].0.contains("/m.room.name"));
+            assert_eq!(traffic.state_writes[0].1["name"], "New room");
+            assert!(traffic.state_writes[1].0.contains("/m.room.topic"));
+            assert_eq!(traffic.state_writes[1].1["topic"], "Room description");
+        }
+        // The dialog may already be open when an administrator removes this role.
+        server.traffic.lock().unwrap().sync = Some(sync(0, "revoked"));
+        client.sync_once(SyncSettings::default()).await.unwrap();
+        let summary = summaries(&client).await.into_iter().find(|room| room.id == id).unwrap();
+        assert!(!summary.can_edit_name && !summary.can_edit_topic);
+        handle(&client, &outbox, &shared, Command::RoomSettings {
+            room: id, name: Some("Denied".into()), topic: None,
+        }).await.unwrap();
+        assert!(matches!(updates.next().await, Some(Update::Rooms(_))));
+        assert!(matches!(updates.next().await, Some(Update::RoomSettingsSaved { error: Some(_), .. })));
+        assert_eq!(server.traffic.lock().unwrap().state_writes.len(), 2);
+    }).await.expect("Room settings integration test timed out");
 }
 
 #[tokio::test]
@@ -232,7 +291,21 @@ impl Server {
                 let mut traffic = captured.lock().unwrap();
                 let mut status = "200 OK";
                 let mut content_type = "application/json";
-                let response = if path.contains("/upload") && traffic.reject_uploads {
+                let response = if path.contains("/sync") {
+                    serde_json::to_vec(
+                        &traffic
+                            .sync
+                            .take()
+                            .unwrap_or_else(|| serde_json::json!({"next_batch":"empty"})),
+                    )
+                    .unwrap()
+                } else if path.contains("/state/") && header.starts_with("PUT ") {
+                    traffic.state_writes.push((
+                        path.to_owned(),
+                        serde_json::from_slice(&request[header_end..header_end + length]).unwrap(),
+                    ));
+                    serde_json::to_vec(&serde_json::json!({"event_id":format!("$state{}", traffic.state_writes.len())})).unwrap()
+                } else if path.contains("/upload") && traffic.reject_uploads {
                     status = "403 Forbidden";
                     br#"{"errcode":"M_FORBIDDEN","error":"Uploads disabled"}"#.to_vec()
                 } else if path.contains("/upload") {

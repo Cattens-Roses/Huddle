@@ -80,6 +80,7 @@ enum Phase {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Dialog {
+    RoomSettings,
     Choose,
     Join,
     Create,
@@ -465,6 +466,10 @@ pub struct MatrixClient {
     thread_draft: Entity<Input>,
     field: Entity<Input>,
     profile_name: Entity<Input>,
+    settings_room: Option<OwnedRoomId>,
+    room_name: Entity<Input>,
+    room_topic: Entity<Input>,
+    room_settings_busy: bool,
     mark: Option<Mark>,
     _updates: Task<()>,
 }
@@ -589,6 +594,10 @@ impl MatrixClient {
             thread_draft: cx.new(|cx| Input::new("huddle-thread-hint", cx).tucked().growing()),
             field: cx.new(|cx| Input::new("huddle-join-hint", cx)),
             profile_name: cx.new(|cx| Input::new("huddle-profile-hint", cx)),
+            settings_room: None,
+            room_name: cx.new(|cx| Input::new("Room name", cx)),
+            room_topic: cx.new(|cx| Input::new("Room topic", cx).growing()),
+            room_settings_busy: false,
             mark: None,
             _updates: listener,
         };
@@ -619,7 +628,38 @@ impl MatrixClient {
 
     fn apply(&mut self, update: Update, cx: &mut Context<Self>) {
         match update {
+            Update::RoomSettingsSaved {
+                room,
+                name,
+                topic,
+                error,
+            } => {
+                if self.settings_room.as_ref() != Some(&room) {
+                    return;
+                }
+                self.room_settings_busy = false;
+                if let Some(error) = error {
+                    self.notify(error, true, cx);
+                } else {
+                    if let Some(summary) = self.rooms.iter_mut().find(|known| known.id == room) {
+                        if let Some(name) = name {
+                            summary.explicit_name = (!name.is_empty()).then(|| name.clone());
+                            if !name.is_empty() {
+                                summary.name = name;
+                            }
+                        }
+                        if let Some(topic) = topic {
+                            summary.topic = (!topic.is_empty()).then_some(topic);
+                        }
+                    }
+                    self.dialog = None;
+                    self.settings_room = None;
+                    self.notify("Room settings saved.", false, cx);
+                }
+            }
             Update::SignedOut => {
+                self.settings_room = None;
+                self.room_settings_busy = false;
                 self.cache_clearing = false;
                 self.cache_status = None;
                 cx.emit(CacheChanged);
@@ -2305,6 +2345,78 @@ impl MatrixClient {
         self.show_dialog(Dialog::RemoveSpace, window, cx);
     }
 
+    fn open_room_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(room) = self
+            .room
+            .as_ref()
+            .and_then(|id| self.summary(id))
+            .filter(|room| !room.invite && (room.can_edit_name || room.can_edit_topic))
+        else {
+            return;
+        };
+        let (id, name, topic, can_name) = (
+            room.id.clone(),
+            room.explicit_name.clone().unwrap_or_default(),
+            room.topic.clone().unwrap_or_default(),
+            room.can_edit_name,
+        );
+        self.settings_room = Some(id);
+        self.room_settings_busy = false;
+        self.room_name
+            .update(cx, |input, cx| input.set_text(name, cx));
+        self.room_topic
+            .update(cx, |input, cx| input.set_text(topic, cx));
+        self.dialog = Some(Dialog::RoomSettings);
+        focus(
+            if can_name {
+                &self.room_name
+            } else {
+                &self.room_topic
+            },
+            window,
+            cx,
+        );
+        cx.notify();
+    }
+
+    fn save_room_settings(&mut self, cx: &mut Context<Self>) {
+        if self.room_settings_busy {
+            return;
+        }
+        let Some(room) = self.settings_room.as_ref().and_then(|id| self.summary(id)) else {
+            self.notify("This room is no longer available.", true, cx);
+            return;
+        };
+        let name = self.room_name.read(cx).text().trim().to_owned();
+        let topic = self.room_topic.read(cx).text().trim().to_owned();
+        let name = (name != room.explicit_name.as_deref().unwrap_or_default()).then_some(name);
+        let topic = (topic != room.topic.as_deref().unwrap_or_default()).then_some(topic);
+        if room.invite
+            || (!room.can_edit_name && !room.can_edit_topic)
+            || (name.is_some() && !room.can_edit_name)
+            || (topic.is_some() && !room.can_edit_topic)
+        {
+            self.notify(
+                "You don't have permission to change these room settings.",
+                true,
+                cx,
+            );
+            return;
+        }
+        if name.is_none() && topic.is_none() {
+            self.close_dialog(cx);
+            return;
+        }
+        let id = room.id.clone();
+        self.room_settings_busy = true;
+        self.command(Command::RoomSettings {
+            room: id,
+            name,
+            topic,
+        });
+        cx.notify();
+    }
+
     fn show_dialog(&mut self, dialog: Dialog, window: &mut Window, cx: &mut Context<Self>) {
         self.dialog = Some(dialog);
         let hint = match dialog {
@@ -2315,6 +2427,7 @@ impl MatrixClient {
             | Dialog::Leave
             | Dialog::RemoveSpace
             | Dialog::Security
+            | Dialog::RoomSettings
             | Dialog::Profile => "",
         };
         if dialog == Dialog::Profile {
@@ -2342,6 +2455,9 @@ impl MatrixClient {
     }
 
     fn close_dialog(&mut self, cx: &mut Context<Self>) {
+        if self.dialog == Some(Dialog::RoomSettings) && self.room_settings_busy {
+            return;
+        }
         if self.dialog == Some(Dialog::Security)
             && matches!(
                 self.guard,
@@ -2351,6 +2467,7 @@ impl MatrixClient {
             self.command(Command::CancelVerify);
         }
         self.dialog = None;
+        self.settings_room = None;
         self.removing_space = None;
         cx.notify();
     }
@@ -2360,6 +2477,10 @@ impl MatrixClient {
         let text = self.field.read(cx).text().trim().to_owned();
         let command =
             match dialog {
+                Dialog::RoomSettings => {
+                    self.save_room_settings(cx);
+                    return;
+                }
                 Dialog::Choose => return,
                 Dialog::Profile => {
                     self.save_profile(cx);
@@ -5646,6 +5767,18 @@ impl MatrixClient {
                     )
             })
             .child(div().flex_1())
+            .when(room.can_edit_name || room.can_edit_topic, |header| {
+                header.child(
+                    Button::new("room-settings")
+                        .ghost()
+                        .small()
+                        .icon("icons/settings.svg")
+                        .tooltip("Room settings")
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.open_room_settings(window, cx)),
+                        ),
+                )
+            })
             .child({
                 let id = room.id.clone();
                 let name = room.name.clone();
@@ -6357,6 +6490,62 @@ impl MatrixClient {
             .into_any_element()
     }
 
+    fn render_room_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = *cx.theme();
+        let room = self.settings_room.as_ref().and_then(|id| self.summary(id));
+        let can_name = room.is_some_and(|room| !room.invite && room.can_edit_name);
+        let can_topic = room.is_some_and(|room| !room.invite && room.can_edit_topic);
+        let busy = self.room_settings_busy;
+        let row = |title: &'static str, input: &Entity<Input>, editable: bool| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .text_size(theme.text(Text::Small))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(title),
+                )
+                .child(if editable && !busy {
+                    div().min_h(px(40.)).child(input.clone()).into_any_element()
+                } else {
+                    div()
+                        .text_color(theme.muted_foreground)
+                        .child(input.read(cx).text().to_owned())
+                        .into_any_element()
+                })
+        };
+        Modal::new("dialog-room-settings", "Room settings")
+            .w(px(460.))
+            .close_button()
+            .on_dismiss(cx.listener(|this, _: &(), _, cx| this.close_dialog(cx)))
+            .child(row("Name", &self.room_name, can_name))
+            .child(row("Topic", &self.room_topic, can_topic))
+            .when(!can_name && !can_topic, |modal| {
+                modal.child(
+                    div()
+                        .text_color(theme.muted_foreground)
+                        .child("You no longer have permission to edit this room."),
+                )
+            })
+            .action(
+                Button::new("room-settings-cancel")
+                    .ghost()
+                    .label("Cancel")
+                    .disabled(busy)
+                    .on_click(cx.listener(|this, _, _, cx| this.close_dialog(cx))),
+            )
+            .action(
+                Button::new("room-settings-save")
+                    .primary()
+                    .label(if busy { "Saving…" } else { "Save" })
+                    .disabled(busy || (!can_name && !can_topic))
+                    .on_click(cx.listener(|this, _, _, cx| this.save_room_settings(cx))),
+            )
+            .into_any_element()
+    }
+
     fn render_dialog(&self, dialog: Dialog, cx: &mut Context<Self>) -> AnyElement {
         let theme = *cx.theme();
         let close = cx.listener(|this, _: &(), _, cx| this.close_dialog(cx));
@@ -6386,6 +6575,7 @@ impl MatrixClient {
         };
 
         match dialog {
+            Dialog::RoomSettings => self.render_room_settings(cx),
             Dialog::Security => self.render_security(cx),
             Dialog::Choose => {
                 let option = |id: &'static str, path: &'static str, title: &'static str, detail: &'static str, next: Dialog| {
