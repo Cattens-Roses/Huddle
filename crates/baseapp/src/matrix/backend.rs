@@ -208,6 +208,10 @@ pub enum Answer {
 }
 
 pub enum Command {
+    Typing {
+        room: OwnedRoomId,
+        active: bool,
+    },
     LoadRoomAdmin(OwnedRoomId),
     RoomAdmin {
         room: OwnedRoomId,
@@ -327,6 +331,10 @@ pub enum Command {
 }
 
 pub enum Update {
+    Typing {
+        room: OwnedRoomId,
+        users: Vec<OwnedUserId>,
+    },
     RoomAdminLoaded {
         room: OwnedRoomId,
         result: std::result::Result<Box<admin::Snapshot>, String>,
@@ -549,6 +557,7 @@ struct Worker {
     tasks: Vec<JoinHandle<()>>,
     shared: Arc<Shared>,
     signup: Option<SignUp>,
+    typing: Option<mpsc::UnboundedSender<(OwnedRoomId, bool)>>,
 }
 
 impl Worker {
@@ -559,6 +568,7 @@ impl Worker {
             tasks: Vec::new(),
             shared: Arc::default(),
             signup: None,
+            typing: None,
         }
     }
 
@@ -604,6 +614,11 @@ impl Worker {
                 }
                 Command::CancelSignUp => self.signup = None,
                 Command::SignOut => self.sign_out().await,
+                Command::Typing { room, active } => {
+                    if let Some(typing) = &self.typing {
+                        let _ = typing.send((room, active));
+                    }
+                }
                 command => {
                     let Some(client) = self.client.clone() else {
                         continue;
@@ -819,6 +834,7 @@ impl Worker {
     }
 
     async fn sign_out(&mut self) {
+        self.typing = None;
         for task in self.tasks.drain(..) {
             task.abort();
         }
@@ -835,6 +851,43 @@ impl Worker {
     }
 
     async fn begin(&mut self, client: Client) {
+        // Serialize notices separately so start/stop cannot overtake one another,
+        // and a slow typing request cannot delay messages or uploads.
+        let (typing, mut notices) = mpsc::unbounded_channel::<(OwnedRoomId, bool)>();
+        self.typing = Some(typing);
+        let typing_client = client.clone();
+        self.tasks.push(tokio::spawn(async move {
+            while let Some((id, active)) = notices.recv().await {
+                if let Some(room) = typing_client.get_room(&id)
+                    && let Err(error) = room.typing_notice(active).await
+                {
+                    log::debug!("matrix: typing notice failed: {error}");
+                }
+            }
+        }));
+
+        let outbox = self.outbox.clone();
+        client.add_event_handler(
+            move |event: matrix_sdk::ruma::events::typing::SyncTypingEvent, room: Room| {
+                let outbox = outbox.clone();
+                async move {
+                    let users = event
+                        .content
+                        .user_ids
+                        .into_iter()
+                        .filter(|user| user.as_str() != room.own_user_id().as_str())
+                        .take(3)
+                        .collect();
+                    post(
+                        &outbox,
+                        Update::Typing {
+                            room: room.room_id().to_owned(),
+                            users,
+                        },
+                    );
+                }
+            },
+        );
         if let Err(error) = client
             .media()
             .set_media_retention_policy(cache_policy())
@@ -1675,6 +1728,7 @@ async fn handle(
         | Command::SignUp { .. }
         | Command::Answer(_)
         | Command::CancelSignUp
+        | Command::Typing { .. }
         | Command::SignOut => {}
     }
     Ok(())

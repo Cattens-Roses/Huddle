@@ -3,6 +3,7 @@ mod photo;
 mod playback;
 mod rich;
 mod room_settings;
+mod typing;
 mod upload;
 
 use crate::cache::Cache;
@@ -416,6 +417,10 @@ pub struct MatrixClient {
     room: Option<OwnedRoomId>,
     focused: bool,
     in_tray: bool,
+    typing: typing::Remote,
+    typing_local: typing::Local,
+    typing_idle: Option<Task<()>>,
+    typing_expiry: Option<Task<()>>,
     notifications: NotificationPreferences,
     timelines: HashMap<OwnedRoomId, Timeline>,
     members: HashMap<OwnedRoomId, Vec<Member>>,
@@ -524,6 +529,10 @@ impl MatrixClient {
             room: None,
             focused: true,
             in_tray: false,
+            typing: typing::Remote::default(),
+            typing_local: typing::Local::default(),
+            typing_idle: None,
+            typing_expiry: None,
             notifications: NotificationPreferences::default(),
             timelines: HashMap::new(),
             members: HashMap::new(),
@@ -640,6 +649,44 @@ impl MatrixClient {
             return;
         }
         match update {
+            Update::Typing { room, users } => {
+                let names = users
+                    .iter()
+                    .map(|user| {
+                        let name = self
+                            .members
+                            .get(&room)
+                            .and_then(|members| members.iter().find(|member| &member.id == user))
+                            .map(|member| member.name.as_str())
+                            .filter(|name| !name.trim().is_empty())
+                            .unwrap_or_else(|| user.localpart());
+                        one_line(name)
+                    })
+                    .collect();
+                self.typing.update(room, names, std::time::Instant::now());
+                if self.typing_expiry.is_none() && !self.typing.is_empty() {
+                    self.typing_expiry = Some(cx.spawn(async move |this, cx| {
+                        loop {
+                            cx.background_executor().timer(Duration::from_secs(1)).await;
+                            let active = this
+                                .update(cx, |this, cx| {
+                                    this.typing.expire(std::time::Instant::now());
+                                    cx.notify();
+                                    if this.typing.is_empty() {
+                                        this.typing_expiry = None;
+                                        false
+                                    } else {
+                                        true
+                                    }
+                                })
+                                .unwrap_or(false);
+                            if !active {
+                                break;
+                            }
+                        }
+                    }));
+                }
+            }
             Update::RoomAdminLoaded { room, result } => {
                 if self.settings_room.as_ref() != Some(&room) {
                     return;
@@ -692,6 +739,9 @@ impl MatrixClient {
                 }
             }
             Update::SignedOut => {
+                self.stop_typing();
+                self.typing = typing::Remote::default();
+                self.typing_expiry = None;
                 self.admin.reset();
                 self.settings_room = None;
                 self.room_settings_busy = false;
@@ -835,6 +885,7 @@ impl MatrixClient {
                         .iter()
                         .any(|known| &known.id == room && !known.invite)
                 {
+                    self.stop_typing();
                     self.room = None;
                     self.thread = None;
                 }
@@ -1283,11 +1334,15 @@ impl MatrixClient {
 
     pub fn set_focused(&mut self, focused: bool) {
         self.focused = focused && !self.in_tray;
+        if !self.focused {
+            self.stop_typing();
+        }
     }
 
     pub fn set_in_tray(&mut self, hidden: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.in_tray = hidden;
         if hidden {
+            self.stop_typing();
             self.focused = false;
             self.pending_play = None;
             self.player = None;
@@ -1610,6 +1665,7 @@ impl MatrixClient {
                 .flatten();
         }
         if self.room.as_ref() != Some(&id) {
+            self.stop_typing();
             self.cancel_compress();
             self.thread = None;
             self.replying = None;
@@ -1657,6 +1713,7 @@ impl MatrixClient {
     }
 
     fn send(&mut self, spot: Spot, window: &mut Window, cx: &mut Context<Self>) {
+        self.stop_typing();
         let (Some(room), Some(me)) = (self.room.clone(), self.me.as_ref()) else {
             return;
         };
@@ -2356,6 +2413,40 @@ impl MatrixClient {
         cx.write_to_clipboard(ClipboardItem::new_string(mark.text[start..end].to_owned()));
     }
 
+    fn stop_typing(&mut self) {
+        self.typing_idle = None;
+        if let Some(room) = self.typing_local.stop() {
+            self.command(Command::Typing {
+                room,
+                active: false,
+            });
+        }
+    }
+
+    fn composer_typed(&mut self, spot: Spot, text: &str, cx: &mut Context<Self>) {
+        if !self.focused || self.in_tray || text.trim().is_empty() {
+            self.stop_typing();
+            return;
+        }
+        let Some(room) = self
+            .room
+            .clone()
+            .filter(|id| self.summary(id).is_some_and(|room| !room.invite))
+        else {
+            return;
+        };
+        if spot == Spot::Thread && self.thread.is_none() {
+            return;
+        }
+        if self.typing_local.activity(&room, std::time::Instant::now()) {
+            self.command(Command::Typing { room, active: true });
+        }
+        self.typing_idle = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(typing::IDLE).await;
+            this.update(cx, |this, _| this.stop_typing()).ok();
+        }));
+    }
+
     fn wire_composer(&mut self, cx: &mut Context<Self>) {
         if self.draft.read(cx).pastes_images() {
             return;
@@ -2367,7 +2458,13 @@ impl MatrixClient {
         ] {
             let pasted = this.clone();
             let active = this.clone();
+            let edited = this.clone();
             input.update(cx, |input, _| {
+                input.on_edit(move |text, cx| {
+                    edited
+                        .update(cx, |this, cx| this.composer_typed(spot, text, cx))
+                        .ok();
+                });
                 input.on_paste_image(move |picture, _, cx| {
                     pasted
                         .update(cx, |this, cx| this.paste_picture(spot, picture, cx))
@@ -2661,6 +2758,7 @@ impl MatrixClient {
                 }
                 Dialog::Leave => match self.room.clone() {
                     Some(room) => {
+                        self.stop_typing();
                         self.room = None;
                         self.thread = None;
                         self.list.reset(0);
@@ -3581,6 +3679,7 @@ impl MatrixClient {
                 let leave = this.room.as_ref().is_some_and(|id| this.loose(id));
                 this.space = None;
                 if leave {
+                    this.stop_typing();
                     this.room = None;
                 }
                 cx.notify();
@@ -4107,7 +4206,10 @@ impl MatrixClient {
                     .small()
                     .icon("icons/log-out.svg")
                     .tooltip("huddle-sign-out")
-                    .on_click(cx.listener(|this, _, _, _| this.command(Command::SignOut))),
+                    .on_click(cx.listener(|this, _, _, _| {
+                        this.stop_typing();
+                        this.command(Command::SignOut);
+                    })),
             )
     }
 
@@ -5814,6 +5916,24 @@ impl MatrixClient {
             .flex_none()
             .px_4()
             .pb_5()
+            .when(spot == Spot::Main, |composer| {
+                let label = self
+                    .room
+                    .as_ref()
+                    .and_then(|room| self.typing.label(room, std::time::Instant::now()))
+                    .unwrap_or("")
+                    .to_owned();
+                composer.child(
+                    div()
+                        .id("typing-status")
+                        .h(px(20.))
+                        .min_w_0()
+                        .truncate()
+                        .text_size(theme.text(Text::Small))
+                        .text_color(theme.muted_foreground)
+                        .child(label),
+                )
+            })
             .children(top)
             .child(
                 div()

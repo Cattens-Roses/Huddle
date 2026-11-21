@@ -222,6 +222,7 @@ pub struct Input {
     context_menu: Option<Point<Pixels>>,
     paste_image: Option<Rc<dyn Fn(PastedPicture, &mut Window, &mut App)>>,
     activity: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
+    edit: Option<Rc<dyn Fn(&str, &mut App)>>,
 }
 
 impl Input {
@@ -252,6 +253,7 @@ impl Input {
             context_menu: None,
             paste_image: None,
             activity: None,
+            edit: None,
         }
     }
 
@@ -311,6 +313,11 @@ impl Input {
     /// Fires when the field is clicked or its text changes, so a selection elsewhere can step aside.
     pub fn on_activity(&mut self, listener: impl Fn(&mut Window, &mut App) + 'static) {
         self.activity = Some(Rc::new(listener));
+    }
+
+    /// Fires for user text edits, including paste and IME composition, but not selection or set_text.
+    pub fn on_edit(&mut self, listener: impl Fn(&str, &mut App) + 'static) {
+        self.edit = Some(Rc::new(listener));
     }
 
     pub fn has_selection(&self) -> bool {
@@ -376,6 +383,9 @@ impl Input {
 
     fn clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.set_text("", cx);
+        if let Some(edit) = self.edit.clone() {
+            edit(&self.content, cx);
+        }
         self.focus(window, cx);
     }
 
@@ -926,6 +936,9 @@ impl EntityInputHandler for Input {
     ) {
         let range = self.edited_range(range_utf16.as_ref());
         self.splice(&range, text);
+        if let Some(edit) = self.edit.clone() {
+            edit(&self.content, cx);
+        }
         self.activity(window, cx);
 
         let caret = range.start + text.len();
@@ -947,6 +960,9 @@ impl EntityInputHandler for Input {
     ) {
         let range = self.edited_range(range_utf16.as_ref());
         self.splice(&range, text);
+        if let Some(edit) = self.edit.clone() {
+            edit(&self.content, cx);
+        }
         self.activity(window, cx);
 
         let caret = range.start + text.len();
