@@ -102,6 +102,20 @@ impl Glide {
         }
     }
 
+    /// Cancel motion after a content change without writing a pixel offset back to
+    /// the scroll handle. Virtual lists may have just restored an exact item anchor.
+    pub fn rebase(&self, scroll: &impl ScrollPosition) {
+        let mut drift = self.drift.borrow_mut();
+        let armed = drift.armed;
+        let offset = scroll.offset();
+        *drift = Drift {
+            shown: offset,
+            target: offset,
+            armed,
+            ..Drift::default()
+        };
+    }
+
     pub fn nudge(&self, scroll: &impl ScrollPosition, window: &mut Window) {
         {
             let mut drift = self.drift.borrow_mut();
@@ -285,4 +299,42 @@ fn held(at: Point<Pixels>, scroll: &impl ScrollPosition) -> Point<Pixels> {
         at.x.clamp(-reach.x.max(Pixels::ZERO), Pixels::ZERO),
         at.y.clamp(-reach.y.max(Pixels::ZERO), Pixels::ZERO),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rebase_cancels_queued_motion_without_overwriting_prepended_list_anchor() {
+        let list = ListState::new(20, gpui::ListAlignment::Bottom, px(600.));
+        list.scroll_to(gpui::ListOffset {
+            item_ix: 0,
+            offset_in_item: px(12.5),
+        });
+        let glide = Glide::default();
+        {
+            let mut drift = glide.drift.borrow_mut();
+            drift.shown = point(px(0.), px(-12.5));
+            drift.target = point(px(0.), px(-80.));
+            drift.gliding = true;
+            drift.armed = true;
+        }
+
+        list.splice(0..0, 30);
+        let anchor = list.logical_scroll_top();
+        assert_eq!(anchor.item_ix, 30);
+        glide.rebase(&list);
+
+        // Prepending unmeasured rows changes scrollbar coordinates. Writing those
+        // coordinates back here would discard the exact item and fractional pixel.
+        let restored = list.logical_scroll_top();
+        assert_eq!(restored.item_ix, anchor.item_ix);
+        assert_eq!(restored.offset_in_item, px(12.5));
+        let drift = glide.drift.borrow();
+        assert!(!drift.gliding);
+        assert!(!drift.springing);
+        assert_eq!(drift.target, list.offset());
+        assert!(drift.armed);
+    }
 }

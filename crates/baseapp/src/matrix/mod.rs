@@ -1,5 +1,6 @@
 mod backend;
 mod photo;
+mod playback;
 mod rich;
 
 use std::cell::RefCell;
@@ -129,7 +130,8 @@ struct Upload {
     mime: String,
     width: u32,
     height: u32,
-    preview: Arc<Image>,
+    preview: Option<Arc<Image>>,
+    duration: Option<Duration>,
 }
 
 const UPLOAD_LIMIT: usize = 20 * 1024 * 1024;
@@ -376,6 +378,19 @@ struct Person {
     avatar: Option<OwnedMxcUri>,
 }
 
+#[derive(Clone)]
+enum Line {
+    Ringing {
+        room: OwnedRoomId,
+        event: OwnedEventId,
+        name: String,
+    },
+    Live {
+        room: OwnedRoomId,
+        name: String,
+    },
+}
+
 pub struct MatrixClient {
     commands: UnboundedSender<Command>,
     phase: Phase,
@@ -394,6 +409,7 @@ pub struct MatrixClient {
     members: HashMap<OwnedRoomId, Vec<Member>>,
     show_members: bool,
     list: ListState,
+    history_anchor: Option<(OwnedRoomId, gpui::ListOffset, Pixels)>,
     chat_scroll: Entity<Scrollbar>,
     thread: Option<OwnedEventId>,
     thread_list: ListState,
@@ -409,8 +425,12 @@ pub struct MatrixClient {
     media: RefCell<HashMap<String, Media>>,
     files: HashMap<String, Vec<u8>>,
     viewing: Option<View>,
+    player: Option<playback::Player>,
+    player_image: Option<Arc<Image>>,
+    pending_play: Option<Picture>,
     saving: Option<Task<()>>,
     person: Option<Person>,
+    line: Option<Line>,
     replying: Option<Target>,
     editing: Option<(OwnedEventId, Spot)>,
     picker: Option<(OwnedEventId, Spot)>,
@@ -448,7 +468,9 @@ impl MatrixClient {
                 }
             }
         });
-        let list = ListState::new(0, ListAlignment::Bottom, px(600.));
+        // Wheel/scrollbar offsets need real heights for the entire loaded history,
+        // including prepended rows outside the visible overdraw.
+        let list = ListState::new(0, ListAlignment::Bottom, px(600.)).measure_all();
         let weak = cx.weak_entity();
         list.set_scroll_handler(move |event, _, cx| {
             if event.visible_range.start == 0 {
@@ -478,6 +500,7 @@ impl MatrixClient {
             members: HashMap::new(),
             show_members: true,
             list: list.clone(),
+            history_anchor: None,
             chat_scroll: cx.new(|_| {
                 Scrollbar::list(list)
                     .named("chat-scrollbar")
@@ -501,8 +524,12 @@ impl MatrixClient {
             media: RefCell::default(),
             files: HashMap::new(),
             viewing: None,
+            player: None,
+            player_image: None,
+            pending_play: None,
             saving: None,
             person: None,
+            line: None,
             replying: None,
             editing: None,
             picker: None,
@@ -571,9 +598,13 @@ impl MatrixClient {
                 self.cancel_compress();
                 self.mark = None;
                 self.viewing = None;
+                self.player = None;
+                self.pending_play = None;
+                self.player_image = None;
                 self.files.clear();
                 self.saving = None;
                 self.person = None;
+                self.line = None;
                 self.profile_photo = None;
                 self.profile_remove = false;
                 self.profile_busy = false;
@@ -614,9 +645,10 @@ impl MatrixClient {
                 if let Some(uri) = &avatar
                     && let Some(photo) = self.profile_photo.take()
                 {
-                    self.media
-                        .borrow_mut()
-                        .insert(format!("{uri}#avatar"), Media::Ready(photo.preview));
+                    self.media.borrow_mut().insert(
+                        format!("{uri}#avatar"),
+                        Media::Ready(photo.preview.expect("profile image preview")),
+                    );
                 }
                 self.profile_photo = None;
                 self.profile_remove = false;
@@ -696,7 +728,7 @@ impl MatrixClient {
                 events,
                 token,
                 older,
-            } => self.history(room, events, token, older),
+            } => self.history(room, events, token, older, cx),
             Update::Thread { room, root, events } => self.thread_loaded(room, root, events),
             Update::Members { room, members } => {
                 self.members.insert(room, members);
@@ -714,6 +746,19 @@ impl MatrixClient {
                 self.pending_focus = Some(Focus::Draft);
             }
             Update::Media { key, bytes } => {
+                if self
+                    .pending_play
+                    .as_ref()
+                    .is_some_and(|media| key == media.key)
+                {
+                    let media = self.pending_play.take().unwrap();
+                    if let Some(bytes) = bytes {
+                        self.start_media(media, bytes, cx);
+                    } else {
+                        self.notify("This media file couldn't load. Try again.", true, cx);
+                    }
+                    return;
+                }
                 if key.ends_with("#original")
                     && let Some(bytes) = &bytes
                 {
@@ -763,6 +808,29 @@ impl MatrixClient {
                 }
                 self.notify(problem, true, cx);
             }
+            Update::Ring { room, event } if !matches!(self.line, Some(Line::Live { .. })) => {
+                let name = self
+                    .summary(&room)
+                    .map(|room| room.name.clone())
+                    .unwrap_or_else(|| "Someone".into());
+                if !self.focused {
+                    crate::presence::announce(cx, "Incoming call", &name, room.as_str());
+                }
+                self.line = Some(Line::Ringing { room, event, name });
+            }
+            Update::Ring { .. } => {}
+            Update::Calling { room } => {
+                let same =
+                    matches!(&self.line, Some(Line::Live { room: live, .. }) if live == &room);
+                if !same {
+                    let name = self
+                        .summary(&room)
+                        .map(|room| room.name.clone())
+                        .unwrap_or_else(|| "Call".into());
+                    self.line = Some(Line::Live { room, name });
+                }
+            }
+            Update::CallEnded => self.line = None,
         }
         cx.notify();
     }
@@ -804,8 +872,21 @@ impl MatrixClient {
         events: Vec<Event>,
         token: Option<String>,
         older: bool,
+        cx: &mut Context<Self>,
     ) {
         let current = self.room.as_ref() == Some(&room);
+        let anchor = (older && current).then(|| {
+            let offset = self.list.logical_scroll_top();
+            let height = if offset.item_ix == 0 {
+                self.list
+                    .bounds_for_item(0)
+                    .map(|bounds| bounds.size.height)
+            } else {
+                None
+            };
+            (offset, height)
+        });
+        let anchor_room = room.clone();
         let timeline = self.timelines.entry(room).or_default();
         let mut fresh = Vec::new();
         let mut relations = Vec::new();
@@ -829,10 +910,21 @@ impl MatrixClient {
             timeline.retry();
             let added = timeline.messages.len().saturating_sub(before);
             if current {
+                // Anchor at response time so scrolling while the page loads is respected.
+                let (mut anchor, height) = anchor.expect("current history has an anchor");
+                anchor.item_ix += added;
                 self.list.splice(0..0, added);
                 let len = timeline.messages.len();
                 self.list
                     .remeasure_items(added.min(len)..(added + 1).min(len));
+                // Restore after invalidation to rebase any pending layout adjustment too.
+                self.list.scroll_to(anchor);
+                if let Some(height) = height {
+                    self.history_anchor = Some((anchor_room, anchor, height));
+                }
+                // A queued wheel animation still targets pixel offsets from before
+                // the prepend. It must not overwrite the restored message anchor.
+                self.chat_scroll.update(cx, |bar, _| bar.rebase());
             }
         } else {
             let pending = timeline
@@ -1331,7 +1423,7 @@ impl MatrixClient {
         };
         let body = input.read(cx).text().trim().to_owned();
         if self.compressing == Some(spot) {
-            self.notify("Still compressing that photo.", false, cx);
+            self.notify("Still preparing that file.", false, cx);
             return;
         }
         let shot = self
@@ -1459,9 +1551,11 @@ impl MatrixClient {
             Spot::Thread => self.thread.clone(),
         };
         let key = format!("local:{local}#image");
-        self.media
-            .borrow_mut()
-            .insert(key.clone(), Media::Ready(shot.preview.clone()));
+        if let Some(preview) = &shot.preview {
+            self.media
+                .borrow_mut()
+                .insert(key.clone(), Media::Ready(preview.clone()));
+        }
         self.files
             .insert(format!("{key}#original"), shot.bytes.clone());
         let body = match caption.is_empty() {
@@ -1479,8 +1573,13 @@ impl MatrixClient {
                 true => rich::Rich::new(),
                 false => rich::markdown(&caption),
             },
-            kind: MessageKind::Image,
+            kind: if shot.preview.is_some() {
+                MessageKind::Image
+            } else {
+                MessageKind::Attachment
+            },
             picture: Some(Picture {
+                mime: shot.preview.is_none().then(|| shot.mime.clone()),
                 key,
                 source: MediaSource::Plain(
                     <&matrix_sdk::ruma::MxcUri>::from("mxc://huddle/local").to_owned(),
@@ -1535,6 +1634,7 @@ impl MatrixClient {
             width: shot.width,
             height: shot.height,
             caption,
+            duration: shot.duration,
             local,
             reply: reply.map(|target| (target.id, target.sender)),
             thread,
@@ -1547,7 +1647,7 @@ impl MatrixClient {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some("Choose an image".into()),
+            prompt: Some("Choose an image, video or audio file".into()),
         });
         cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(paths))) = receiver.await else {
@@ -1604,11 +1704,60 @@ impl MatrixClient {
             return;
         };
         if bytes.len() > UPLOAD_LIMIT {
-            self.notify("That image is too large. Choose one under 20 MB.", true, cx);
+            self.notify("That file is too large. Choose one under 20 MB.", true, cx);
             return;
         }
+        self.cancel_compress();
         if sniff(&bytes).is_none() {
-            self.notify("Choose a PNG, JPEG, GIF or WebP image.", true, cx);
+            if let Some(mime) = playback::mime(&name) {
+                self.cancel_compress();
+                self.attachment = None;
+                self.compressing = Some(spot);
+                let ticket = self.attach_ticket;
+                cx.spawn(async move |this, cx| {
+                    let (bytes, result) = cx
+                        .background_spawn(async move {
+                            let result = playback::inspect(&bytes, mime);
+                            (bytes, result)
+                        })
+                        .await;
+                    this.update(cx, |this, cx| {
+                        if ticket != this.attach_ticket {
+                            return;
+                        }
+                        this.compressing = None;
+                        match result {
+                            Ok(info) => {
+                                this.attachment = Some((
+                                    spot,
+                                    Upload {
+                                        name,
+                                        bytes,
+                                        mime: mime.into(),
+                                        width: info.width,
+                                        height: info.height,
+                                        duration: info.duration,
+                                        preview: None,
+                                    },
+                                ));
+                                cx.notify();
+                            }
+                            Err(error) => {
+                                log::warn!("Media validation failed: {error:#}");
+                                this.notify(
+                                    "This file is damaged or uses an unsupported codec.",
+                                    true,
+                                    cx,
+                                );
+                            }
+                        }
+                    })
+                    .ok();
+                })
+                .detach();
+            } else {
+                self.notify("Choose a supported image, video or audio file.", true, cx);
+            }
             return;
         }
         if !self.photo_compress || !photo::can_compress(&bytes) {
@@ -1662,7 +1811,7 @@ impl MatrixClient {
             return None;
         };
         if bytes.len() > UPLOAD_LIMIT {
-            self.notify("That image is too large. Choose one under 20 MB.", true, cx);
+            self.notify("That file is too large. Choose one under 20 MB.", true, cx);
             return None;
         }
         let Some(format) = sniff(&bytes) else {
@@ -1673,7 +1822,8 @@ impl MatrixClient {
         Some(Upload {
             name: name.to_owned(),
             mime: mime_of(format).to_owned(),
-            preview: Arc::new(Image::from_bytes(format, bytes.clone())),
+            preview: Some(Arc::new(Image::from_bytes(format, bytes.clone()))),
+            duration: None,
             bytes,
             width,
             height,
@@ -3466,6 +3616,48 @@ impl MatrixClient {
             )
     }
 
+    fn measure_main_item(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Pixels {
+        let theme = *cx.theme();
+        let width = self.list.viewport_bounds().size.width;
+        div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .text_size(theme.text(Text::Body))
+            .text_color(theme.foreground)
+            .child(self.render_main_item(index, cx))
+            .into_any_element()
+            .layout_as_root(
+                gpui::size(
+                    gpui::AvailableSpace::Definite(width),
+                    gpui::AvailableSpace::MinContent,
+                ),
+                window,
+                cx,
+            )
+            .height
+    }
+
+    fn restore_history_anchor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((room, anchor, old_height)) = self.history_anchor.take() else {
+            return;
+        };
+        if self.room.as_ref() != Some(&room) || anchor.item_ix >= self.list.item_count() {
+            return;
+        }
+        // The old first row loses its history header and can change date/sender grouping.
+        // Anchor its unchanged message content, rather than the top of that mutable row.
+        let anchor = rebase_history_anchor(anchor, old_height, |index| {
+            self.measure_main_item(index, window, cx)
+        });
+        self.list.scroll_to(anchor);
+    }
+
     fn render_main_item(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
         let Some(timeline) = self.timeline() else {
             return div().into_any_element();
@@ -3495,17 +3687,7 @@ impl MatrixClient {
         let room = self.room.as_ref().and_then(|room| self.summary(room));
         let direct = room.is_some_and(|room| room.kind == RoomKind::Direct);
         let name = room.map_or_else(String::new, |room| room.name.clone());
-        if timeline.loading {
-            return div()
-                .flex()
-                .justify_center()
-                .py_4()
-                .text_size(theme.text(Text::Small))
-                .text_color(theme.muted_foreground)
-                .child("Loading older messages…")
-                .into_any_element();
-        }
-        if timeline.token.is_some() {
+        if timeline.loading || timeline.token.is_some() {
             return div()
                 .flex()
                 .justify_center()
@@ -3514,7 +3696,12 @@ impl MatrixClient {
                     Button::new("load-older")
                         .ghost()
                         .small()
-                        .label("Load older messages")
+                        .label(if timeline.loading {
+                            "Loading older messages…"
+                        } else {
+                            "Load older messages"
+                        })
+                        .disabled(timeline.loading)
                         .on_click(cx.listener(|this, _, _, cx| this.older(cx))),
                 )
                 .into_any_element();
@@ -3688,6 +3875,17 @@ impl MatrixClient {
                 .text_color(theme.muted_foreground)
                 .child(icon("icons/link.svg", px(14.), theme.muted_foreground))
                 .child(message.body.clone())
+                .when_some(message.picture.as_ref(), |row, media| {
+                    let media = media.clone();
+                    row.child(
+                        Button::new(SharedString::from(format!("{key}-play")))
+                            .secondary()
+                            .label("Play")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.open_media(media.clone(), cx)
+                            })),
+                    )
+                })
                 .into_any_element(),
             MessageKind::Encrypted => {
                 let verified = self.security.is_none_or(|(verified, _)| verified);
@@ -4011,6 +4209,150 @@ impl MatrixClient {
                 this.list.scroll_to_reveal_item(index);
             }
         }))
+        .into_any_element()
+    }
+
+    fn open_media(&mut self, media: Picture, cx: &mut Context<Self>) {
+        self.player = None;
+        self.player_image = None;
+        self.pending_play = None;
+        if let Some(bytes) = self.files.get(&format!("{}#original", media.key)).cloned() {
+            self.start_media(media, bytes, cx);
+        } else {
+            self.pending_play = Some(media.clone());
+            self.command(Command::Fetch {
+                key: media.key,
+                source: media.source,
+                size: None,
+            });
+            self.notify("Loading media…", false, cx);
+        }
+    }
+
+    fn start_media(&mut self, media: Picture, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        self.player_image = None;
+        self.player = Some(playback::Player::new(
+            media.name,
+            bytes,
+            media.mime.unwrap_or_default(),
+        ));
+        let state = self.player.as_ref().unwrap().state.clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(33))
+                    .await;
+                let active = this
+                    .update(cx, |this, cx| {
+                        if !this
+                            .player
+                            .as_ref()
+                            .is_some_and(|player| Arc::ptr_eq(&player.state, &state))
+                        {
+                            return false;
+                        }
+                        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(bytes) = state.frame.take() {
+                            this.player_image =
+                                Some(Arc::new(Image::from_bytes(ImageFormat::Jpeg, bytes)));
+                        }
+                        cx.notify();
+                        !state.finished
+                    })
+                    .unwrap_or(false);
+                if !active {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn render_player(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(player) = &self.player else {
+            return div().into_any_element();
+        };
+        let theme = *cx.theme();
+        let state = player.state.lock().unwrap_or_else(|e| e.into_inner());
+        let status = state.error.clone().unwrap_or_else(|| {
+            if state.finished {
+                "Playback finished.".into()
+            } else if player.is_paused() {
+                "Paused".into()
+            } else {
+                "Playing".into()
+            }
+        });
+        let finished = state.finished;
+        let viewport = window.viewport_size();
+        deferred(
+            anchored().position(point(px(0.), px(0.))).child(
+                div()
+                    .w(viewport.width)
+                    .h(viewport.height)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(theme.background.opacity(0.94))
+                    .on_action(cx.listener(|this, _: &Dismiss, _, cx| {
+                        this.player = None;
+                        this.player_image = None;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .p_4()
+                            .max_w(viewport.width - px(64.))
+                            .text_color(theme.foreground)
+                            .child(player.name.clone())
+                            .when_some(self.player_image.clone(), |body, image| {
+                                body.child(
+                                    img(image)
+                                        .w((viewport.width - px(96.)).min(px(960.)))
+                                        .h((viewport.height - px(220.)).max(px(100.)))
+                                        .object_fit(ObjectFit::Contain),
+                                )
+                            })
+                            .child(status)
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .when(!finished, |row| {
+                                        row.child(
+                                            Button::new("media-pause")
+                                                .secondary()
+                                                .label(if player.is_paused() {
+                                                    "Resume"
+                                                } else {
+                                                    "Pause"
+                                                })
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    if let Some(player) = &this.player {
+                                                        player.toggle();
+                                                    }
+                                                    cx.notify();
+                                                })),
+                                        )
+                                    })
+                                    .child(
+                                        Button::new("media-close")
+                                            .secondary()
+                                            .label("Close")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.player = None;
+                                                this.player_image = None;
+                                                cx.notify();
+                                            })),
+                                    ),
+                            ),
+                    ),
+            ),
+        )
         .into_any_element()
     }
 
@@ -4639,14 +4981,16 @@ impl MatrixClient {
                     .gap_2()
                     .px_3()
                     .pt_2()
-                    .child(
-                        img(shot.preview.clone())
-                            .w(px(72.))
-                            .h(px(72.))
-                            .flex_none()
-                            .rounded(theme.radius)
-                            .object_fit(ObjectFit::Cover),
-                    )
+                    .when_some(shot.preview.clone(), |row, preview| {
+                        row.child(
+                            img(preview)
+                                .w(px(72.))
+                                .h(px(72.))
+                                .flex_none()
+                                .rounded(theme.radius)
+                                .object_fit(ObjectFit::Cover),
+                        )
+                    })
                     .child(
                         div()
                             .flex_1()
@@ -4685,7 +5029,7 @@ impl MatrixClient {
                         .flex_1()
                         .text_size(theme.text(Text::Small))
                         .text_color(theme.muted_foreground)
-                        .child("Compressing photo…"),
+                        .child("Preparing media…"),
                 )
                 .child(
                     Button::new(cancel)
@@ -4856,6 +5200,50 @@ impl MatrixClient {
                     )
             })
             .child(div().flex_1())
+            .child({
+                let id = room.id.clone();
+                let name = room.name.clone();
+                let direct = room.kind == RoomKind::Direct;
+                Button::new("call-voice")
+                    .ghost()
+                    .small()
+                    .icon("icons/phone.svg")
+                    .tooltip("huddle-call")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.line = Some(Line::Live {
+                            room: id.clone(),
+                            name: name.clone(),
+                        });
+                        this.command(Command::Call {
+                            room: id.clone(),
+                            direct,
+                            voice: true,
+                        });
+                        cx.notify();
+                    }))
+            })
+            .child({
+                let id = room.id.clone();
+                let name = room.name.clone();
+                let direct = room.kind == RoomKind::Direct;
+                Button::new("call-video")
+                    .ghost()
+                    .small()
+                    .icon("icons/video.svg")
+                    .tooltip("huddle-video")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.line = Some(Line::Live {
+                            room: id.clone(),
+                            name: name.clone(),
+                        });
+                        this.command(Command::Call {
+                            room: id.clone(),
+                            direct,
+                            voice: false,
+                        });
+                        cx.notify();
+                    }))
+            })
             .child(
                 Button::new("toggle-members")
                     .ghost()
@@ -5451,7 +5839,7 @@ impl MatrixClient {
         let face = if self.profile_remove {
             avatar(&id, &name, px(72.)).into_any_element()
         } else if let Some(photo) = &self.profile_photo {
-            img(photo.preview.clone())
+            img(photo.preview.clone().expect("profile image preview"))
                 .size(px(72.))
                 .flex_none()
                 .rounded_full()
@@ -5633,10 +6021,105 @@ impl MatrixClient {
             }
         }
     }
+
+    fn render_line(&self, line: &Line, cx: &mut Context<Self>) -> AnyElement {
+        let theme = *cx.theme();
+        let ringing = matches!(line, Line::Ringing { .. });
+        let (title, name) = match line {
+            Line::Ringing { name, .. } => ("Incoming call", name.clone()),
+            Line::Live { name, .. } => ("On a call", name.clone()),
+        };
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_3()
+            .px_4()
+            .py_2()
+            .bg(theme.secondary)
+            .border_b_1()
+            .border_color(theme.border)
+            .child(icon(
+                if ringing {
+                    "icons/phone.svg"
+                } else {
+                    "icons/video.svg"
+                },
+                px(16.),
+                theme.foreground,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .min_w_0()
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(theme.text(Text::Small))
+                            .text_color(theme.muted_foreground)
+                            .child(name),
+                    ),
+            )
+            .child(div().flex_1())
+            .when(ringing, |row| {
+                row.child(
+                    Button::new("call-decline")
+                        .ghost()
+                        .small()
+                        .label("Decline")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(Line::Ringing { room, event, .. }) = this.line.take() {
+                                this.command(Command::DeclineCall { room, event });
+                            }
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("call-answer")
+                        .primary()
+                        .small()
+                        .label("Answer")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            let Some(Line::Ringing { room, name, .. }) = this.line.clone() else {
+                                return;
+                            };
+                            let direct = this
+                                .summary(&room)
+                                .is_some_and(|room| room.kind == RoomKind::Direct);
+                            this.line = Some(Line::Live {
+                                room: room.clone(),
+                                name,
+                            });
+                            this.command(Command::AnswerCall {
+                                room: room.clone(),
+                                direct,
+                            });
+                            this.open(room, window, cx);
+                        })),
+                )
+            })
+            .when(!ringing, |row| {
+                row.child(
+                    Button::new("call-hangup")
+                        .destructive()
+                        .small()
+                        .label("Hang up")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.line = None;
+                            this.command(Command::HangUp);
+                            cx.notify();
+                        })),
+                )
+            })
+            .into_any_element()
+    }
 }
 
 impl Render for MatrixClient {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.restore_history_anchor(window, cx);
         self.wire_composer(cx);
         if let Some(target) = self.pending_focus.take() {
             let input = match target {
@@ -5660,27 +6143,38 @@ impl Render for MatrixClient {
                 let sidebar = self.on_home() || self.space.is_some();
                 div()
                     .flex()
+                    .flex_col()
                     .flex_1()
                     .min_w_0()
                     .min_h_0()
-                    .child(self.render_rail(cx))
-                    .child(slide(
-                        self.render_channels(cx).into_any_element(),
-                        "channels",
-                        sidebar,
-                        CHANNELS,
-                        false,
-                    ))
-                    .child(match room {
-                        Some(room) => self.render_chat(&room, cx),
-                        None => self.render_welcome(cx),
+                    .when_some(self.line.clone(), |column, line| {
+                        column.child(self.render_line(&line, cx))
                     })
-                    .when_some(self.dialog, |layout, dialog| {
-                        layout.child(self.render_dialog(dialog, cx))
-                    })
-                    .when_some(self.person.clone(), |layout, person| {
-                        layout.child(self.render_person(&person, cx))
-                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
+                            .child(self.render_rail(cx))
+                            .child(slide(
+                                self.render_channels(cx).into_any_element(),
+                                "channels",
+                                sidebar,
+                                CHANNELS,
+                                false,
+                            ))
+                            .child(match room {
+                                Some(room) => self.render_chat(&room, cx),
+                                None => self.render_welcome(cx),
+                            })
+                            .when_some(self.dialog, |layout, dialog| {
+                                layout.child(self.render_dialog(dialog, cx))
+                            })
+                            .when_some(self.person.clone(), |layout, person| {
+                                layout.child(self.render_person(&person, cx))
+                            }),
+                    )
                     .into_any_element()
             }
         };
@@ -5706,6 +6200,9 @@ impl Render for MatrixClient {
             .when_some(viewing, |root, view| {
                 root.child(self.render_viewer(&view, window, cx))
             })
+            .when(self.player.is_some(), |root| {
+                root.child(self.render_player(window, cx))
+            })
             .when_some(self.notice.clone(), |root, (text, failed)| {
                 let toast =
                     Toast::new("huddle-notice", text).on_dismiss(cx.listener(|this, _, _, cx| {
@@ -5721,10 +6218,53 @@ impl Render for MatrixClient {
     }
 }
 
+/// Preserve a message's position when content above it within its row changes height.
+fn rebase_history_anchor(
+    mut anchor: gpui::ListOffset,
+    old_height: Pixels,
+    mut measure: impl FnMut(usize) -> Pixels,
+) -> gpui::ListOffset {
+    anchor.offset_in_item += measure(anchor.item_ix) - old_height;
+    // The viewport may have started inside a header that has now moved to an older row.
+    while anchor.offset_in_item < px(0.) && anchor.item_ix > 0 {
+        anchor.item_ix -= 1;
+        anchor.offset_in_item += measure(anchor.item_ix);
+    }
+    anchor
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use matrix_sdk::ruma::{owned_event_id, owned_user_id};
+
+    #[test]
+    fn history_keeps_message_pixels_stationary_when_row_headers_change() {
+        // The old first message ends at y=old_height-offset. Prepending rows and
+        // removing its history/date/sender headers must leave that y unchanged.
+        for (old_height, offset, heights) in [
+            (180., 140., vec![80., 60., 100.]),
+            (180., 10., vec![80., 60., 100.]),
+            (240., 0., vec![50., 60., 80., 100.]),
+            (100., 35., vec![80., 60., 160.]),
+            (100., 35., vec![100.]),
+        ] {
+            let message_index = heights.len() - 1;
+            let anchor = rebase_history_anchor(
+                gpui::ListOffset {
+                    item_ix: message_index,
+                    offset_in_item: px(offset),
+                },
+                px(old_height),
+                |index| px(heights[index]),
+            );
+            let scroll_top =
+                heights[..anchor.item_ix].iter().sum::<f32>() + f32::from(anchor.offset_in_item);
+            let message_bottom = heights.iter().sum::<f32>() - scroll_top;
+            assert_eq!(message_bottom, old_height - offset);
+            assert!(anchor.offset_in_item >= px(0.));
+        }
+    }
 
     fn message(id: &str, body: &str) -> Message {
         Message {

@@ -255,7 +255,7 @@ impl Scrollbar {
     /// to know to stop.
     pub fn stirred(&mut self) {
         if let Some(list) = &self.list {
-            self.glide.jump(list, list.scroll_px_offset_for_scrollbar());
+            self.glide.rebase(list);
             self.following = false;
         } else if self.glide.stop_spring(&self.scroll) {
             self.following = false;
@@ -267,7 +267,10 @@ impl Scrollbar {
         self.following = false;
         self.nudges = self.nudges.wrapping_add(1);
         match &self.list {
-            Some(list) => self.glide.nudge(list, window),
+            // GPUI already applied this wheel delta to its item anchor. Replaying
+            // it through absolute scrollbar coordinates can jump across unmeasured
+            // rows, so leave virtual-list wheel scrolling to GPUI.
+            Some(list) => self.glide.rebase(list),
             None => self.glide.nudge(&self.scroll, window),
         }
     }
@@ -313,6 +316,16 @@ impl Scrollbar {
             Some(list) => self.glide.sync(list),
             None => self.glide.sync(&self.scroll),
         }
+    }
+
+    /// Forget animation targets in the old content coordinates without moving the view.
+    pub fn rebase(&mut self) {
+        match &self.list {
+            Some(list) => self.glide.rebase(list),
+            None => self.glide.rebase(&self.scroll),
+        }
+        self.following = false;
+        self.seen = self.target().offset();
     }
 
     /// How far down the region is scrolled, whichever kind of scrolling it does.
@@ -483,7 +496,7 @@ impl Scrollbar {
 
     fn moved(&mut self, offset: Pixels, cx: &mut Context<Self>) {
         if let Some(list) = &self.list {
-            self.glide.jump(list, list.scroll_px_offset_for_scrollbar());
+            self.glide.rebase(list);
             self.following = false;
         } else if self.glide.stop_spring(&self.scroll) {
             self.following = false;
@@ -694,5 +707,109 @@ impl Render for Scrollbar {
                 ))
             })
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{ListAlignment, ListOffset, ScrollDelta, ScrollWheelEvent, TestAppContext};
+
+    struct WheelTest {
+        list: ListState,
+        bar: Rc<std::cell::RefCell<Scrollbar>>,
+    }
+
+    impl Render for WheelTest {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            // Match Scroller: synchronization runs before the list's layout.
+            self.bar.borrow().sync();
+            let bar = self.bar.clone();
+            div()
+                .size_full()
+                .on_scroll_wheel(move |event: &ScrollWheelEvent, window, _| {
+                    if event.delta.precise() {
+                        bar.borrow_mut().stirred();
+                    } else {
+                        bar.borrow_mut().nudge(window);
+                    }
+                })
+                .child(
+                    gpui::list(self.list.clone(), |index, _, _| {
+                        div()
+                            .h(px(30. + (index % 3) as f32 * 10.))
+                            .w_full()
+                            .into_any_element()
+                    })
+                    .size_full(),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn tiny_wheel_scroll_after_prepend_preserves_the_visible_message(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let list = ListState::new(30, ListAlignment::Bottom, px(50.)).measure_all();
+        let bar = Rc::new(std::cell::RefCell::new(Scrollbar::list(list.clone())));
+        list.scroll_to(ListOffset {
+            item_ix: 0,
+            offset_in_item: px(12.5),
+        });
+
+        let view = cx.update(|_, cx| {
+            cx.new(|_| WheelTest {
+                list: list.clone(),
+                bar: bar.clone(),
+            })
+        });
+        let draw = |cx: &mut gpui::VisualTestContext| {
+            cx.draw(
+                point(px(0.), px(0.)),
+                gpui::size(px(300.), px(200.)),
+                |_, cx| {
+                    cx.notify(view.entity_id());
+                    view.clone().into_any_element()
+                },
+            );
+        };
+        draw(cx);
+
+        for _ in 0..3 {
+            let mut anchor = list.logical_scroll_top();
+            list.splice(0..0, 90);
+            // History invalidates the old first row; this also schedules measurement
+            // of off-screen prepended rows before the next input event.
+            list.remeasure_items(90..91);
+            anchor.item_ix += 90;
+            list.scroll_to(anchor);
+            bar.borrow_mut().rebase();
+            draw(cx);
+
+            for precise in [false, true] {
+                for direction in [1., -1.] {
+                    let before = list.scroll_px_offset_for_scrollbar().y;
+                    cx.simulate_event(ScrollWheelEvent {
+                        position: point(px(100.), px(100.)),
+                        delta: if precise {
+                            ScrollDelta::Pixels(point(px(0.), px(direction * 0.25)))
+                        } else {
+                            ScrollDelta::Lines(point(0., direction * 0.01))
+                        },
+                        ..Default::default()
+                    });
+                    let movement = list.scroll_px_offset_for_scrollbar().y - before;
+                    assert!(movement * direction > px(0.), "wheel direction was lost");
+                    assert!(
+                        movement.abs() < px(2.),
+                        "tiny wheel event jumped {movement}"
+                    );
+                    if precise {
+                        assert_eq!(movement, px(direction * 0.25));
+                    }
+                    draw(cx);
+                    assert_eq!(list.scroll_px_offset_for_scrollbar().y, before + movement);
+                }
+            }
+        }
     }
 }

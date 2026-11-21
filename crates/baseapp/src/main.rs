@@ -984,7 +984,11 @@ impl Render for BaseApp {
                     .child("Huddle")
                     .window_control_area(gpui::WindowControlArea::Drag),
             )
-            .child(WindowControls::new(false));
+            .child(WindowControls::new(false).on_close(|window, cx| {
+                if presence::allow_close(window, cx) {
+                    window.remove_window();
+                }
+            }));
 
         let ambient_animates = self.ambient && self.ambient_motion && ui::motion::animates(cx);
         let now = Instant::now();
@@ -1214,7 +1218,6 @@ fn main() {
             bind_input_keys(cx);
             cx.set_app_identity("app.huddle.desktop", "Huddle");
             let bounds = WindowBounds::Windowed(Bounds::centered(None, FIRST_SIZE, cx));
-            let parked = Rc::new(Cell::new(false));
             let window = cx
                 .open_window(
                     WindowOptions {
@@ -1231,15 +1234,8 @@ fn main() {
                         ..Default::default()
                     },
                     {
-                        let parked = parked.clone();
                         move |window, cx| {
-                            window.on_window_should_close(cx, move |window, _| {
-                                if parked.get() {
-                                    presence::allow_close(window)
-                                } else {
-                                    true
-                                }
-                            });
+                            window.on_window_should_close(cx, presence::allow_close);
                             window.set_rem_size(cx.theme().font_size);
                             let view = cx.new(|cx| BaseApp::new(prefs, cx));
                             view.update(cx, |this, cx| {
@@ -1285,7 +1281,7 @@ fn main() {
                     },
                 )
                 .expect("failed to open window");
-            parked.set(presence::install(window, cx));
+            presence::install(window, cx);
             cx.activate(true);
         });
 }

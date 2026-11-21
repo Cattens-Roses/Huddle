@@ -127,6 +127,7 @@ impl RenderOnce for WindowFrame {
 pub struct WindowControls {
     base: Div,
     leading: bool,
+    on_close: Option<std::rc::Rc<dyn Fn(&mut Window, &mut App)>>,
 }
 
 impl WindowControls {
@@ -134,7 +135,14 @@ impl WindowControls {
         Self {
             base: div(),
             leading,
+            on_close: None,
         }
+    }
+
+    /// Override the close button for applications that keep running in the tray.
+    pub fn on_close(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        self.on_close = Some(std::rc::Rc::new(handler));
+        self
     }
 }
 
@@ -183,6 +191,7 @@ impl RenderOnce for WindowControls {
             })
             .children(wanted.into_iter().map(move |control| {
                 let danger = control == Control::Close;
+                let on_close = self.on_close.clone();
 
                 div()
                     .id(control.id())
@@ -233,7 +242,10 @@ impl RenderOnce for WindowControls {
                                 match control {
                                     Control::Minimize => window.minimize_window(),
                                     Control::Maximize | Control::Restore => window.zoom_window(),
-                                    Control::Close => window.remove_window(),
+                                    Control::Close => match &on_close {
+                                        Some(handler) => handler(window, cx),
+                                        None => window.remove_window(),
+                                    },
                                 }
                             })
                     })

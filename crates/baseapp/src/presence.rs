@@ -89,11 +89,16 @@ pub fn announce(cx: &mut App, title: &str, body: &str, room: &str) {
 }
 
 /// Closing the window hides it while the tray icon can bring it back. Quit still closes it.
-pub fn allow_close(window: &mut Window) -> bool {
+pub fn allow_close(window: &mut Window, cx: &mut App) -> bool {
     if QUITTING.load(Ordering::Relaxed) {
         return true;
     }
-    conceal(window);
+    if cx.try_global::<Seat>().is_some() {
+        conceal(window);
+    } else {
+        // Keep the window accessible from the taskbar if tray installation failed.
+        window.minimize_window();
+    }
     false
 }
 

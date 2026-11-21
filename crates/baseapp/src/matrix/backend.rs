@@ -5,7 +5,9 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, anyhow};
 use futures::StreamExt as _;
 use futures::channel::mpsc as ui;
-use matrix_sdk::attachment::{AttachmentConfig, AttachmentInfo, BaseImageInfo};
+use matrix_sdk::attachment::{
+    AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseImageInfo, BaseVideoInfo,
+};
 use matrix_sdk::authentication::matrix::MatrixSession;
 use matrix_sdk::config::SyncSettings;
 use matrix_sdk::deserialized_responses::RawSyncOrStrippedState;
@@ -52,6 +54,9 @@ use tokio::task::JoinHandle;
 
 use super::rich::{self, Rich};
 
+#[path = "call.rs"]
+mod call;
+
 const DEVICE_NAME: &str = "Huddle";
 const HISTORY: u32 = 60;
 const PAGE: usize = 20;
@@ -96,6 +101,7 @@ pub enum MessageKind {
 
 #[derive(Clone)]
 pub struct Picture {
+    pub mime: Option<String>,
     pub key: String,
     pub source: MediaSource,
     pub width: u32,
@@ -228,6 +234,7 @@ pub enum Command {
         width: u32,
         height: u32,
         caption: String,
+        duration: Option<Duration>,
         local: u64,
         reply: Option<(OwnedEventId, OwnedUserId)>,
         thread: Option<(OwnedEventId, OwnedEventId)>,
@@ -272,6 +279,20 @@ pub enum Command {
     CancelVerify,
     Recover(String),
     SetUpRecovery,
+    Call {
+        room: OwnedRoomId,
+        direct: bool,
+        voice: bool,
+    },
+    AnswerCall {
+        room: OwnedRoomId,
+        direct: bool,
+    },
+    DeclineCall {
+        room: OwnedRoomId,
+        event: OwnedEventId,
+    },
+    HangUp,
 }
 
 pub enum Update {
@@ -327,6 +348,14 @@ pub enum Update {
     RecoveryKey(String),
     Recovered,
     Failed(String),
+    Ring {
+        room: OwnedRoomId,
+        event: OwnedEventId,
+    },
+    Calling {
+        room: OwnedRoomId,
+    },
+    CallEnded,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -425,6 +454,7 @@ fn persist(client: &Client, store: &str) -> Result<()> {
 struct Shared {
     request: Mutex<Option<VerificationRequest>>,
     sas: Mutex<Option<SasVerification>>,
+    calls: Arc<call::Calls>,
 }
 
 impl Shared {
@@ -738,6 +768,7 @@ impl Worker {
         for task in self.tasks.drain(..) {
             task.abort();
         }
+        self.shared.calls.end();
         self.shared.set_request(None);
         self.shared.set_sas(None);
         if let Some(client) = self.client.take()
@@ -764,9 +795,28 @@ impl Worker {
         post(&self.outbox, Update::SignedIn { user, name, avatar });
 
         let outbox = self.outbox.clone();
+        let shared = self.shared.clone();
         client.add_event_handler(move |raw: Raw<AnySyncTimelineEvent>, room: Room| {
             let outbox = outbox.clone();
+            let shared = shared.clone();
             async move {
+                if let Some(event) = call::incoming(&raw)
+                    && raw
+                        .get_field::<OwnedUserId>("sender")
+                        .ok()
+                        .flatten()
+                        .as_deref()
+                        != Some(room.own_user_id())
+                    && !shared.calls.busy()
+                {
+                    post(
+                        &outbox,
+                        Update::Ring {
+                            room: room.room_id().to_owned(),
+                            event,
+                        },
+                    );
+                }
                 if let Some(event) = parse(&room, &raw).await {
                     let room = room.room_id().to_owned();
                     post(&outbox, Update::Live { room, event });
@@ -1060,18 +1110,35 @@ async fn handle(
             width,
             height,
             caption,
+            duration,
             local,
             reply,
             thread,
         } => {
             let room = joined(client, &id)?;
-            let mime = mime.parse().unwrap_or(mime::IMAGE_PNG);
-            let mut config = AttachmentConfig::new().info(AttachmentInfo::Image(BaseImageInfo {
-                width: (width > 0).then_some(UInt::from(width)),
-                height: (height > 0).then_some(UInt::from(height)),
-                size: UInt::try_from(bytes.len() as u64).ok(),
-                ..BaseImageInfo::default()
-            }));
+            let mime: mime::Mime = mime.parse().context("Invalid attachment type")?;
+            let size = UInt::try_from(bytes.len() as u64).ok();
+            let info = match mime.type_() {
+                mime::VIDEO => AttachmentInfo::Video(BaseVideoInfo {
+                    width: (width > 0).then_some(UInt::from(width)),
+                    height: (height > 0).then_some(UInt::from(height)),
+                    duration,
+                    size,
+                    ..BaseVideoInfo::default()
+                }),
+                mime::AUDIO => AttachmentInfo::Audio(BaseAudioInfo {
+                    duration,
+                    size,
+                    ..BaseAudioInfo::default()
+                }),
+                _ => AttachmentInfo::Image(BaseImageInfo {
+                    width: (width > 0).then_some(UInt::from(width)),
+                    height: (height > 0).then_some(UInt::from(height)),
+                    size,
+                    ..BaseImageInfo::default()
+                }),
+            };
+            let mut config = AttachmentConfig::new().info(info);
             if !caption.is_empty() {
                 config = config.caption(Some(TextMessageEventContent::markdown(caption)));
             }
@@ -1303,6 +1370,55 @@ async fn handle(
             })?;
             post(outbox, Update::RecoveryKey(key));
             security(client, outbox);
+        }
+        Command::Call {
+            room,
+            direct,
+            voice,
+        } => {
+            call::place(
+                client,
+                outbox,
+                &shared.calls,
+                call::Request {
+                    room,
+                    direct,
+                    voice,
+                    join: false,
+                },
+            )
+            .await?;
+        }
+        Command::AnswerCall { room, direct } => {
+            call::place(
+                client,
+                outbox,
+                &shared.calls,
+                call::Request {
+                    room,
+                    direct,
+                    voice: false,
+                    join: true,
+                },
+            )
+            .await?;
+        }
+        Command::DeclineCall { room, event } => {
+            let room = joined(client, &room)?;
+            room.send_raw(
+                "m.rtc.decline",
+                serde_json::json!({
+                    "m.relates_to": {
+                        "rel_type": "m.reference",
+                        "event_id": event,
+                    }
+                }),
+            )
+            .await?;
+        }
+        Command::HangUp => {
+            shared.calls.end();
+            post(outbox, Update::CallEnded);
         }
         Command::SignIn { .. }
         | Command::SignUp { .. }
@@ -1721,6 +1837,7 @@ fn describe(msgtype: &MessageType) -> (String, Rich, MessageKind, Option<Picture
                 .filter(|name| !name.trim().is_empty())
                 .unwrap_or_else(|| body.clone());
             let picture = Picture {
+                mime: None,
                 key: format!("{}#image", media_url(&image.source)),
                 source: image.source.clone(),
                 width: size(info.and_then(|info| info.width)),
@@ -1733,9 +1850,34 @@ fn describe(msgtype: &MessageType) -> (String, Rich, MessageKind, Option<Picture
             };
             (body, caption, MessageKind::Image, Some(picture))
         }
-        MessageType::Video(video) => attachment(format!("Shared a video: {}", video.body)),
-        MessageType::Audio(audio) => attachment(format!("Shared audio: {}", audio.body)),
-        MessageType::File(file) => attachment(format!("Shared a file: {}", file.body)),
+        MessageType::Video(video) => playable(
+            &video.body,
+            video.filename.as_deref(),
+            &video.source,
+            video
+                .info
+                .as_ref()
+                .and_then(|info| info.mimetype.as_deref()),
+        ),
+        MessageType::Audio(audio) => playable(
+            &audio.body,
+            audio.filename.as_deref(),
+            &audio.source,
+            audio
+                .info
+                .as_ref()
+                .and_then(|info| info.mimetype.as_deref()),
+        ),
+        MessageType::File(file) => {
+            let mime = file.info.as_ref().and_then(|info| info.mimetype.as_deref());
+            if mime.is_some_and(|mime| mime.starts_with("audio/") || mime.starts_with("video/"))
+                || super::playback::mime(file.filename.as_deref().unwrap_or(&file.body)).is_some()
+            {
+                playable(&file.body, file.filename.as_deref(), &file.source, mime)
+            } else {
+                attachment(format!("Shared a file: {}", file.body))
+            }
+        }
         other => (
             other.body().to_owned(),
             rich::plain(other.body()),
@@ -1743,6 +1885,33 @@ fn describe(msgtype: &MessageType) -> (String, Rich, MessageKind, Option<Picture
             None,
         ),
     }
+}
+
+fn playable(
+    body: &str,
+    filename: Option<&str>,
+    source: &MediaSource,
+    mime: Option<&str>,
+) -> (String, Rich, MessageKind, Option<Picture>) {
+    let name = filename.unwrap_or(body).to_owned();
+    let mime = mime
+        .filter(|m| m.starts_with("audio/") || m.starts_with("video/"))
+        .or_else(|| super::playback::mime(&name))
+        .unwrap_or("application/octet-stream")
+        .to_owned();
+    (
+        body.to_owned(),
+        Rich::new(),
+        MessageKind::Attachment,
+        Some(Picture {
+            key: format!("{}#playback", media_url(source)),
+            source: source.clone(),
+            width: 0,
+            height: 0,
+            name,
+            mime: Some(mime),
+        }),
+    )
 }
 
 fn attachment(label: String) -> (String, Rich, MessageKind, Option<Picture>) {
@@ -1828,6 +1997,7 @@ fn problem(error: &anyhow::Error) -> String {
         "Your account",
         "The request has",
         "The comparison has",
+        "The call",
     ];
     if let Some(message) = error.chain().find_map(|cause| {
         let text = cause.to_string();
@@ -1851,6 +2021,28 @@ fn problem(error: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preserves_playable_media_sources_and_names() {
+        for (kind, mime, name) in [
+            ("m.video", "video/mp4", "clip.mp4"),
+            ("m.audio", "audio/mpeg", "song.mp3"),
+            ("m.file", "audio/flac", "song.flac"),
+        ] {
+            let msgtype: MessageType = serde_json::from_value(serde_json::json!({
+                "msgtype": kind, "body": "A caption", "filename": name,
+                "url": "mxc://example.org/media", "info": {"mimetype": mime}
+            }))
+            .unwrap();
+            let (body, _, kind, media) = describe(&msgtype);
+            assert_eq!(body, "A caption");
+            assert!(kind == MessageKind::Attachment);
+            let media = media.unwrap();
+            assert_eq!(media.name, name);
+            assert_eq!(media.mime.as_deref(), Some(mime));
+            assert_eq!(media_url(&media.source), "mxc://example.org/media");
+        }
+    }
 
     #[test]
     fn strips_reply_fallbacks() {

@@ -476,6 +476,7 @@ Used by 684 crate(s):
 - [reqwest_cookie_store 0.9.0](https://github.com/pfernie/reqwest_cookie_store) — Copyright (c) 2017
 - [resvg 0.46.0](https://github.com/linebender/resvg) — Copyright 2017 the Resvg Authors
 - [rgb 0.8.53](https://github.com/kornelski/rust-rgb) — Copyright (c) 2019 Kornel
+- [rodio 0.19.0](https://github.com/RustAudio/rodio)
 - [rodio 0.21.1](https://github.com/RustAudio/rodio)
 - [rodio 0.22.2](https://github.com/RustAudio/rodio) — Copyright (c) The Rodio Project Contributors
 - [roxmltree 0.20.0](https://github.com/RazrFalcon/roxmltree) — Copyright (c) 2018 Yevhenii Reizner
@@ -766,6 +767,7 @@ Used by 40 crate(s):
 - [aws-lc-sys 0.45.0](https://github.com/aws/aws-lc-rs) — Copyright [yyyy] [name of copyright owner]
 - [codespan-reporting 0.13.1](https://github.com/brendanzab/codespan) — Copyright [yyyy] [name of copyright owner]
 - [collections 0.1.0](https://crates.io/crates/collections) — Copyright 2022 - 2025 Zed Industries, Inc
+- [cpal 0.15.3](https://github.com/RustAudio/cpal)
 - [cpal 0.16.0](https://github.com/rustaudio/cpal) — Copyright [yyyy] [name of copyright owner]
 - [cpal 0.17.1](https://github.com/RustAudio/cpal) — Copyright [yyyy] [name of copyright owner]
 - [derive_refineable 0.1.0](https://crates.io/crates/derive_refineable) — Copyright 2022 - 2025 Zed Industries, Inc
