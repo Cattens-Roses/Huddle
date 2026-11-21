@@ -2,7 +2,7 @@ use super::*;
 use admin::{Action, MemberAction, Setting};
 use serde_json::{Value, json};
 
-async fn setup(space: bool) -> (Server, Client, OwnedRoomId) {
+pub(super) async fn setup(space: bool) -> (Server, Client, OwnedRoomId) {
     let server = Server::new();
     let client = Client::builder()
         .homeserver_url(&server.url)

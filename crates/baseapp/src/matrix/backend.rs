@@ -52,6 +52,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use super::receipts;
 use super::rich::{self, Rich};
 
 #[cfg(test)]
@@ -331,6 +332,10 @@ pub enum Command {
 }
 
 pub enum Update {
+    Receipts {
+        room: OwnedRoomId,
+        readers: Vec<receipts::Reader>,
+    },
     Typing {
         room: OwnedRoomId,
         users: Vec<OwnedUserId>,
@@ -964,6 +969,25 @@ impl Worker {
         );
 
         let outbox = self.outbox.clone();
+        client.add_event_handler(
+            move |event: matrix_sdk::ruma::events::receipt::SyncReceiptEvent, room: Room| {
+                let outbox = outbox.clone();
+                async move {
+                    let readers = receipts::live(&room, event.content).await;
+                    if !readers.is_empty() {
+                        post(
+                            &outbox,
+                            Update::Receipts {
+                                room: room.room_id().to_owned(),
+                                readers,
+                            },
+                        );
+                    }
+                }
+            },
+        );
+
+        let outbox = self.outbox.clone();
         let watched = client.clone();
         self.tasks.push(tokio::spawn(async move {
             let encryption = watched.encryption();
@@ -1177,6 +1201,7 @@ async fn handle(
             let room = joined(client, &id)?;
             if history {
                 let (events, token) = page(&room, None).await?;
+                let readers = receipts::snapshot(&room, &events, None).await;
                 let latest = events.iter().rev().find_map(|event| match event {
                     Event::Message(message) => message.id.clone(),
                     _ => None,
@@ -1188,6 +1213,13 @@ async fn handle(
                         events,
                         token,
                         older: false,
+                    },
+                );
+                post(
+                    outbox,
+                    Update::Receipts {
+                        room: id.clone(),
+                        readers,
                     },
                 );
                 if let Some(latest) = latest {
@@ -1223,15 +1255,17 @@ async fn handle(
         Command::Older { room: id, from } => {
             let room = joined(client, &id)?;
             let (events, token) = page(&room, Some(from)).await?;
+            let readers = receipts::snapshot(&room, &events, None).await;
             post(
                 outbox,
                 Update::History {
-                    room: id,
+                    room: id.clone(),
                     events,
                     token,
                     older: true,
                 },
             );
+            post(outbox, Update::Receipts { room: id, readers });
         }
         Command::Thread { room: id, root } => {
             let room = joined(client, &id)?;
@@ -1246,14 +1280,28 @@ async fn handle(
                     events.push(event);
                 }
             }
+            let readers = receipts::snapshot(&room, &events, Some(&root)).await;
+            let latest = events.iter().rev().find_map(|event| match event {
+                Event::Message(message) => message.id.clone(),
+                _ => None,
+            });
             post(
                 outbox,
                 Update::Thread {
-                    room: id,
-                    root,
+                    room: id.clone(),
+                    root: root.clone(),
                     events,
                 },
             );
+            post(outbox, Update::Receipts { room: id, readers });
+            if let Some(latest) = latest {
+                if let Err(error) = room
+                    .send_single_receipt(ReceiptType::Read, ReceiptThread::Thread(root), latest)
+                    .await
+                {
+                    log::debug!("matrix: could not send thread read receipt: {error}");
+                }
+            }
         }
         Command::Send {
             room: id,

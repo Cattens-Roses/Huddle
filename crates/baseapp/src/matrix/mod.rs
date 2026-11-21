@@ -1,6 +1,7 @@
 mod backend;
 mod photo;
 mod playback;
+mod receipts;
 mod rich;
 mod room_settings;
 mod typing;
@@ -178,6 +179,7 @@ enum Insert {
 
 #[derive(Default)]
 struct Timeline {
+    receipts: receipts::ReadState,
     messages: Vec<Message>,
     threads: HashMap<OwnedEventId, Vec<Message>>,
     orphans: Vec<Event>,
@@ -479,6 +481,8 @@ pub struct MatrixClient {
     room_name: Entity<Input>,
     room_topic: Entity<Input>,
     room_settings_busy: bool,
+    readers_view: Option<receipts::Selection>,
+    own_read_targets: [Option<OwnedEventId>; 2],
     admin: room_settings::Panel,
     mark: Option<Mark>,
     _updates: Task<()>,
@@ -614,6 +618,8 @@ impl MatrixClient {
             room_name: cx.new(|cx| Input::new("Room name", cx)),
             room_topic: cx.new(|cx| Input::new("Room topic", cx).growing()),
             room_settings_busy: false,
+            readers_view: None,
+            own_read_targets: [None, None],
             admin: room_settings::Panel::new(cx),
             mark: None,
             _updates: listener,
@@ -649,6 +655,31 @@ impl MatrixClient {
             return;
         }
         match update {
+            Update::Receipts { room, readers } => {
+                if let Some(timeline) = self.timelines.get_mut(&room) {
+                    let messages = &timeline.messages;
+                    let threads = &timeline.threads;
+                    let readers = readers
+                        .into_iter()
+                        .filter(|reader| match &reader.thread {
+                            matrix_sdk::ruma::events::receipt::ReceiptThread::Thread(root) => {
+                                threads.contains_key(root)
+                            }
+                            _ => true,
+                        })
+                        .collect();
+                    let changed = timeline.receipts.merge(readers, |a, b, scope| {
+                        receipts::compare(a, b, scope, messages, threads)
+                    });
+                    let places: Vec<_> = changed
+                        .iter()
+                        .filter_map(|event| timeline.locate(event))
+                        .collect();
+                    for place in places {
+                        self.changed(&room, Change::Updated(place));
+                    }
+                }
+            }
             Update::Typing { room, users } => {
                 let names = users
                     .iter()
@@ -739,6 +770,7 @@ impl MatrixClient {
                 }
             }
             Update::SignedOut => {
+                self.readers_view = None;
                 self.stop_typing();
                 self.typing = typing::Remote::default();
                 self.typing_expiry = None;
@@ -1045,6 +1077,19 @@ impl MatrixClient {
                 }
             }
             Update::CallEnded => self.line = None,
+        }
+        // A live message can make a previously unknown receipt position visible.
+        // Refresh the last sent message as well as the receipt's exact event row.
+        if let Some(room) = self.room.clone() {
+            let places: Vec<_> = self
+                .own_read_targets
+                .iter()
+                .flatten()
+                .filter_map(|id| self.timelines.get(&room)?.locate(id))
+                .collect();
+            for place in places {
+                self.changed(&room, Change::Updated(place));
+            }
         }
         self.release_retired_images(cx);
         cx.notify();
@@ -1665,6 +1710,7 @@ impl MatrixClient {
                 .flatten();
         }
         if self.room.as_ref() != Some(&id) {
+            self.readers_view = None;
             self.stop_typing();
             self.cancel_compress();
             self.thread = None;
@@ -4665,7 +4711,8 @@ impl MatrixClient {
             .child(body)
             .children(edited)
             .children(reactions)
-            .children(thread_summary);
+            .children(thread_summary)
+            .children(self.receipt_line(message, spot, cx));
 
         let toolbar = (!pending && message.kind != MessageKind::Encrypted)
             .then(|| self.render_toolbar(message, &key, spot, mine, cx));
@@ -5419,6 +5466,26 @@ impl MatrixClient {
                     }
                 })),
             );
+        if let (Some(room), Some(event)) = (self.room.clone(), message.id.clone()) {
+            let root = if spot == Spot::Thread {
+                self.thread.clone()
+            } else {
+                None
+            };
+            bar = bar.child(
+                tool("readers", "icons/circle-check.svg", "Read receipts").on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.readers_view = Some(receipts::Selection {
+                            room: room.clone(),
+                            event: event.clone(),
+                            root: root.clone(),
+                            limit: 50,
+                        });
+                        cx.notify();
+                    },
+                )),
+            );
+        }
         if spot == Spot::Main {
             let reply = target.clone();
             bar = bar.child(tool("reply", "icons/reply.svg", "huddle-reply").on_click(
@@ -7033,6 +7100,36 @@ impl MatrixClient {
 
 impl Render for MatrixClient {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.own_read_targets = [None, None];
+        if let (Some(timeline), Some(me)) = (
+            self.room.as_ref().and_then(|id| self.timelines.get(id)),
+            self.me.as_ref(),
+        ) {
+            self.own_read_targets[0] = timeline
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.sender == me.id && message.id.is_some())
+                .and_then(|message| message.id.clone());
+            if let Some(root) = &self.thread {
+                self.own_read_targets[1] = timeline
+                    .threads
+                    .get(root)
+                    .and_then(|messages| {
+                        messages
+                            .iter()
+                            .rev()
+                            .find(|message| message.sender == me.id && message.id.is_some())
+                    })
+                    .and_then(|message| message.id.clone())
+                    .or_else(|| {
+                        timeline
+                            .find(root)
+                            .filter(|message| message.sender == me.id)
+                            .and_then(|message| message.id.clone())
+                    });
+            }
+        }
         self.release_player_texture(window);
         self.release_retired_images(cx);
         self.restore_history_anchor(window, cx);
@@ -7089,6 +7186,9 @@ impl Render for MatrixClient {
                             })
                             .when_some(self.person.clone(), |layout, person| {
                                 layout.child(self.render_person(&person, cx))
+                            })
+                            .when_some(self.readers_view.clone(), |layout, selected| {
+                                layout.child(self.render_readers(&selected, cx))
                             }),
                     )
                     .into_any_element()

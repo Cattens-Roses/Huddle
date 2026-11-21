@@ -113,6 +113,13 @@ remove, ban, and unban users. Space settings also manage linked rooms, their ord
 and whether they are suggested, and can create new rooms. Actions use current Matrix permissions; enabling
 encryption is permanent. Room IDs and room versions are shown as information.
 
+## Read receipts
+
+Read markers show who has reached a message. Click **Read by** or the read-receipt
+button in a message toolbar to see who has read it, including readers who have
+already continued to a later message. Main-chat and thread receipts stay separate;
+only public receipts shared by other people are shown.
+
 ## Media notes
 
 Chat attachments support images plus MP4/M4V, MOV, MKV, WebM, MP3, M4A, AAC, WAV, FLAC, and Ogg/OGA (up to 20 MB). Playback uses native Rust decoders, GPUI video rendering, and system audio. Video containers support H.264, 8-bit HEVC, and VP9 with AAC, MP3, FLAC, PCM, or Opus audio.

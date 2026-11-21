@@ -10,6 +10,9 @@ use std::{
 #[path = "room_admin_tests.rs"]
 mod room_admin_tests;
 
+#[path = "receipt_tests.rs"]
+mod receipt_tests;
+
 fn decode_component(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut result = Vec::new();
