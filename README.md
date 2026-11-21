@@ -1,7 +1,8 @@
-# baseapp
+# Huddle
 
-A small, reusable desktop application shell built with Rust and GPUI. It includes a Home screen,
-an Appearance settings page, and the shared UI components and themes in `crates/ui`.
+A native Matrix desktop client built with Rust and GPUI. Huddle includes rooms,
+direct messages, threads, encrypted messaging, voice and video calls, native media
+playback, and customizable appearance, notifications, and media caching.
 
 ## Run
 
