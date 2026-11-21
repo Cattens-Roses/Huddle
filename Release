@@ -1,0 +1,24 @@
+Origin: huddle
+Label: huddle
+Suite: stable
+Codename: stable
+Architectures: amd64
+Components: main
+Description: Huddle apt repository
+Date: Sat, 21 Nov 2026 15:15:05 +0000
+MD5Sum:
+ ec4e963d9eedbe68720dff88af853c7a              732 Packages
+ 73acad59ee2cca01fdb6c3098fa251fe              471 Packages.gz
+ 9c4807eece39a89c242f0ec652ae65db              171 Release
+SHA1:
+ c175be33cbf46054e8a88e8b71cf667859e31740              732 Packages
+ c9c94573aa6520c808fc15e16c1ea2a0d9946283              471 Packages.gz
+ e0f326716ef516a63f088fca515d609f93696d15              171 Release
+SHA256:
+ 1032f91ed9a88fc31874ec5bee5f5c8086efd36c80be4149bb6933ae648cc085              732 Packages
+ 50060939e3c9faf479e20c7c4d3bd8e39c45883af5c98c9e1b7be626998fdd67              471 Packages.gz
+ f260b0e841445d14a131e4eee6dcab24da206406ecb0c56eaa714c3118283392              171 Release
+SHA512:
+ 19965f2e25f1eb7f48d98c133c997c0c3883d3c3475964ac0339c3e31b9ccb972c4cef1edbf5fd7b56285a93037f8ea2906cb3b39759f6fbc03bc89804a30277              732 Packages
+ b305f05c0a12b2c0a787db6bee3760e076974cb6623395062c63e6faaac74e839903d27529a028a8a09f64ad67054a495fa5685fc977f7e44df7769c14dd4048              471 Packages.gz
+ 1742e3eff910495e22b53d93fb396177dfb73e3ffef5227f0e286d977b32f7e887905ba597aa7685fc9c53ec021bdff528e5fbd3cef83c36b22790ac8d740034              171 Release
