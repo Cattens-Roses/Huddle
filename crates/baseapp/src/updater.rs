@@ -135,7 +135,10 @@ pub fn init(auto: bool) {
     let _ = STAGE_DIR.set(stage_dir());
 
     if std::env::var_os("HUDDLE_DISABLE_UPDATE").is_some_and(|v| !v.is_empty() && v != "0") {
-        set_status(State::Disabled, "Updates are disabled by HUDDLE_DISABLE_UPDATE.");
+        set_status(
+            State::Disabled,
+            "Updates are disabled by HUDDLE_DISABLE_UPDATE.",
+        );
         return;
     }
     if !auto {
@@ -189,8 +192,10 @@ pub fn tick() {
     {
         let mut last = LAST_PERIODIC.lock().unwrap_or_else(|e| e.into_inner());
         let st = state();
-        if matches!(st, State::Idle | State::UpToDate | State::Error | State::Available)
-            && !WORKER_BUSY.load(Ordering::Relaxed)
+        if matches!(
+            st,
+            State::Idle | State::UpToDate | State::Error | State::Available
+        ) && !WORKER_BUSY.load(Ordering::Relaxed)
         {
             match *last {
                 None => *last = Some(now),
@@ -314,7 +319,10 @@ fn http_get(url: &str) -> Result<Vec<u8>, String> {
     if !response.status().is_success() {
         return Err(format!("HTTP {}", response.status()));
     }
-    response.bytes().map(|b| b.to_vec()).map_err(|e| e.to_string())
+    response
+        .bytes()
+        .map(|b| b.to_vec())
+        .map_err(|e| e.to_string())
 }
 
 fn http_get_long(url: &str) -> Result<Vec<u8>, String> {
@@ -327,7 +335,10 @@ fn http_get_long(url: &str) -> Result<Vec<u8>, String> {
     if !response.status().is_success() {
         return Err(format!("HTTP {}", response.status()));
     }
-    response.bytes().map(|b| b.to_vec()).map_err(|e| e.to_string())
+    response
+        .bytes()
+        .map(|b| b.to_vec())
+        .map_err(|e| e.to_string())
 }
 
 fn sha256_bytes(data: &[u8]) -> String {
@@ -366,9 +377,7 @@ fn manifest_url() -> String {
 }
 
 fn normalize_rel(path: &str) -> String {
-    path.replace('\\', "/")
-        .trim_start_matches('/')
-        .to_string()
+    path.replace('\\', "/").trim_start_matches('/').to_string()
 }
 
 fn write_atomic(path: &Path, data: &[u8]) -> Result<(), String> {
@@ -377,11 +386,12 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<(), String> {
     }
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, data).map_err(|e| e.to_string())?;
-    fs::rename(&tmp, path).or_else(|_| {
-        let _ = fs::remove_file(path);
-        fs::rename(&tmp, path)
-    })
-    .map_err(|e| e.to_string())
+    fs::rename(&tmp, path)
+        .or_else(|_| {
+            let _ = fs::remove_file(path);
+            fs::rename(&tmp, path)
+        })
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(target_os = "windows")]
@@ -454,9 +464,7 @@ fn worker_windows() {
             return;
         }
         let dest = stage().join(&rel);
-        if dest.exists()
-            && sha256_file(&dest).is_some_and(|got| got.eq_ignore_ascii_case(&sha))
-        {
+        if dest.exists() && sha256_file(&dest).is_some_and(|got| got.eq_ignore_ascii_case(&sha)) {
             PERCENT.store((((index + 1) * 100) / total) as i32, Ordering::Relaxed);
             continue;
         }
@@ -464,10 +472,7 @@ fn worker_windows() {
         let bytes = match http_get_long(&url) {
             Ok(b) => b,
             Err(err) => {
-                set_status(
-                    State::Error,
-                    format!("Download failed for {rel}: {err}"),
-                );
+                set_status(State::Error, format!("Download failed for {rel}: {err}"));
                 return;
             }
         };
@@ -489,7 +494,10 @@ fn worker_windows() {
     let _ = fs::write(stage().join(".huddle-update-version"), &man.version);
     PERCENT.store(100, Ordering::Relaxed);
     *READY_SINCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    set_status(State::Ready, format!("Update {} ready. Restarting…", man.version));
+    set_status(
+        State::Ready,
+        format!("Update {} ready. Restarting…", man.version),
+    );
 }
 
 #[cfg(target_os = "windows")]
@@ -545,7 +553,14 @@ fn begin_apply_windows() {
     let dest = install_dir().display().to_string();
     let params = format!("{pid} \"{stage}\" \"{dest}\"");
     let ok = Command::new("cmd")
-        .args(["/C", "start", "", "/MIN", script.to_str().unwrap_or(""), &params])
+        .args([
+            "/C",
+            "start",
+            "",
+            "/MIN",
+            script.to_str().unwrap_or(""),
+            &params,
+        ])
         .spawn()
         .is_ok();
     if !ok {

@@ -552,14 +552,13 @@ impl BaseApp {
         let percent = updater::download_percent();
         let state = updater::state();
         let version = updater::current_version();
-        let auto = Switch::new("auto-update", self.auto_update).on_click(cx.listener(
-            |this, _, _, cx| {
+        let auto =
+            Switch::new("auto-update", self.auto_update).on_click(cx.listener(|this, _, _, cx| {
                 this.auto_update = !this.auto_update;
                 updater::set_auto_enabled(this.auto_update);
                 this.save();
                 cx.notify();
-            },
-        ));
+            }));
         let check = Button::new("check-updates")
             .secondary()
             .label("Check now")
@@ -679,9 +678,9 @@ impl BaseApp {
                                     .child("Updates"),
                             )
                             .child(
-                                div().text_color(theme.muted_foreground).child(
-                                    "Keep Huddle current from the rolling beta channel.",
-                                ),
+                                div()
+                                    .text_color(theme.muted_foreground)
+                                    .child("Keep Huddle current from the rolling beta channel."),
                             ),
                     )
                     .child(self.settings_card("App updates", rows, cx)),
