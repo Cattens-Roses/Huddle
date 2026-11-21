@@ -14,6 +14,7 @@ pub struct Cache<T> {
     max_entries: usize,
     clock: Cell<u64>,
     weight: fn(&T) -> usize,
+    on_remove: Option<Box<dyn Fn(T)>>,
 }
 
 impl<T> Cache<T> {
@@ -25,6 +26,17 @@ impl<T> Cache<T> {
             max_entries,
             clock: Cell::new(0),
             weight,
+            on_remove: None,
+        }
+    }
+    pub fn on_remove(mut self, handler: impl Fn(T) + 'static) -> Self {
+        self.on_remove = Some(Box::new(handler));
+        self
+    }
+
+    fn removed(&self, entry: Entry<T>) {
+        if let Some(handler) = &self.on_remove {
+            handler(entry.value);
         }
     }
     fn tick(&self) -> u64 {
@@ -40,6 +52,7 @@ impl<T> Cache<T> {
     pub fn insert(&mut self, key: String, value: T) {
         if let Some(previous) = self.entries.remove(&key) {
             self.bytes -= previous.bytes;
+            self.removed(previous);
         }
         let bytes = (self.weight)(&value);
         if bytes > self.capacity || self.max_entries == 0 {
@@ -54,7 +67,9 @@ impl<T> Cache<T> {
             else {
                 break;
             };
-            self.bytes -= self.entries.remove(&oldest).unwrap().bytes;
+            let entry = self.entries.remove(&oldest).unwrap();
+            self.bytes -= entry.bytes;
+            self.removed(entry);
         }
         let used = Cell::new(self.tick());
         self.entries.insert(key, Entry { value, bytes, used });
@@ -64,24 +79,47 @@ impl<T> Cache<T> {
         self.bytes
     }
     pub fn clear(&mut self) {
-        self.entries.clear();
+        for (_, entry) in self.entries.drain() {
+            if let Some(handler) = &self.on_remove {
+                handler(entry.value);
+            }
+        }
+        self.entries.shrink_to_fit();
         self.bytes = 0;
     }
     pub fn retain(&mut self, keep: impl Fn(&str) -> bool) {
-        self.entries.retain(|key, entry| {
-            if keep(key) {
-                true
-            } else {
-                self.bytes -= entry.bytes;
-                false
+        for (_, entry) in self.entries.extract_if(|key, _| !keep(key)) {
+            self.bytes -= entry.bytes;
+            if let Some(handler) = &self.on_remove {
+                handler(entry.value);
             }
-        });
+        }
+        self.entries.shrink_to_fit();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn removal_handler_releases_evicted_replaced_and_cleared_values() {
+        use std::{cell::RefCell, rc::Rc};
+        let removed = Rc::new(RefCell::new(Vec::new()));
+        let recorded = removed.clone();
+        let mut cache =
+            Cache::new(4, 2, Vec::len).on_remove(move |value| recorded.borrow_mut().push(value));
+        cache.insert("a".into(), vec![1; 2]);
+        cache.insert("b".into(), vec![2; 2]);
+        cache.insert("c".into(), vec![3; 2]);
+        cache.insert("b".into(), vec![4]);
+        cache.retain(|key| key == "c");
+        cache.clear();
+        assert_eq!(
+            *removed.borrow(),
+            vec![vec![1; 2], vec![2; 2], vec![4], vec![3; 2]]
+        );
+        assert_eq!(cache.bytes(), 0);
+    }
     #[test]
     fn cache_evicts_the_least_recently_used_bytes() {
         let mut cache = Cache::new(6, 10, Vec::len);

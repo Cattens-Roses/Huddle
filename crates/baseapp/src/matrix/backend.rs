@@ -1365,7 +1365,6 @@ async fn handle(
                     .flatten();
                 }
             }
-            let mut original = None;
             if preview.is_none() {
                 if let Ok(bytes) = media
                     .get_media_content(
@@ -1377,14 +1376,12 @@ async fn handle(
                     )
                     .await
                 {
-                    let copy = bytes.clone();
                     preview = tokio::task::spawn_blocking(move || {
-                        super::playback::thumbnail(copy).ok().map(|p| p.bytes)
+                        super::playback::thumbnail(bytes).ok().map(|p| p.bytes)
                     })
                     .await
                     .ok()
                     .flatten();
-                    original = Some(bytes);
                 }
             }
             if !cached && let Some(bytes) = &preview {
@@ -1406,7 +1403,9 @@ async fn handle(
                 outbox,
                 Update::VideoPreview {
                     key,
-                    bytes: original,
+                    // The SDK has already cached the original on disk. Scrolling
+                    // past a video only needs its poster in the UI's memory.
+                    bytes: None,
                     thumbnail: preview,
                 },
             );

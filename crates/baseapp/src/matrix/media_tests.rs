@@ -426,13 +426,12 @@ async fn uploads_video_thumbnail_and_downloads_preview_and_original() {
         match updates.next().await.unwrap() {
             Update::VideoPreview {
                 thumbnail: Some(poster),
-                bytes: Some(original),
+                bytes: None,
                 ..
             } => {
-                assert_eq!(original, bytes);
                 assert_eq!(poster, expected_poster);
             }
-            _ => panic!("Expected native fallback preview and cached video"),
+            _ => panic!("Expected native fallback preview without retaining the video in RAM"),
         }
         let downloads = server.traffic.lock().unwrap().downloads.len();
         handle(
@@ -479,6 +478,11 @@ async fn uploads_video_thumbnail_and_downloads_preview_and_original() {
             } => assert_eq!(original, bytes),
             _ => panic!("Expected original playable bytes"),
         }
+        assert_eq!(
+            server.traffic.lock().unwrap().downloads.len(),
+            downloads,
+            "Opening a video after its preview must reuse the SDK cache"
+        );
         // Every advertised container/extension uses the same real SDK upload path.
         for (name, data) in [
             (

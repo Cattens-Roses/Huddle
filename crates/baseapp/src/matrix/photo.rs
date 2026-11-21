@@ -139,7 +139,7 @@ fn decode_still(bytes: &[u8]) -> Option<VideoFrame> {
     let image = image::load_from_memory(bytes)
         .map_err(|error| log::warn!("Could not read a photo: {error}"))
         .ok()?;
-    let rgb = on_white(&image);
+    let rgb = on_white(image);
     let (width, height) = rgb.dimensions();
     if width == 0 || height == 0 {
         return None;
@@ -149,8 +149,11 @@ fn decode_still(bytes: &[u8]) -> Option<VideoFrame> {
     Some(frame)
 }
 
-fn on_white(image: &image::DynamicImage) -> image::RgbImage {
-    let rgba = image.to_rgba8();
+fn on_white(image: image::DynamicImage) -> image::RgbImage {
+    if !image.color().has_alpha() {
+        return image.into_rgb8();
+    }
+    let rgba = image.into_rgba8();
     image::RgbImage::from_fn(rgba.width(), rgba.height(), |x, y| {
         let pixel = rgba.get_pixel(x, y);
         let alpha = pixel[3] as u16;
@@ -254,6 +257,18 @@ fn animated_webp(bytes: &[u8]) -> bool {
 mod tests {
     use super::*;
     use image::ImageEncoder as _;
+
+    #[test]
+    fn opaque_photos_reuse_the_rgb_buffer_and_alpha_blends_on_white() {
+        let rgb = image::RgbImage::from_pixel(2, 2, image::Rgb([12, 34, 56]));
+        let pixels = rgb.as_ptr();
+        let result = on_white(image::DynamicImage::ImageRgb8(rgb));
+        assert_eq!(result.as_ptr(), pixels);
+        assert_eq!(result.get_pixel(0, 0).0, [12, 34, 56]);
+        let rgba = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 128]));
+        let result = on_white(image::DynamicImage::ImageRgba8(rgba));
+        assert_eq!(result.get_pixel(0, 0).0, [255, 127, 127]);
+    }
 
     #[test]
     fn compresses_png_within_the_longest_side() {

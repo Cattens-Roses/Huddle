@@ -431,7 +431,8 @@ pub struct MatrixClient {
     refresh: Option<Task<()>>,
     next_local: u64,
     media: RefCell<Cache<Media>>,
-    files: Cache<Vec<u8>>,
+    retired_images: Rc<RefCell<Vec<Arc<Image>>>>,
+    files: Cache<Arc<[u8]>>,
     cache_clearing: bool,
     cache_status: Option<String>,
     viewing: Option<View>,
@@ -495,6 +496,8 @@ impl MatrixClient {
         });
         let thread_list = ListState::new(0, ListAlignment::Bottom, px(400.));
         let owner = cx.entity_id();
+        let retired_images = Rc::new(RefCell::new(Vec::new()));
+        let retired = retired_images.clone();
         let client = Self {
             commands,
             phase: Phase::Starting,
@@ -536,11 +539,20 @@ impl MatrixClient {
             notice_timer: None,
             refresh: None,
             next_local: 0,
-            media: RefCell::new(Cache::new(32 * 1024 * 1024, 512, |media| match media {
-                Media::Ready(image) => image.bytes.len(),
-                _ => 0,
-            })),
-            files: Cache::new(128 * 1024 * 1024, 128, Vec::len),
+            media: RefCell::new(
+                Cache::new(32 * 1024 * 1024, 512, |media| match media {
+                    Media::Ready(image) => image.bytes.len(),
+                    _ => 0,
+                })
+                .on_remove(move |media| {
+                    if let Media::Ready(image) = media {
+                        retired.borrow_mut().push(image);
+                    }
+                }),
+            ),
+            retired_images,
+            // Originals remain in the SDK's disk cache and can be read again.
+            files: Cache::new(32 * 1024 * 1024, 64, |bytes| bytes.len()),
             cache_clearing: false,
             cache_status: None,
             viewing: None,
@@ -584,6 +596,11 @@ impl MatrixClient {
         App::on_action(cx, move |_: &Copy, cx: &mut App| {
             this.update(cx, |this, cx| this.copy_mark(cx)).ok();
         });
+        cx.on_release(|this, cx| {
+            this.media.get_mut().clear();
+            this.release_retired_images(cx);
+        })
+        .detach();
         client
     }
 
@@ -791,7 +808,7 @@ impl MatrixClient {
                 thumbnail,
             } => {
                 if let Some(bytes) = bytes {
-                    self.files.insert(format!("{key}#original"), bytes);
+                    self.files.insert(format!("{key}#original"), bytes.into());
                 }
                 self.media.borrow_mut().insert(
                     format!("{key}#poster"),
@@ -814,8 +831,10 @@ impl MatrixClient {
                 {
                     let media = self.pending_play.take().unwrap();
                     if let Some(bytes) = bytes {
-                        self.files
-                            .insert(format!("{}#original", media.key), bytes.clone());
+                        self.files.insert(
+                            format!("{}#original", media.key),
+                            Arc::from(bytes.as_slice()),
+                        );
                         self.start_media(media, bytes, cx);
                     } else {
                         self.notify("This media file couldn't load. Try again.", true, cx);
@@ -825,7 +844,7 @@ impl MatrixClient {
                 if key.ends_with("#original")
                     && let Some(bytes) = &bytes
                 {
-                    self.files.insert(key.clone(), bytes.clone());
+                    self.files.insert(key.clone(), Arc::from(bytes.as_slice()));
                 }
                 let image = bytes.and_then(|bytes| {
                     sniff(&bytes).map(|format| Arc::new(Image::from_bytes(format, bytes)))
@@ -901,7 +920,16 @@ impl MatrixClient {
             }
             Update::CallEnded => self.line = None,
         }
+        self.release_retired_images(cx);
         cx.notify();
+    }
+
+    fn release_retired_images(&self, cx: &mut App) {
+        // Evict the decoded GPUI asset too: dropping encoded bytes alone leaves
+        // its full-resolution RGBA frames in the global asset cache indefinitely.
+        for image in self.retired_images.borrow_mut().drain(..) {
+            image.remove_asset(cx);
+        }
     }
 
     /// Reloads timelines after keys arrive so older encrypted messages can be read.
@@ -1166,6 +1194,7 @@ impl MatrixClient {
         self.media
             .borrow_mut()
             .retain(|key| key.starts_with("local:"));
+        self.release_retired_images(cx);
         self.cache_clearing = true;
         self.cache_status = Some("Clearing media cache…".into());
         self.command(Command::ClearCache);
@@ -1669,7 +1698,7 @@ impl MatrixClient {
             );
         }
         self.files
-            .insert(format!("{key}#original"), shot.bytes.clone());
+            .insert(format!("{key}#original"), Arc::from(shot.bytes.as_slice()));
         let body = match caption.is_empty() {
             true => shot.name.clone(),
             false => caption.clone(),
@@ -4496,7 +4525,7 @@ impl MatrixClient {
         self.player_scrub = None;
         self.pending_play = None;
         if let Some(bytes) = self.files.get(&format!("{}#original", media.key)).cloned() {
-            self.start_media(media, bytes, cx);
+            self.start_media(media, bytes.to_vec(), cx);
         } else {
             self.pending_play = Some(media.clone());
             self.command(Command::Fetch {
@@ -6545,6 +6574,7 @@ impl MatrixClient {
 
 impl Render for MatrixClient {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.release_retired_images(cx);
         self.restore_history_anchor(window, cx);
         self.wire_composer(cx);
         if let Some(target) = self.pending_focus.take() {
