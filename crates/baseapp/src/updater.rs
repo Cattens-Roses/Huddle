@@ -517,7 +517,19 @@ fn worker_windows() {
 }
 
 #[cfg(target_os = "windows")]
+fn win_path(path: &Path) -> String {
+    // Trailing backslash + quotes breaks cmd.exe argument parsing ("C:\foo\" → open quote).
+    let mut text = path.to_string_lossy().replace('/', "\\");
+    while text.ends_with('\\') && !text.ends_with(":\\") {
+        text.pop();
+    }
+    text
+}
+
+#[cfg(target_os = "windows")]
 fn begin_apply_windows() {
+    use std::os::windows::process::CommandExt;
+
     set_status(State::Applying, "Applying update…");
     let pid = std::process::id().to_string();
     let script = dirs::data_local_dir()
@@ -527,14 +539,18 @@ fn begin_apply_windows() {
     if let Some(parent) = script.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let body = format!(
-        "@echo off\r\n\
+    // Keep the apply helper self-contained: never rely on `start "" …` from Rust,
+    // because empty-title quoting collapses and the PID becomes the "command".
+    let body = "@echo off\r\n\
          setlocal EnableExtensions\r\n\
          set \"PID=%~1\"\r\n\
          set \"STAGE=%~2\"\r\n\
          set \"DEST=%~3\"\r\n\
          set \"LOG=%TEMP%\\huddle-update-apply.log\"\r\n\
-         echo apply start %DATE% %TIME% PID=%PID% > \"%LOG%\"\r\n\
+         echo apply start %DATE% %TIME% > \"%LOG%\"\r\n\
+         echo PID=%PID%>> \"%LOG%\"\r\n\
+         echo STAGE=%STAGE%>> \"%LOG%\"\r\n\
+         echo DEST=%DEST%>> \"%LOG%\"\r\n\
          :wait\r\n\
          tasklist /FI \"PID eq %PID%\" 2>nul | find \"%PID%\" >nul\r\n\
          if not errorlevel 1 (\r\n\
@@ -542,11 +558,11 @@ fn begin_apply_windows() {
            goto wait\r\n\
          )\r\n\
          timeout /t 2 /nobreak >nul\r\n\
-         if not exist \"%STAGE%\" (\r\n\
-           echo missing STAGE>> \"%LOG%\"\r\n\
+         if not exist \"%STAGE%\\Huddle.exe\" (\r\n\
+           echo missing STAGE or Huddle.exe>> \"%LOG%\"\r\n\
            exit /b 1\r\n\
          )\r\n\
-         robocopy \"%STAGE%\" \"%DEST%\" /E /IS /IT /R:3 /W:1 /NFL /NDL /NJH /NJS /NC /NS /XF .huddle-update-version >> \"%LOG%\" 2>&1\r\n\
+         robocopy \"%STAGE%\" \"%DEST%\" /E /IS /IT /R:5 /W:1 /NFL /NDL /NJH /NJS /NC /NS /XF .huddle-update-version >> \"%LOG%\" 2>&1\r\n\
          if errorlevel 8 (\r\n\
            echo copy failed>> \"%LOG%\"\r\n\
            exit /b 1\r\n\
@@ -557,38 +573,29 @@ fn begin_apply_windows() {
          )\r\n\
          rmdir /S /Q \"%STAGE%\" 2>nul\r\n\
          echo ok, restarting>> \"%LOG%\"\r\n\
-         start \"\" /D \"%DEST%\" \"%DEST%\\Huddle.exe\"\r\n\
+         start \"Huddle\" /D \"%DEST%\" \"%DEST%\\Huddle.exe\"\r\n\
          del \"%~f0\" 2>nul\r\n\
-         exit /b 0\r\n"
-    );
+         exit /b 0\r\n";
     if fs::write(&script, body).is_err() {
         set_status(State::Error, "Could not write apply script.");
         return;
     }
-    let stage = stage().display().to_string();
-    let dest = install_dir().display().to_string();
-    let params = format!("{pid} \"{stage}\" \"{dest}\"");
-    let ok = Command::new("cmd")
-        .args([
-            "/C",
-            "start",
-            "",
-            "/MIN",
-            script.to_str().unwrap_or(""),
-            &params,
-        ])
+    let stage = win_path(stage());
+    let dest = win_path(install_dir());
+    // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+    // Spawn the .cmd directly so Rust's Windows Command path quotes %1/%2/%3 correctly
+    // (unlike `start "" …`, which ate the empty title and treated the PID as a program).
+    const FLAGS: u32 = 0x00000008 | 0x00000200 | 0x08000000;
+    let ok = Command::new(&script)
+        .arg(&pid)
+        .arg(&stage)
+        .arg(&dest)
+        .creation_flags(FLAGS)
         .spawn()
         .is_ok();
     if !ok {
-        // Fallback: Shell-less spawn of the script itself.
-        let ok = Command::new(&script)
-            .args([&pid, &stage, &dest])
-            .spawn()
-            .is_ok();
-        if !ok {
-            set_status(State::Error, "Could not start apply script.");
-            return;
-        }
+        set_status(State::Error, "Could not start apply script.");
+        return;
     }
     WANT_QUIT.store(true, Ordering::Relaxed);
 }
