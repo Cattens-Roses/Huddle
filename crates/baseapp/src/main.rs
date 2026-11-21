@@ -174,6 +174,7 @@ struct Huddle {
     appearance_observer: Option<gpui::Subscription>,
     activation_observer: Option<gpui::Subscription>,
     matrix: Entity<matrix::MatrixClient>,
+    in_tray: bool,
     auto_update: bool,
     _updater: Option<gpui::Task<()>>,
 }
@@ -440,6 +441,7 @@ impl Huddle {
                 .new(|_| Scrollbar::new(ScrollHandle::new()).watching(owner)),
             appearance_observer: None,
             activation_observer: None,
+            in_tray: false,
             auto_update: prefs.auto_update,
             _updater: Some(updater_tick),
             matrix: {
@@ -903,6 +905,9 @@ impl Huddle {
 
 impl Render for Huddle {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.in_tray {
+            return div().size_full().into_any_element();
+        }
         let theme = *cx.theme();
         let sidebar_open = self.sidebar_open && self.page != Page::Home;
         let nav = |page, id: &'static str, icon: &'static str| {
@@ -1574,6 +1579,19 @@ impl Render for Huddle {
                     .child(sidebar)
                     .child(content)
             })
+            .into_any_element()
+    }
+}
+
+impl Huddle {
+    fn set_in_tray(&mut self, hidden: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.in_tray == hidden {
+            return;
+        }
+        self.in_tray = hidden;
+        self.matrix
+            .update(cx, |client, cx| client.set_in_tray(hidden, window, cx));
+        cx.notify();
     }
 }
 

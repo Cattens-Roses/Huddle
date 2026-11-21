@@ -50,6 +50,7 @@ pub fn install(window: WindowHandle<Huddle>, cx: &mut App) -> bool {
         let room = response.tag.to_string();
         window
             .update(cx, |app, window, cx| {
+                app.set_in_tray(false, window, cx);
                 reveal(window);
                 app.matrix
                     .update(cx, |client, cx| client.focus_room(&room, window, cx));
@@ -99,6 +100,37 @@ pub fn allow_close(window: &mut Window, cx: &mut App) -> bool {
     }
     if cx.try_global::<Seat>().is_some() {
         conceal(window);
+        // Close handlers can run while Huddle is already borrowed. Defer the
+        // entity update, then replace the retained frame even though it is hidden.
+        cx.defer(|cx| {
+            let Some(handle) = cx.try_global::<Seat>().map(|seat| seat.window) else {
+                return;
+            };
+            handle
+                .update(cx, |app, window, cx| {
+                    app.set_in_tray(true, window, cx);
+                    window.refresh();
+                })
+                .ok();
+            gpui::AnyWindowHandle::from(handle)
+                .update(cx, |_, window, cx| {
+                    window.draw(cx).clear(cx);
+                })
+                .ok();
+            cx.spawn(async move |cx| {
+                // Give decoder workers time to observe their stop flag and drop buffers.
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                let hidden = handle.update(cx, |app, _, _| app.in_tray).unwrap_or(false);
+                if hidden {
+                    cx.background_executor()
+                        .spawn(async {
+                            release_working_set();
+                        })
+                        .detach();
+                }
+            })
+            .detach();
+        });
     } else {
         // Keep the window accessible from the taskbar if tray installation failed.
         window.minimize_window();
@@ -139,7 +171,29 @@ fn drain(cx: &mut App) {
         return;
     }
     if open {
-        window.update(cx, |_, window, _| reveal(window)).ok();
+        window
+            .update(cx, |app, window, cx| {
+                app.set_in_tray(false, window, cx);
+                reveal(window);
+            })
+            .ok();
+    }
+}
+
+/// Return unused resident pages after releasing our references. This does not
+/// destroy session state or trim repeatedly while the window is being used.
+fn release_working_set() {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        use windows_sys::Win32::System::{
+            ProcessStatus::EmptyWorkingSet, Threading::GetCurrentProcess,
+        };
+        if EmptyWorkingSet(GetCurrentProcess()) == 0 {
+            log::debug!(
+                "tray: working set trim failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
     }
 }
 

@@ -414,6 +414,7 @@ pub struct MatrixClient {
     removing_space: Option<(OwnedRoomId, String)>,
     room: Option<OwnedRoomId>,
     focused: bool,
+    in_tray: bool,
     notifications: NotificationPreferences,
     timelines: HashMap<OwnedRoomId, Timeline>,
     members: HashMap<OwnedRoomId, Vec<Member>>,
@@ -440,6 +441,7 @@ pub struct MatrixClient {
     viewing: Option<View>,
     player: Option<playback::Player>,
     player_image: Option<Arc<gpui::RenderImage>>,
+    painted_player_image: Option<Arc<gpui::RenderImage>>,
     player_timeline: ScrubberState,
     player_scrub: Option<Duration>,
     pending_play: Option<Picture>,
@@ -519,6 +521,7 @@ impl MatrixClient {
             removing_space: None,
             room: None,
             focused: true,
+            in_tray: false,
             notifications: NotificationPreferences::default(),
             timelines: HashMap::new(),
             members: HashMap::new(),
@@ -564,6 +567,7 @@ impl MatrixClient {
             viewing: None,
             player: None,
             player_image: None,
+            painted_player_image: None,
             player_timeline: ScrubberState::new("media-timeline"),
             player_scrub: None,
             pending_play: None,
@@ -628,6 +632,10 @@ impl MatrixClient {
     }
 
     fn apply(&mut self, update: Update, cx: &mut Context<Self>) {
+        // A fetch that finished after hiding must not repopulate the media caches.
+        if self.in_tray && matches!(&update, Update::Media { .. } | Update::VideoPreview { .. }) {
+            return;
+        }
         match update {
             Update::RoomSettingsSaved {
                 room,
@@ -1248,7 +1256,39 @@ impl MatrixClient {
     }
 
     pub fn set_focused(&mut self, focused: bool) {
-        self.focused = focused;
+        self.focused = focused && !self.in_tray;
+    }
+
+    pub fn set_in_tray(&mut self, hidden: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.in_tray = hidden;
+        if hidden {
+            self.focused = false;
+            self.pending_play = None;
+            self.player = None;
+            self.player_image = None;
+            self.release_player_texture(window);
+            self.player_scrub = None;
+            self.viewing = None;
+            // Keep unsent local attachments; remote media reloads from the disk cache.
+            self.files.retain(|key| key.starts_with("local:"));
+            self.media
+                .borrow_mut()
+                .retain(|key| key.starts_with("local:"));
+            self.release_retired_images(cx);
+        }
+        cx.emit(CacheChanged);
+        cx.notify();
+    }
+
+    fn release_player_texture(&mut self, window: &mut Window) {
+        if self.painted_player_image.as_ref().map(|image| image.id)
+            != self.player_image.as_ref().map(|image| image.id)
+        {
+            if let Some(previous) = self.painted_player_image.take() {
+                window.drop_image(previous).ok();
+            }
+            self.painted_player_image = self.player_image.clone();
+        }
     }
 
     pub fn dismiss_alert(&self, cx: &mut Context<Self>) {
@@ -6866,6 +6906,7 @@ impl MatrixClient {
 
 impl Render for MatrixClient {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.release_player_texture(window);
         self.release_retired_images(cx);
         self.restore_history_anchor(window, cx);
         self.wire_composer(cx);

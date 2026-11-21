@@ -37,7 +37,7 @@ icons.workspace = true
 ui.workspace = true
 raw-window-handle = "0.6"
 tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }
-windows-sys.workspace = true
+windows-sys = { workspace = true, features = ["Win32_System_ProcessStatus", "Win32_System_Threading"] }
 tao = "0.37"
 wry = "0.57"
 
