@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "huddle"
+path = "src/main.rs"
+
 [features]
 profiler = ["gpui/profiler"]
 

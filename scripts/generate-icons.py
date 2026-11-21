@@ -2,6 +2,7 @@
 
 import math
 import re
+import runpy
 import shutil
 import struct
 import subprocess
@@ -258,7 +259,7 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         workdir = Path(tmp)
 
-        scalable = assets / "linux" / "sonora.svg"
+        scalable = assets / "linux" / "huddle.svg"
         scalable.parent.mkdir(parents=True, exist_ok=True)
         scalable.write_text(round_svg(master, 512), encoding="utf-8")
 
@@ -275,7 +276,7 @@ def main():
                 / "hicolor"
                 / f"{pixels}x{pixels}"
                 / "apps"
-                / "sonora.png"
+                / "huddle.png"
             )
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(blob)
@@ -288,7 +289,7 @@ def main():
                     squircle_svg(master, pixels), pixels, workdir, f"m{pixels}"
                 )
             icns.append((kind, rendered[pixels]))
-        write_icns(icns, assets / "macos" / "sonora.icns")
+        write_icns(icns, assets / "macos" / "huddle.icns")
 
         ico = [
             (
@@ -299,14 +300,15 @@ def main():
         ]
         windows = assets / "windows"
         windows.mkdir(parents=True, exist_ok=True)
-        write_ico(ico, windows / "sonora.ico")
+        write_ico(ico, windows / "huddle.ico")
+        runpy.run_path(str(ROOT / "scripts/generate-windows-wizard.py"), run_name="__main__")
 
         tray = assets / "tray"
         tray.mkdir(parents=True, exist_ok=True)
         for pixels in TRAY_SIZES:
             blob = rasterize(template_svg(master), pixels, workdir, f"t{pixels}")
             (tray / f"template-{pixels}.png").write_bytes(blob)
-        (tray / "sonora.png").write_bytes(
+        (tray / "huddle.png").write_bytes(
             rasterize(round_svg(master, 32), 32, workdir, "tray")
         )
 

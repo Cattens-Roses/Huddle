@@ -17,7 +17,7 @@ pub(super) struct Showcase {
 }
 
 impl Showcase {
-    pub(super) fn new(cx: &mut Context<BaseApp>) -> Self {
+    pub(super) fn new(cx: &mut Context<Huddle>) -> Self {
         let owner = cx.entity_id();
         Self {
             scroll: cx.new(|_| Scrollbar::new(ScrollHandle::new()).watching(owner)),
@@ -34,7 +34,7 @@ impl Showcase {
     }
 }
 
-impl BaseApp {
+impl Huddle {
     fn show_notification(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
         self.demo.toast_generation = self.demo.toast_generation.wrapping_add(1);
         self.demo.toast_closing = false;

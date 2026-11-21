@@ -1,9 +1,9 @@
 # Third-party licenses
 
-Sonora is licensed under the GNU General Public License v3.0 or later; the full
+Huddle is licensed under the GNU General Public License v3.0 or later; the full
 text is in `COPYING`. GPUI pulls in `zlog`, `ztracing` and `ztracing_macro` from
 the Zed repository, which carry the same license. The complete corresponding
-source is the tagged commit of <https://github.com/sonorahq/sonora> together
+source is the tagged commit of <https://github.com/Cattens-Roses/Huddle> together
 with the dependency revisions pinned in `Cargo.lock`.
 
 The binary embeds:
@@ -20,7 +20,7 @@ Symphonia decoders, `option-ext` and `priority-queue`. They are used unmodified;
 their source is available from the upstream repositories linked below and from
 <https://crates.io>.
 
-Where a dependency offers a choice of licenses, Sonora relies on the permissive
+Where a dependency offers a choice of licenses, Huddle relies on the permissive
 option: Apache-2.0 for `self_cell`, MPL-2.0 for `priority-queue`.
 
 Each section lists the crates covered by that license and the copyright notices

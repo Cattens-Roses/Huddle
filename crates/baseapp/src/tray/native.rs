@@ -8,17 +8,17 @@ use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIc
 
 use super::{Art, Event, Shown};
 
-const TOOLTIP: &str = "Sonora";
+const TOOLTIP: &str = "Huddle";
 const PNG: &[u8] = match cfg!(target_os = "macos") {
     true => include_bytes!("../../../../assets/tray/template-64.png"),
-    false => include_bytes!("../../../../assets/tray/sonora.png"),
+    false => include_bytes!("../../../../assets/tray/huddle.png"),
 };
 const MENU_ON_CLICK: bool = cfg!(target_os = "macos");
 
 /// The tray icon and its menu. The status item is built the first time it goes into the tray, so
-/// a Sonora started with the icon off never shows it, not even for a frame.
+/// a Huddle started with the icon off never shows it, not even for a frame.
 pub struct Icon {
-    /// The Sonora logo the status item is built with.
+    /// The Huddle logo the status item is built with.
     logo: tray_icon::Icon,
     menu: Menu,
     icon: Option<TrayIcon>,
@@ -114,7 +114,7 @@ impl Icon {
         })
     }
 
-    /// Whether there is a tray to bring Sonora back from, which Windows and macOS always have.
+    /// Whether there is a tray to bring Huddle back from, which Windows and macOS always have.
     pub fn hosted() -> bool {
         true
     }
@@ -149,7 +149,7 @@ impl Icon {
 
     pub fn show(&mut self, shown: &Shown) {
         // the status notifier hosts read the caption off the tooltip themselves; here it has to
-        // be pushed, or hovering the icon only ever says Sonora
+        // be pushed, or hovering the icon only ever says Huddle
         self.tooltip.clone_from(&shown.caption);
         if let Some(icon) = &self.icon
             && let Err(error) = icon.set_tooltip(Some(&shown.caption))

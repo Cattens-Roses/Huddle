@@ -144,7 +144,7 @@ struct AmbientTransition {
     started: Instant,
 }
 
-struct BaseApp {
+struct Huddle {
     page: Page,
     theme: ThemeKind,
     rounding: Rounding,
@@ -229,7 +229,18 @@ impl Preferences {
         let Some(path) = preferences_path() else {
             return prefs;
         };
-        let Ok(contents) = std::fs::read_to_string(path) else {
+        let contents = std::fs::read_to_string(&path).or_else(|error| {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error);
+            }
+            // Read preferences from installations made before the Huddle rename.
+            let legacy = path
+                .parent()
+                .and_then(|parent| parent.parent())
+                .map(|base| base.join("baseapp").join("appearance.cfg"));
+            legacy.map_or(Err(error), std::fs::read_to_string)
+        });
+        let Ok(contents) = contents else {
             return prefs;
         };
         Self::parse(&contents)
@@ -330,7 +341,7 @@ fn preferences_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    Some(base.join("baseapp").join("appearance.cfg"))
+    Some(base.join("huddle").join("appearance.cfg"))
 }
 
 #[cfg(test)]
@@ -370,7 +381,7 @@ mod notification_preferences_tests {
     }
 }
 
-impl BaseApp {
+impl Huddle {
     fn new(prefs: Preferences, cx: &mut Context<Self>) -> Self {
         let owner = cx.entity_id();
         updater::init(prefs.auto_update);
@@ -890,7 +901,7 @@ impl BaseApp {
     }
 }
 
-impl Render for BaseApp {
+impl Render for Huddle {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.theme();
         let sidebar_open = self.sidebar_open && self.page != Page::Home;
@@ -940,7 +951,7 @@ impl Render for BaseApp {
             .border_color(theme.sidebar_border)
             .child(
                 svg()
-                    .path(icons::path("icons/baseapp.svg"))
+                    .path(icons::path("icons/huddle.svg"))
                     .size(px(30.))
                     .text_color(theme.foreground),
             )
@@ -1669,14 +1680,14 @@ fn main() {
                         }),
                         app_owns_titlebar_drag: true,
                         window_min_size: Some(gpui::size(px(480.), px(400.))),
-                        app_id: Some("baseapp".into()),
+                        app_id: Some("huddle".into()),
                         ..Default::default()
                     },
                     {
                         move |window, cx| {
                             window.on_window_should_close(cx, presence::allow_close);
                             window.set_rem_size(cx.theme().font_size);
-                            let view = cx.new(|cx| BaseApp::new(prefs, cx));
+                            let view = cx.new(|cx| Huddle::new(prefs, cx));
                             view.update(cx, |this, cx| {
                                 this.appearance_observer = Some(cx.observe_window_appearance(
                                     window,

@@ -9,12 +9,12 @@ fi
 REPO="$1"
 TAG="$2"
 OUT="$3"
-APP=io.github.nolight132.sonora
+APP=io.github.nolight132.huddle
 BRANCH=stable
 RUNTIME_REPO=https://flathub.org/repo/flathub.flatpakrepo
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
-FLATPAKREPO="$SCRIPT_DIR/pages/sonora.flatpakrepo"
+FLATPAKREPO="$SCRIPT_DIR/pages/huddle.flatpakrepo"
 
 URL="$(sed -n 's/^Url=//p' "$FLATPAKREPO")"
 KEYRING="$(mktemp)"
@@ -30,7 +30,7 @@ if [ -z "$ARCHES" ]; then
 fi
 
 for arch in $ARCHES; do
-  bundle="$OUT/sonora-$TAG-$arch.flatpak"
+  bundle="$OUT/huddle-$TAG-$arch.flatpak"
   echo "==> $bundle"
   flatpak build-bundle \
     --arch="$arch" \

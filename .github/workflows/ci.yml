@@ -39,5 +39,5 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
-      - name: Check baseapp
+      - name: Check huddle
         run: cargo check --locked -p baseapp

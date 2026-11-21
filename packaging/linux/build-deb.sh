@@ -17,9 +17,9 @@ mkdir -p \
   "$stage/usr/share/applications" \
   "$stage/usr/share/icons/hicolor/scalable/apps"
 
-install -m 755 "target/${target}/release/baseapp" "$stage/usr/bin/huddle"
+install -m 755 "target/${target}/release/huddle" "$stage/usr/bin/huddle"
 install -m 644 packaging/linux/huddle.desktop "$stage/usr/share/applications/huddle.desktop"
-install -m 644 assets/linux/baseapp.svg "$stage/usr/share/icons/hicolor/scalable/apps/huddle.svg"
+install -m 644 assets/linux/huddle.svg "$stage/usr/share/icons/hicolor/scalable/apps/huddle.svg"
 
 cat > "$stage/DEBIAN/control" <<EOF
 Package: huddle

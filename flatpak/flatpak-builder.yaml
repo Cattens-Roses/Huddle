@@ -1,4 +1,4 @@
-id: io.github.nolight132.sonora
+id: io.github.nolight132.huddle
 branch: stable
 
 runtime: org.gnome.Platform
@@ -7,7 +7,7 @@ sdk: org.gnome.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
 
-command: sonora
+command: huddle
 finish-args:
   - --socket=wayland # Permission needed to show the window
   - --socket=fallback-x11 # Permission needed to show the window on legacy windowing systems
@@ -31,20 +31,20 @@ finish-args:
   - --talk-name=org.kde.StatusNotifierWatcher
 
   # MPRIS media controls
-  - --own-name=org.mpris.MediaPlayer2.sonora
+  - --own-name=org.mpris.MediaPlayer2.huddle
 
 modules:
-  - name: sonora
+  - name: huddle
     buildsystem: simple
     build-options:
       append-path: /usr/lib/sdk/rust-stable/bin
       env:
-        CARGO_HOME: /run/build/sonora/cargo
+        CARGO_HOME: /run/build/huddle/cargo
         CARGO_NET_OFFLINE: 'true'
     sources:
       # Use source from GitHub:
       #- type: git
-      #  url: https://github.com/sonorahq/sonora.git
+      #  url: https://github.com/Cattens-Roses/Huddle.git
       #  tag: v0.28.0
 
       # Use source from this machine:
@@ -68,24 +68,24 @@ modules:
       - test -f cargo/config && mv cargo/config cargo/config.toml || true
 
       # Build directly - Cargo will automatically use $CARGO_HOME/config
-      - cargo build --offline --locked --release --package sonora
+      - cargo build --offline --locked --release --package baseapp
 
       # Collect info as suggested by: https://v2.tauri.app/distribute/flatpak/
       # Install binary to /app/bin
-      - install -Dm755 "target/release/sonora" /app/bin/sonora
+      - install -Dm755 "target/release/huddle" /app/bin/huddle
 
       # Install desktop icons
-      - for icon in assets/linux/icons/hicolor/*/apps/sonora.png; do install -Dm644 "$icon" "/app/share/icons/hicolor/$(basename "$(dirname "$(dirname "$icon")")")/apps/io.github.nolight132.sonora.png"; done
-      - install -Dm644 assets/linux/sonora.svg /app/share/icons/hicolor/scalable/apps/io.github.nolight132.sonora.svg
+      - for icon in assets/linux/icons/hicolor/*/apps/huddle.png; do install -Dm644 "$icon" "/app/share/icons/hicolor/$(basename "$(dirname "$(dirname "$icon")")")/apps/io.github.nolight132.huddle.png"; done
+      - install -Dm644 assets/linux/huddle.svg /app/share/icons/hicolor/scalable/apps/io.github.nolight132.huddle.svg
 
       # Install Desktop File and AppData Metainfo
       - install -d /app/share/applications /app/share/metainfo
-      - sed 's/^Icon=sonora$/Icon=io.github.nolight132.sonora/' assets/linux/sonora.desktop > /app/share/applications/io.github.nolight132.sonora.desktop
-      - sed -e "s/@VERSION@/$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)/" -e "s/@DATE@/$(date -I)/" flatpak/io.github.nolight132.sonora.metainfo.xml > /app/share/metainfo/io.github.nolight132.sonora.metainfo.xml
+      - sed 's/^Icon=huddle$/Icon=io.github.nolight132.huddle/' assets/linux/huddle.desktop > /app/share/applications/io.github.nolight132.huddle.desktop
+      - sed -e "s/@VERSION@/$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)/" -e "s/@DATE@/$(date -I)/" flatpak/io.github.nolight132.huddle.metainfo.xml > /app/share/metainfo/io.github.nolight132.huddle.metainfo.xml
 
       # Install licenses
-      - install -Dm644 COPYING /app/share/licenses/io.github.nolight132.sonora/LICENSE
-      - install -Dm644 THIRD-PARTY.md /app/share/licenses/io.github.nolight132.sonora/THIRD-PARTY.md
-      - install -Dm644 assets/fonts/LICENSE.txt /app/share/licenses/io.github.nolight132.sonora/LICENSE.Inter
-      - install -Dm644 assets/icons/LICENSE /app/share/licenses/io.github.nolight132.sonora/icons/LICENSE
-      - for licence in assets/icons/*/LICENSE; do install -Dm644 "$licence" "/app/share/licenses/io.github.nolight132.sonora/icons/LICENSE.$(basename "$(dirname "$licence")")"; done
+      - install -Dm644 COPYING /app/share/licenses/io.github.nolight132.huddle/LICENSE
+      - install -Dm644 THIRD-PARTY.md /app/share/licenses/io.github.nolight132.huddle/THIRD-PARTY.md
+      - install -Dm644 assets/fonts/LICENSE.txt /app/share/licenses/io.github.nolight132.huddle/LICENSE.Inter
+      - install -Dm644 assets/icons/LICENSE /app/share/licenses/io.github.nolight132.huddle/icons/LICENSE
+      - for licence in assets/icons/*/LICENSE; do install -Dm644 "$licence" "/app/share/licenses/io.github.nolight132.huddle/icons/LICENSE.$(basename "$(dirname "$licence")")"; done

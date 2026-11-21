@@ -1,5 +1,5 @@
 {
-  description = "Sonora Base - a native desktop UI shell";
+  description = "Huddle Base - a native desktop UI shell";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -91,15 +91,15 @@
           );
 
           alsaPluginDirectory = pkgs.symlinkJoin {
-            name = "sonora-alsa-plugins";
+            name = "huddle-alsa-plugins";
             paths = [
               "${pkgs.pipewire}/lib/alsa-lib"
               "${pkgs.alsa-plugins}/lib/alsa-lib"
             ];
           };
 
-          sonora = pkgs.rustPlatform.buildRustPackage (final: {
-            pname = "sonora";
+          huddle = pkgs.rustPlatform.buildRustPackage (final: {
+            pname = "huddle";
             inherit ((lib.importTOML (final.src + /Cargo.toml)).workspace.package) version;
 
             src = ./.;
@@ -167,40 +167,40 @@
             installPhase = ''
               runHook preInstall
 
-              install -Dm755 target/release/sonora "$out/bin/sonora"
+              install -Dm755 target/release/huddle "$out/bin/huddle"
               ${
                 if pkgs.stdenv.hostPlatform.isDarwin then
                   ''
-                    install -Dm755 target/release/sonora "$out/Applications/Sonora.app/Contents/MacOS/sonora"
-                    install -Dm444 "$src/assets/macos/sonora.icns" \
-                      "$out/Applications/Sonora.app/Contents/Resources/sonora.icns"
+                    install -Dm755 target/release/huddle "$out/Applications/Huddle.app/Contents/MacOS/huddle"
+                    install -Dm444 "$src/assets/macos/huddle.icns" \
+                      "$out/Applications/Huddle.app/Contents/Resources/huddle.icns"
 
                     sed \
                       "s/@VERSION@/$version/g" \
                       "$src/assets/macos/Info.plist" \
-                      > "$out/Applications/Sonora.app/Contents/Info.plist"
+                      > "$out/Applications/Huddle.app/Contents/Info.plist"
 
-                    LICENSE_DIR="$out/Applications/Sonora.app/Contents/Resources"
+                    LICENSE_DIR="$out/Applications/Huddle.app/Contents/Resources"
                   ''
                 else
                   ''
-                    install -Dm444 "$src/assets/linux/sonora.desktop" \
-                      "$out/share/applications/sonora.desktop"
-                    install -Dm444 "$src/assets/linux/sonora.svg" \
-                      "$out/share/icons/hicolor/scalable/apps/sonora.svg"
-                    for icon in "$src"/assets/linux/icons/hicolor/*/apps/sonora.png; do
+                    install -Dm444 "$src/assets/linux/huddle.desktop" \
+                      "$out/share/applications/huddle.desktop"
+                    install -Dm444 "$src/assets/linux/huddle.svg" \
+                      "$out/share/icons/hicolor/scalable/apps/huddle.svg"
+                    for icon in "$src"/assets/linux/icons/hicolor/*/apps/huddle.png; do
                       size="$(basename "$(dirname "$(dirname "$icon")")")"
                       install -Dm444 "$icon" \
-                        "$out/share/icons/hicolor/$size/apps/sonora.png"
+                        "$out/share/icons/hicolor/$size/apps/huddle.png"
                     done
 
-                    LICENSE_DIR="$out/share/licenses/sonora"
+                    LICENSE_DIR="$out/share/licenses/huddle"
                   ''
               }
               install -Dm444 "$src/COPYING" "$LICENSE_DIR/LICENSE"
               install -Dm444 "$src/THIRD-PARTY.md" "$LICENSE_DIR/THIRD-PARTY.md"
               install -Dm444 "$src/assets/fonts/LICENSE.txt" \
-                "$LICENSE_DIR/sonora/LICENSE.Inter"
+                "$LICENSE_DIR/huddle/LICENSE.Inter"
               for licence in "$src/assets/icons"/*/LICENSE; do
                 pack="$(basename "$(dirname "$licence")")"
                 install -Dm444 "$licence" \
@@ -212,15 +212,15 @@
               runHook postInstall
             '';
 
-            inherit (sonora-bin) meta;
+            inherit (huddle-bin) meta;
           });
 
-          sonora-bin = pkgs.stdenv.mkDerivation {
-            pname = "sonora-bin";
+          huddle-bin = pkgs.stdenv.mkDerivation {
+            pname = "huddle-bin";
             inherit (release) version;
 
             src = pkgs.fetchurl {
-              url = "https://github.com/sonorahq/sonora/releases/download/v${release.version}/sonora-v${release.version}-${asset.target}${
+              url = "https://github.com/Cattens-Roses/Huddle/releases/download/v${release.version}/huddle-v${release.version}-${asset.target}${
                 if pkgs.stdenv.hostPlatform.isDarwin then ".dmg" else ""
               }";
               inherit (asset) hash;
@@ -240,27 +240,27 @@
               if pkgs.stdenv.hostPlatform.isLinux then
                 ''
                   runHook preInstall
-                  install -Dm755 "$src" "$out/bin/sonora"
-                  install -Dm444 ${./assets/linux/sonora.desktop} \
-                    "$out/share/applications/sonora.desktop"
-                  install -Dm444 ${./assets/linux/sonora.svg} \
-                    "$out/share/icons/hicolor/scalable/apps/sonora.svg"
-                  for icon in ${./assets/linux/icons}/hicolor/*/apps/sonora.png; do
+                  install -Dm755 "$src" "$out/bin/huddle"
+                  install -Dm444 ${./assets/linux/huddle.desktop} \
+                    "$out/share/applications/huddle.desktop"
+                  install -Dm444 ${./assets/linux/huddle.svg} \
+                    "$out/share/icons/hicolor/scalable/apps/huddle.svg"
+                  for icon in ${./assets/linux/icons}/hicolor/*/apps/huddle.png; do
                     size="$(basename "$(dirname "$(dirname "$icon")")")"
                     install -Dm444 "$icon" \
-                      "$out/share/icons/hicolor/$size/apps/sonora.png"
+                      "$out/share/icons/hicolor/$size/apps/huddle.png"
                   done
-                  install -Dm444 ${./COPYING} "$out/share/licenses/sonora/LICENSE"
-                  install -Dm444 ${./THIRD-PARTY.md} "$out/share/licenses/sonora/THIRD-PARTY.md"
+                  install -Dm444 ${./COPYING} "$out/share/licenses/huddle/LICENSE"
+                  install -Dm444 ${./THIRD-PARTY.md} "$out/share/licenses/huddle/THIRD-PARTY.md"
                   install -Dm444 ${./assets/fonts/LICENSE.txt} \
-                    "$out/share/licenses/sonora/LICENSE.Inter"
+                    "$out/share/licenses/huddle/LICENSE.Inter"
                   for licence in ${./assets/icons}/*/LICENSE; do
                     pack="$(basename "$(dirname "$licence")")"
                     install -Dm444 "$licence" \
-                      "$out/share/licenses/sonora/icons/LICENSE.$pack"
+                      "$out/share/licenses/huddle/icons/LICENSE.$pack"
                   done
                   install -Dm444 ${./assets/icons/LICENSE} \
-                    "$out/share/licenses/sonora/icons/LICENSE"
+                    "$out/share/licenses/huddle/icons/LICENSE"
                   runHook postInstall
                 ''
               else
@@ -269,11 +269,11 @@
                   mnt="$(mktemp -d)"
                   /usr/bin/hdiutil attach -readonly -nobrowse -mountpoint "$mnt" "$src"
                   mkdir -p "$out/Applications" "$out/bin"
-                  cp -R "$mnt/Sonora.app" "$out/Applications/Sonora.app"
+                  cp -R "$mnt/Huddle.app" "$out/Applications/Huddle.app"
                   /usr/bin/hdiutil detach "$mnt"
                   makeBinaryWrapper \
-                    "$out/Applications/Sonora.app/Contents/MacOS/sonora" \
-                    "$out/bin/sonora"
+                    "$out/Applications/Huddle.app/Contents/MacOS/huddle" \
+                    "$out/bin/huddle"
                   runHook postInstall
                 '';
 
@@ -281,16 +281,16 @@
               patchelf \
                 --set-interpreter "${pkgs.stdenv.cc.bintools.dynamicLinker}" \
                 --add-rpath "${lib.makeLibraryPath (runtimeLibraries ++ [ pkgs.stdenv.cc.cc.lib ])}" \
-                "$out/bin/sonora"
-              wrapProgram "$out/bin/sonora" \
+                "$out/bin/huddle"
+              wrapProgram "$out/bin/huddle" \
                 --set ALSA_PLUGIN_DIR ${alsaPluginDirectory} \
                 --prefix GIO_EXTRA_MODULES : ${pkgs.glib-networking}/lib/gio/modules \
                 --prefix GST_PLUGIN_SYSTEM_PATH_1_0 : ${gstPluginPath}
             '';
 
             meta = {
-              description = "A minimal native desktop app with Sonora's UI and appearance settings";
-              mainProgram = "sonora";
+              description = "A minimal native desktop app with Huddle's UI and appearance settings";
+              mainProgram = "huddle";
               license = with lib.licenses; [
                 gpl3Plus
                 ofl
@@ -301,13 +301,13 @@
           };
         in
         {
-          inherit sonora;
-          default = sonora;
+          inherit huddle;
+          default = huddle;
         }
         // lib.optionalAttrs (builtins.hasAttr pkgs.stdenv.hostPlatform.system release.assets) {
-          inherit sonora-bin;
-          sonora = sonora-bin;
-          default = sonora-bin;
+          inherit huddle-bin;
+          huddle = huddle-bin;
+          default = huddle-bin;
         }
       );
 
@@ -413,12 +413,12 @@
       );
 
       overlays.default = final: _prev: {
-        sonora = self.packages.${final.stdenv.hostPlatform.system}.default;
+        huddle = self.packages.${final.stdenv.hostPlatform.system}.default;
       };
 
       homeManagerModules = {
         default = import ./nix/modules/hm-module.nix self;
-        sonora = import ./nix/modules/hm-module.nix self;
+        huddle = import ./nix/modules/hm-module.nix self;
       };
 
       homeModules = self.homeManagerModules;

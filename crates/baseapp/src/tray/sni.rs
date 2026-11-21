@@ -6,9 +6,9 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use super::{Art, Event, Shown};
 
-const ID: &str = "sonora";
-const ICON_NAME: &str = "sonora";
-const PNG: &[u8] = include_bytes!("../../../../assets/tray/sonora.png");
+const ID: &str = "huddle";
+const ICON_NAME: &str = "huddle";
+const PNG: &[u8] = include_bytes!("../../../../assets/tray/huddle.png");
 /// Flatpak writes this file into every sandbox it starts.
 const FLATPAK_INFO: &str = "/.flatpak-info";
 const WATCHER: &str = "org.kde.StatusNotifierWatcher";
@@ -50,7 +50,7 @@ impl Icon {
         Some(Self { item, handle: None })
     }
 
-    /// Whether a status notifier watcher is on the session bus, so there is a tray to bring Sonora
+    /// Whether a status notifier watcher is on the session bus, so there is a tray to bring Huddle
     /// back from. It asks the bus, not the watcher, so it works while the icon is out.
     pub fn hosted() -> bool {
         match watched() {
@@ -137,7 +137,7 @@ impl ksni::Tray for Item {
     }
 
     fn title(&self) -> String {
-        "Sonora".to_owned()
+        "Huddle".to_owned()
     }
 
     fn icon_name(&self) -> String {
@@ -150,7 +150,7 @@ impl ksni::Tray for Item {
 
     fn tool_tip(&self) -> ToolTip {
         ToolTip {
-            title: "Sonora".to_owned(),
+            title: "Huddle".to_owned(),
             description: self
                 .shown
                 .as_ref()
@@ -209,7 +209,7 @@ fn sandboxed() -> bool {
 }
 
 /// The themed icon to ask the host for, or none when the host's theme cannot be counted on to
-/// have it. A Flatpak or AppImage install puts no `sonora` icon where the host looks, and hosts
+/// have it. A Flatpak or AppImage install puts no `huddle` icon where the host looks, and hosts
 /// such as Quickshell draw a placeholder for a name they cannot find rather than the pixmap.
 fn icon_name(sandboxed: bool) -> String {
     let packaged = sandboxed || std::env::var_os("APPIMAGE").is_some();

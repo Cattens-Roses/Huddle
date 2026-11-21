@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use gpui::App;
-use state::Sonora;
+use state::Huddle;
 
 /// How often freed heap pages go back to the kernel. The first time comes after half of it, while
 /// startup is still settling.
@@ -51,7 +51,7 @@ pub fn watch(cx: &mut App) {
                     .await;
                 cx.update(|cx| report(probed, cx));
             }
-            if cx.update(|cx| Sonora::global(cx).wake.read(cx).watched()) {
+            if cx.update(|cx| Huddle::global(cx).wake.read(cx).watched()) {
                 continue;
             }
             let shedding = started.elapsed() >= shed_at;
@@ -76,7 +76,7 @@ pub fn watch(cx: &mut App) {
 fn report(probed: (Footprint, Option<usize>), cx: &mut App) {
     let (footprint, resident) = probed;
     let (entries, bytes) = ui::artwork_usage(cx).unwrap_or((0, 0));
-    let queue = Sonora::global(cx).queue.read(cx);
+    let queue = Huddle::global(cx).queue.read(cx);
     let past = queue.past().len();
     let ahead = queue.upcoming().len() + queue.similar().len();
 

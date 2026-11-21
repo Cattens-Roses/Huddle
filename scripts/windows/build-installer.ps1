@@ -1,6 +1,6 @@
 param(
     [string]$Version = "0.0.0",
-    [string]$Executable = "target/release/sonora.exe",
+    [string]$Executable = "target/release/huddle.exe",
     [string]$Output = "dist"
 )
 
@@ -18,11 +18,11 @@ if (-not $iscc) {
     throw "Inno Setup 6 is not installed"
 }
 
-$env:SONORA_VERSION = $Version.TrimStart("v")
-$env:SONORA_EXE = $source.Path
-$env:SONORA_DIST = (Resolve-Path $outputPath).Path
+$env:HUDDLE_VERSION = $Version.TrimStart("v")
+$env:HUDDLE_EXE = $source.Path
+$env:HUDDLE_DIST = (Resolve-Path $outputPath).Path
 
-& $iscc (Join-Path $PSScriptRoot "sonora.iss")
+& $iscc (Join-Path $root "packaging/windows/huddle.iss")
 if ($LASTEXITCODE -ne 0) {
     throw "Inno Setup failed with exit code $LASTEXITCODE"
 }

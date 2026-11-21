@@ -76,6 +76,6 @@ echo "==> Build complete!"
 
 echo "==> Packaging into .flatpak"
 
-flatpak build-bundle flatpak-repo sonora.flatpak io.github.nolight132.sonora
+flatpak build-bundle flatpak-repo huddle.flatpak io.github.nolight132.huddle
 
 echo "==> Finished"

@@ -6,9 +6,9 @@ use env_logger::{Env, Logger, Target};
 use log::{Log, Metadata, Record};
 
 const CONSOLE: &str = "warn,symphonia=error,lofty=error,discord_rich_presence=error";
-const DISK: &str = "warn,symphonia=error,lofty=error,discord_rich_presence=error,sonora=debug,ui=debug,music=debug,ytmusic=debug";
-const FILTER: &str = "SONORA_LOG";
-const PREVIOUS: &str = "sonora.log.1";
+const DISK: &str = "warn,symphonia=error,lofty=error,discord_rich_presence=error,huddle=debug,ui=debug,music=debug,ytmusic=debug";
+const FILTER: &str = "HUDDLE_LOG";
+const PREVIOUS: &str = "huddle.log.1";
 const LIMIT: u64 = 16 * 1024 * 1024;
 
 /// Logs to stderr only, for a process that is not the app, such as the Widevine host.
@@ -43,10 +43,10 @@ pub fn init() {
     }
     catch_panics();
 
-    log::debug!("logging: sonora {} started", env!("CARGO_PKG_VERSION"));
+    log::debug!("logging: huddle {} started", env!("CARGO_PKG_VERSION"));
 }
 
-/// Writes a panic to the log before the default hook prints it. A Sonora started from a
+/// Writes a panic to the log before the default hook prints it. A Huddle started from a
 /// desktop entry or a tray has no terminal to lose it to, so this is the only place a crash
 /// leaves a trace. `RUST_BACKTRACE` still decides whether there is a backtrace to write.
 fn catch_panics() {

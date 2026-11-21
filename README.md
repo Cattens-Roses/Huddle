@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="/assets/tray/sonora.png" alt="Huddle" width="128" height="128">
+  <img src="/assets/tray/huddle.png" alt="Huddle" width="128" height="128">
 </p>
 
 <h1 align="center">Huddle</h1>
@@ -89,6 +89,12 @@ cargo test -p baseapp system_audio_and_video_playback_smoke -- --ignored
 - `packaging` - Linux `.deb`, Windows installer, and update manifest scripts
 - `flatpak` / `nix` - packaging and Nix flake support
 - `.github` - CI, beta release, apt repo publish, issue templates
+
+The Cargo package remains `baseapp`; its executable is `huddle` (`huddle.exe` on Windows).
+Windows releases ship it as `Huddle.exe`. Build an installer with
+`scripts/windows/build-installer.ps1 -Version 0.42.2` after a release build.
+The installer uses `assets/windows/huddle.ico`; after changing that icon, run
+`python scripts/generate-windows-wizard.py` to refresh its wizard panels (requires Pillow).
 
 ## Media notes
 

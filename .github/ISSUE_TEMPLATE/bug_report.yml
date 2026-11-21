@@ -6,10 +6,10 @@ body:
   - type: markdown
     attributes:
       value: |
-        A log turns a bug report into a fix. Sonora writes one to
-        `~/.local/state/sonora/sonora.log` on Linux, `~/Library/Caches/sonora/sonora.log` on macOS
-        and `%LOCALAPPDATA%\sonora\sonora.log` on Windows. Reproduce the problem first, then attach
-        the tail of that file. `SONORA_LOG=debug` on the command line makes it more detailed.
+        A log turns a bug report into a fix. Huddle writes one to
+        `~/.local/state/huddle/huddle.log` on Linux, `~/Library/Caches/huddle/huddle.log` on macOS
+        and `%LOCALAPPDATA%\huddle\huddle.log` on Windows. Reproduce the problem first, then attach
+        the tail of that file. `HUDDLE_LOG=debug` on the command line makes it more detailed.
 
   - type: textarea
     id: summary
@@ -33,7 +33,7 @@ body:
   - type: input
     id: version
     attributes:
-      label: Sonora version
+      label: Huddle version
       description: The first line of the log file names it.
       placeholder: 0.29.0
     validations:
@@ -108,7 +108,7 @@ body:
     id: logs
     attributes:
       label: Log
-      description: The tail of sonora.log covering the moment it went wrong. Do not paste a screenshot of it.
+      description: The tail of huddle.log covering the moment it went wrong. Do not paste a screenshot of it.
       render: text
     validations:
       required: true

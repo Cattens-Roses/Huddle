@@ -7,5 +7,5 @@ Icon=huddle
 Exec=huddle
 Terminal=false
 Categories=Network;InstantMessaging;
-StartupWMClass=baseapp
+StartupWMClass=huddle
 StartupNotify=true

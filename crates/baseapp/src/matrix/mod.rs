@@ -2745,7 +2745,7 @@ impl MatrixClient {
             .justify_center()
             .gap_3()
             .text_color(theme.muted_foreground)
-            .child(icon("icons/baseapp.svg", px(40.), theme.foreground))
+            .child(icon("icons/huddle.svg", px(40.), theme.foreground))
             .child("Connecting to Matrix…")
             .into_any_element()
     }
@@ -2848,7 +2848,7 @@ impl MatrixClient {
                     .items_center()
                     .gap_2()
                     .text_center()
-                    .child(icon("icons/baseapp.svg", px(44.), theme.primary))
+                    .child(icon("icons/huddle.svg", px(44.), theme.primary))
                     .child(
                         div()
                             .text_size(theme.text(Text::Title))

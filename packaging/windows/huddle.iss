@@ -15,7 +15,8 @@ AppPublisher={#AppPublisher}
 DefaultDirName={localappdata}\Programs\{#AppName}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
-UninstallDisplayIcon={app}\{#AppExeName}
+UninstallDisplayIcon={app}\{#AppExeName},0
+SetupIconFile=..\..\assets\windows\huddle.ico
 OutputDir={#OutputDir}
 OutputBaseFilename={#SetupName}
 Compression=lzma2
@@ -25,6 +26,9 @@ ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=commandline dialog
 WizardStyle=modern
+WizardImageFile=..\..\assets\windows\wizard.bmp
+WizardSmallImageFile=..\..\assets\windows\wizard-small.bmp
+WizardImageStretch=yes
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"
@@ -35,5 +39,5 @@ Source: "..\..\COPYING"; DestDir: "{app}"; DestName: "LICENSE"; Flags: ignorever
 Source: "..\..\THIRD-PARTY.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"
-Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
+Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\{#AppExeName}"; IconIndex: 0; AppUserModelID: "app.huddle.desktop"
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\{#AppExeName}"; IconIndex: 0; AppUserModelID: "app.huddle.desktop"; Tasks: desktopicon

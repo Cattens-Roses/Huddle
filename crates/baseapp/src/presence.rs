@@ -7,12 +7,12 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
-use crate::BaseApp;
+use crate::Huddle;
 
 static QUITTING: AtomicBool = AtomicBool::new(false);
 
 struct Seat {
-    window: WindowHandle<BaseApp>,
+    window: WindowHandle<Huddle>,
     _icon: TrayIcon,
     _watch: Task<()>,
 }
@@ -21,7 +21,7 @@ impl Global for Seat {}
 
 /// Keeps a tray icon for the life of the process. Returns whether the icon is up, so closing
 /// the window can stay in the tray instead of ending the process.
-pub fn install(window: WindowHandle<BaseApp>, cx: &mut App) -> bool {
+pub fn install(window: WindowHandle<Huddle>, cx: &mut App) -> bool {
     let Ok(icon) = mark() else {
         log::warn!("tray: the icon could not be built");
         return false;
@@ -183,22 +183,9 @@ fn place(window: &Window, shown: bool) -> bool {
     }
 }
 
-fn mark() -> Result<tray_icon::Icon, tray_icon::BadIcon> {
-    const SIZE: u32 = 32;
-    let mut pixels = vec![0u8; (SIZE * SIZE * 4) as usize];
-    let center = (SIZE as f32 - 1.) / 2.;
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let dx = x as f32 - center;
-            let dy = y as f32 - center;
-            if (dx * dx + dy * dy).sqrt() <= 14.5 {
-                let index = ((y * SIZE + x) * 4) as usize;
-                pixels[index] = 88;
-                pixels[index + 1] = 101;
-                pixels[index + 2] = 242;
-                pixels[index + 3] = 255;
-            }
-        }
-    }
-    tray_icon::Icon::from_rgba(pixels, SIZE, SIZE)
+fn mark() -> anyhow::Result<tray_icon::Icon> {
+    let image = image::load_from_memory(include_bytes!("../../../assets/tray/huddle.png"))?
+        .resize_exact(32, 32, image::imageops::FilterType::Lanczos3)
+        .into_rgba8();
+    Ok(tray_icon::Icon::from_rgba(image.into_raw(), 32, 32)?)
 }

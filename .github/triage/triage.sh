@@ -14,7 +14,7 @@ set -euo pipefail
 root="$(git rev-parse --show-toplevel)"
 config="$root/.github/triage/config.yml"
 system="$root/.github/triage/prompt.md"
-marker="<!-- sonora-triage:needs-info -->"
+marker="<!-- huddle-triage:needs-info -->"
 
 repo="${REPO:-${GITHUB_REPOSITORY:-}}"
 issue="${ISSUE:?the issue number is required}"
@@ -34,7 +34,7 @@ ask() {
     -H "Authorization: Bearer $TRIAGE_API_KEY" \
     -H 'Content-Type: application/json' \
     -H "x-opencode-session: $session" \
-    -A "sonora-triage/1.0" \
+    -A "huddle-triage/1.0" \
     -d "$1" \
     "$base/chat/completions"
 }
@@ -80,7 +80,7 @@ request="$(jq -n \
            "\n\nBody:\n" + (($issue.body // "") | .[0:12000]) +
            "\n\nComments, oldest first. Context given in one of these counts as given:\n" +
            ([ $issue.comments[]
-              | select((.body | contains("sonora-triage")) | not)
+              | select((.body | contains("huddle-triage")) | not)
               | "- " + (.author.login // "unknown") + ": " + (.body | .[0:4000]) ]
             | .[-10:] | join("\n\n"))
          ) }
@@ -141,7 +141,7 @@ has_label 'needs triage' && remove+=(--remove-label 'needs triage')
 where=""
 if grep -qi 'log' <<<"$missing"; then
   where="
-The log is at \`~/.local/state/sonora/sonora.log\` on Linux, \`~/Library/Caches/sonora/sonora.log\` on macOS and \`%LOCALAPPDATA%\\sonora\\sonora.log\` on Windows. Reproduce the problem, then paste the tail of it. Starting Sonora with \`SONORA_LOG=debug\` makes it more detailed.
+The log is at \`~/.local/state/huddle/huddle.log\` on Linux, \`~/Library/Caches/huddle/huddle.log\` on macOS and \`%LOCALAPPDATA%\\huddle\\huddle.log\` on Windows. Reproduce the problem, then paste the tail of it. Starting Huddle with \`HUDDLE_LOG=debug\` makes it more detailed.
 "
 fi
 
@@ -155,7 +155,7 @@ $where
 Edit the issue or reply with the missing pieces and the label comes off. Left as it is, this closes itself in a couple of weeks.
 
 > [!NOTE]
-> Sonora Buddy is an AI. If it read the issue wrong, say so and a maintainer will look.
+> Huddle Buddy is an AI. If it read the issue wrong, say so and a maintainer will look.
 "
   add+=(--add-label 'needs-info')
 elif [ -z "$missing" ] && has_label 'needs-info'; then
