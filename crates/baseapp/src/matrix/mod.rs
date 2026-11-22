@@ -480,6 +480,9 @@ pub struct MatrixClient {
     profile_name: Entity<Input>,
     profile: profile::Panel,
     public_profiles: Cache<profile::Public>,
+    person_loading: bool,
+    person_ticket: u64,
+    shared_room_limit: usize,
     settings_room: Option<OwnedRoomId>,
     room_name: Entity<Input>,
     room_topic: Entity<Input>,
@@ -619,6 +622,9 @@ impl MatrixClient {
             profile_name: cx.new(|cx| Input::new("huddle-profile-hint", cx)),
             profile: profile::Panel::new(cx),
             public_profiles: Cache::new(512 * 1024, 128, profile::Public::bytes),
+            person_loading: false,
+            person_ticket: 0,
+            shared_room_limit: 10,
             settings_room: None,
             room_name: cx.new(|cx| Input::new("Room name", cx)),
             room_topic: cx.new(|cx| Input::new("Room topic", cx).growing()),
@@ -691,13 +697,32 @@ impl MatrixClient {
             Update::PublicProfile {
                 user,
                 viewer,
+                ticket,
                 details,
             } => {
-                if !self.me.as_ref().is_some_and(|me| me.id == viewer) {
+                if !self.me.as_ref().is_some_and(|me| me.id == viewer)
+                    || !self.person.as_ref().is_some_and(|person| person.id == user)
+                    || ticket != self.person_ticket
+                {
                     return;
                 }
-                self.public_profiles
-                    .insert(user.to_string(), details.unwrap_or_default());
+                self.person_loading = false;
+                if let Some(person) = &mut self.person {
+                    if let Some(room) = details
+                        .room
+                        .as_ref()
+                        .filter(|room| Some(&room.id) == self.room.as_ref())
+                    {
+                        person.name.clone_from(&room.nickname);
+                        person.avatar.clone_from(&room.avatar);
+                    } else if !details.unavailable {
+                        if let Some(name) = &details.name {
+                            person.name.clone_from(name);
+                        }
+                        person.avatar.clone_from(&details.avatar);
+                    }
+                }
+                self.public_profiles.insert(user.to_string(), details);
             }
             Update::Receipts { room, readers } => {
                 if let Some(timeline) = self.timelines.get_mut(&room) {
@@ -6849,8 +6874,9 @@ impl MatrixClient {
             person.avatar.as_ref(),
             px(96.),
         );
+        let copied_id = person.id.to_string();
         Modal::new("dialog-person", title)
-            .w(px(360.))
+            .w(px(520.))
             .detail(person.id.to_string())
             .close_button()
             .on_dismiss(cx.listener(|this, _: &(), _, cx| {
@@ -6859,6 +6885,21 @@ impl MatrixClient {
             }))
             .child(div().flex().justify_center().py_2().child(face))
             .child(self.public_profile_body(&person.id, cx))
+            .action(
+                Button::new("person-copy-id")
+                    .ghost()
+                    .label("Copy ID")
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copied_id.clone()));
+                    }),
+            )
+            .action(
+                Button::new("person-refresh")
+                    .ghost()
+                    .label("Refresh")
+                    .disabled(self.person_loading)
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh_person(cx))),
+            )
             .action(match mine {
                 true => Button::new("person-edit")
                     .primary()

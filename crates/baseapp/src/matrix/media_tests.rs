@@ -37,6 +37,7 @@ fn decode_component(value: &str) -> String {
 
 #[derive(Default)]
 struct Traffic {
+    presence: Option<serde_json::Value>,
     profile: serde_json::Value,
     capabilities: Option<serde_json::Value>,
     profile_writes: Vec<(String, serde_json::Value)>,
@@ -330,6 +331,13 @@ impl Server {
                 let mut content_type = "application/json";
                 let response = if path.contains("/capabilities") {
                     serde_json::to_vec(&serde_json::json!({"capabilities":traffic.capabilities.clone().unwrap_or_else(|| serde_json::json!({}))})).unwrap()
+                } else if path.contains("/presence/") {
+                    if let Some(presence) = &traffic.presence {
+                        serde_json::to_vec(presence).unwrap()
+                    } else {
+                        status = "403 Forbidden";
+                        br#"{"errcode":"M_FORBIDDEN","error":"Presence not shared"}"#.to_vec()
+                    }
                 } else if let Some((_, suffix)) = path.split_once("/profile/") {
                     let field = suffix
                         .split_once('/')

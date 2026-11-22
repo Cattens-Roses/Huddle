@@ -16,6 +16,37 @@ pub const LIMITS: [usize; 4] = [1000, 80, 2048, 100];
 #[derive(Clone, Default)]
 pub struct Public {
     pub values: [String; 4],
+    pub name: Option<String>,
+    pub avatar: Option<OwnedMxcUri>,
+    pub presence: Option<Presence>,
+    pub room: Option<RoomInfo>,
+    pub shared: Vec<SharedRoom>,
+    pub unavailable: bool,
+}
+#[derive(Clone)]
+pub struct Presence {
+    pub state: String,
+    pub message: Option<String>,
+    pub active: Option<bool>,
+    pub last_active: Option<Duration>,
+    pub observed: std::time::Instant,
+}
+#[derive(Clone)]
+pub struct SharedRoom {
+    pub id: OwnedRoomId,
+    pub name: String,
+    pub space: bool,
+}
+#[derive(Clone)]
+pub struct RoomInfo {
+    pub id: OwnedRoomId,
+    pub name: String,
+    pub nickname: String,
+    pub avatar: Option<OwnedMxcUri>,
+    pub membership: String,
+    pub role: Option<String>,
+    pub power: Option<String>,
+    pub permissions: Vec<&'static str>,
 }
 impl Public {
     pub fn read(
@@ -29,11 +60,157 @@ impl Public {
                     .unwrap_or_default()
                     .to_owned()
             }),
+            name: profile
+                .get("displayname")
+                .and_then(|value| value.as_str())
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned),
+            avatar: profile
+                .get("avatar_url")
+                .and_then(|value| value.as_str())
+                .filter(|url| !url.is_empty())
+                .map(OwnedMxcUri::from),
+            ..Self::default()
         }
     }
     pub fn bytes(&self) -> usize {
-        self.values.iter().map(String::len).sum()
+        self.values.iter().map(String::len).sum::<usize>()
+            + self.name.as_ref().map_or(0, String::len)
+            + self.avatar.as_ref().map_or(0, |url| url.as_str().len())
+            + self
+                .presence
+                .as_ref()
+                .and_then(|presence| presence.message.as_ref())
+                .map_or(0, String::len)
+            + self.room.as_ref().map_or(0, |room| {
+                room.id.as_str().len() + room.name.len() + room.nickname.len() + 256
+            })
+            + self
+                .shared
+                .iter()
+                .map(|room| room.id.as_str().len() + room.name.len() + 64)
+                .sum::<usize>()
     }
+}
+
+pub async fn inspect(client: &Client, user: &OwnedUserId, context: Option<&OwnedRoomId>) -> Public {
+    use matrix_sdk::ruma::api::client::presence::get_presence;
+    let account = client.account();
+    let presence = client
+        .send(get_presence::v3::Request::new(user.clone()))
+        .with_request_config(
+            matrix_sdk::config::RequestConfig::short_retry().timeout(Duration::from_secs(5)),
+        );
+    let (raw, presence) = tokio::join!(account.fetch_user_profile_of(user), presence);
+    let mut profile = raw.as_ref().map(Public::read).unwrap_or_default();
+    profile.unavailable = raw.is_err();
+    profile.presence = presence.ok().map(|presence| Presence {
+        state: presence.presence.to_string(),
+        message: presence
+            .status_msg
+            .filter(|message| !message.trim().is_empty()),
+        active: presence.currently_active,
+        last_active: presence.last_active_ago,
+        observed: std::time::Instant::now(),
+    });
+    for room in client
+        .rooms()
+        .into_iter()
+        .filter(|room| room.state() == RoomState::Joined)
+    {
+        let Some(member) = room.get_member_no_sync(user).await.ok().flatten() else {
+            continue;
+        };
+        let joined = member.membership().as_str() == "join";
+        let selected = context.is_some_and(|id| id == room.room_id());
+        if !joined && !selected {
+            continue;
+        }
+        let name = room
+            .display_name()
+            .await
+            .map(|name| name.to_string())
+            .unwrap_or_else(|_| room.room_id().to_string());
+        if joined {
+            profile.shared.push(SharedRoom {
+                id: room.room_id().to_owned(),
+                name: name.clone(),
+                space: room.is_space(),
+            });
+        }
+        if selected {
+            let mut info = RoomInfo {
+                id: room.room_id().to_owned(),
+                name,
+                nickname: member.name().to_owned(),
+                avatar: member.avatar_url().map(ToOwned::to_owned),
+                membership: member.membership().as_str().to_owned(),
+                role: None,
+                power: None,
+                permissions: Vec::new(),
+            };
+            if let Ok(levels) = room.power_levels().await {
+                use matrix_sdk::ruma::events::{
+                    MessageLikeEventType, StateEventType, room::power_levels::UserPowerLevel,
+                };
+                let power = levels.for_user(user);
+                let (role, power) = match power {
+                    UserPowerLevel::Infinite => ("Creator".to_owned(), "Unlimited".to_owned()),
+                    UserPowerLevel::Int(value) => {
+                        let value = i64::from(value);
+                        (
+                            match value {
+                                100.. => "Administrator".into(),
+                                50..=99 => "Moderator".into(),
+                                0 => "Member".into(),
+                                _ => format!("Custom role ({value})"),
+                            },
+                            value.to_string(),
+                        )
+                    }
+                    _ => ("Unknown".into(), "Unknown".into()),
+                };
+                info.role = Some(role);
+                info.power = Some(power);
+                if joined {
+                    for (allowed, label) in [
+                        (
+                            levels.user_can_send_message(user, MessageLikeEventType::RoomMessage),
+                            "Send messages",
+                        ),
+                        (levels.user_can_invite(user), "Invite people"),
+                        (
+                            levels.user_can_send_state(user, StateEventType::RoomName),
+                            "Edit room name",
+                        ),
+                        (
+                            levels.user_can_send_state(user, StateEventType::RoomTopic),
+                            "Edit room topic",
+                        ),
+                        (levels.user_can_kick(user), "Remove members"),
+                        (levels.user_can_ban(user), "Ban members"),
+                        (
+                            levels.user_can_redact_event_of_other(user),
+                            "Delete others' messages",
+                        ),
+                        (
+                            levels.user_can_send_state(user, StateEventType::RoomPowerLevels),
+                            "Manage permissions",
+                        ),
+                    ] {
+                        if allowed {
+                            info.permissions.push(label);
+                        }
+                    }
+                }
+            }
+            profile.room = Some(info);
+        }
+    }
+    profile
+        .shared
+        .sort_by_cached_key(|room| (room.name.to_lowercase(), room.id.clone()));
+    profile
 }
 pub struct RoomProfile {
     pub id: OwnedRoomId,
@@ -292,6 +469,8 @@ pub async fn save(client: &Client, edit: Edit) -> anyhow::Result<Saved> {
                 .send_state_event_for_key(user, content)
                 .await?;
         }
+        public.name = Some(name.clone());
+        public.avatar = avatar.clone();
         Ok(Saved {
             user: client
                 .user_id()
@@ -394,8 +573,23 @@ fn input_row(label: &'static str, input: &Entity<Input>, enabled: bool, cx: &App
 
 impl MatrixClient {
     pub(super) fn open_person(&mut self, person: Person, cx: &mut Context<Self>) {
-        self.command(Command::LoadPublicProfile(person.id.clone()));
         self.person = Some(person);
+        self.shared_room_limit = 10;
+        self.refresh_person(cx);
+    }
+
+    pub(super) fn refresh_person(&mut self, cx: &mut Context<Self>) {
+        let Some(person) = &self.person else {
+            return;
+        };
+        let user = person.id.clone();
+        self.person_ticket = self.person_ticket.wrapping_add(1);
+        self.person_loading = true;
+        self.command(Command::LoadPublicProfile {
+            user,
+            room: self.room.clone(),
+            ticket: self.person_ticket,
+        });
         cx.notify();
     }
 
@@ -404,10 +598,55 @@ impl MatrixClient {
         user: &OwnedUserId,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(profile) = self.public_profiles.get(user.as_str()) else {
-            return div().into_any_element();
-        };
         let mut body = div().flex().flex_col().gap_2();
+        let row = |label: &str, value: String| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(cx.theme().muted_foreground)
+                        .child(label.to_owned()),
+                )
+                .child(div().child(value))
+        };
+        body = body.child(row("Homeserver", user.server_name().to_string()));
+        let Some(profile) = self.public_profiles.get(user.as_str()) else {
+            return body.child("Loading profile…").into_any_element();
+        };
+        if let Some(name) = &profile.name {
+            body = body.child(row("Global name", name.clone()));
+        }
+        let availability =
+            profile.presence.as_ref().map_or("Not shared", |presence| {
+                match presence.state.as_str() {
+                    "online" if presence.active == Some(true) => "Active now",
+                    "online" => "Online",
+                    "unavailable" => "Away",
+                    "offline" => "Offline",
+                    _ => "Unknown",
+                }
+            });
+        body = body.child(row("Availability", availability.into()));
+        if let Some(presence) = &profile.presence {
+            if let Some(message) = &presence.message {
+                body = body.child(row("Status", message.clone()));
+            }
+            if presence.active != Some(true) {
+                if let Some(age) = presence.last_active {
+                    let seconds = age.saturating_add(presence.observed.elapsed()).as_secs();
+                    let label = match seconds {
+                        0..60 => "Less than a minute ago".into(),
+                        60..3600 => format!("{} minutes ago", seconds / 60),
+                        3600..86400 => format!("{} hours ago", seconds / 3600),
+                        _ => format!("{} days ago", seconds / 86400),
+                    };
+                    body = body.child(row("Last active", label));
+                }
+            }
+        }
         for (index, value) in profile
             .values
             .iter()
@@ -422,7 +661,10 @@ impl MatrixClient {
             );
             if index == 2
                 && reqwest::Url::parse(value).is_ok_and(|url| {
-                    (url.scheme() == "https" || url.scheme() == "http") && url.host_str().is_some()
+                    (url.scheme() == "https" || url.scheme() == "http")
+                        && url.host_str().is_some()
+                        && url.username().is_empty()
+                        && url.password().is_none()
                 })
             {
                 let url = value.clone();
@@ -436,6 +678,81 @@ impl MatrixClient {
                 row = row.child(div().child(value.clone()));
             }
             body = body.child(row);
+        }
+        if profile.unavailable {
+            body = body.child(row(
+                "Public profile",
+                "Could not load public details. Try refreshing.".into(),
+            ));
+        }
+        if let Some(room) = profile
+            .room
+            .as_ref()
+            .filter(|room| Some(&room.id) == self.room.as_ref())
+        {
+            body = body
+                .child(row("Current room", room.name.clone()))
+                .child(row("Room nickname", room.nickname.clone()))
+                .child(row(
+                    "Membership",
+                    match room.membership.as_str() {
+                        "join" => "Joined",
+                        "invite" => "Invited",
+                        "leave" => "Left",
+                        "ban" => "Banned",
+                        "knock" => "Requested to join",
+                        _ => "Unknown",
+                    }
+                    .into(),
+                ));
+            if let Some(role) = &room.role {
+                body = body.child(row("Room role", role.clone()));
+            }
+            if let Some(power) = &room.power {
+                body = body.child(row("Permission level", power.clone()));
+            }
+            if room.membership == "join" && room.power.is_some() {
+                body = body.child(row(
+                    "Allowed actions",
+                    if room.permissions.is_empty() {
+                        "No listed permissions".into()
+                    } else {
+                        room.permissions.join(" · ")
+                    },
+                ));
+            }
+        }
+        body = body.child(row(
+            "Known shared rooms",
+            format!(
+                "{} — based on member lists available on this device",
+                profile.shared.len()
+            ),
+        ));
+        for room in profile.shared.iter().take(self.shared_room_limit) {
+            body = body.child(div().child(format!(
+                "{}{}",
+                room.name,
+                if room.space { " (space)" } else { "" }
+            )));
+        }
+        if profile.shared.len() > self.shared_room_limit {
+            body = body.child(
+                Button::new("person-more-rooms")
+                    .ghost()
+                    .label("Show more")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.shared_room_limit = this.shared_room_limit.saturating_add(10);
+                        cx.notify();
+                    })),
+            );
+        }
+        if self.person_loading {
+            body = body.child(
+                div()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Refreshing profile…"),
+            );
         }
         body.into_any_element()
     }

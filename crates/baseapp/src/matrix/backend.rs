@@ -214,7 +214,11 @@ pub enum Command {
         room: Option<OwnedRoomId>,
         ticket: u64,
     },
-    LoadPublicProfile(OwnedUserId),
+    LoadPublicProfile {
+        user: OwnedUserId,
+        room: Option<OwnedRoomId>,
+        ticket: u64,
+    },
     Typing {
         room: OwnedRoomId,
         active: bool,
@@ -341,7 +345,8 @@ pub enum Update {
     PublicProfile {
         user: OwnedUserId,
         viewer: OwnedUserId,
-        details: Option<profile::Public>,
+        ticket: u64,
+        details: profile::Public,
     },
     Receipts {
         room: OwnedRoomId,
@@ -1179,22 +1184,18 @@ async fn handle(
                 },
             );
         }
-        Command::LoadPublicProfile(user) => {
+        Command::LoadPublicProfile { user, room, ticket } => {
             let viewer = client
                 .user_id()
                 .ok_or_else(|| anyhow!("not signed in"))?
                 .to_owned();
-            let details = client
-                .account()
-                .fetch_user_profile_of(&user)
-                .await
-                .ok()
-                .map(|raw| profile::Public::read(&raw));
+            let details = profile::inspect(client, &user, room.as_ref()).await;
             post(
                 outbox,
                 Update::PublicProfile {
                     user,
                     viewer,
+                    ticket,
                     details,
                 },
             );

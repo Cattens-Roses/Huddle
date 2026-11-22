@@ -152,3 +152,51 @@ fn unicode_lengths_and_public_website_validation() {
     fields[2] = Some("https://example.org/about".into());
     assert!(profile::validate(&fields, None, None).is_ok());
 }
+
+#[tokio::test]
+async fn inspection_shows_public_presence_room_role_and_known_shared_rooms() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let (server, client, id) = super::room_admin_tests::setup(true).await;
+        {
+            let mut traffic = server.traffic.lock().unwrap();
+            traffic.profile = json!({"displayname":"Global name", "app.huddle.profile.bio":"Hello", "m.tz":"Europe/Warsaw"});
+            traffic.presence = Some(json!({"presence":"unavailable","status_msg":"Busy","currently_active":false,"last_active_ago":120000}));
+        }
+        let user = "@tester:example.org".parse().unwrap();
+        let details = profile::inspect(&client, &user, Some(&id)).await;
+        assert!(!details.unavailable);
+        assert_eq!(details.name.as_deref(), Some("Global name"));
+        assert_eq!(details.values[0], "Hello");
+        let presence = details.presence.unwrap();
+        assert_eq!(presence.state, "unavailable");
+        assert_eq!(presence.message.as_deref(), Some("Busy"));
+        assert_eq!(presence.last_active, Some(Duration::from_secs(120)));
+        let room = details.room.unwrap();
+        assert_eq!(room.nickname, "Admin");
+        assert_eq!(room.role.as_deref(), Some("Administrator"));
+        assert_eq!(room.power.as_deref(), Some("100"));
+        assert!(room.permissions.contains(&"Manage permissions"));
+        assert_eq!(details.shared.len(), 1);
+        assert_eq!(details.shared[0].id, id);
+        assert!(details.shared[0].space);
+        let member = profile::inspect(&client, &"@member:example.org".parse().unwrap(), Some(&id)).await;
+        let room = member.room.unwrap();
+        assert_eq!(room.role.as_deref(), Some("Member"));
+        assert!(room.permissions.contains(&"Send messages"));
+        assert!(!room.permissions.contains(&"Manage permissions"));
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn inspection_does_not_invent_presence_or_shared_membership() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let (_server, client, id) = super::room_admin_tests::setup(false).await;
+        let details =
+            profile::inspect(&client, &"@unknown:example.org".parse().unwrap(), Some(&id)).await;
+        assert!(details.presence.is_none());
+        assert!(details.room.is_none());
+        assert!(details.shared.is_empty());
+    })
+    .await
+    .unwrap();
+}
