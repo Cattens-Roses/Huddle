@@ -18,6 +18,16 @@
   <a href="COPYING"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue?style=flat-square" alt="License"></a>
 </p>
 
+## Showcase
+
+<p align="center">
+  <img src="docs/screenshots/main.png" alt="Huddle home" width="900">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/matrix.png" alt="Huddle Matrix HQ room" width="900">
+</p>
+
 ## Features
 
 - **Rooms & DMs** - join rooms, message people directly, and follow threads
