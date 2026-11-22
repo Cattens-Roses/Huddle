@@ -1,6 +1,7 @@
 mod backend;
 mod photo;
 mod playback;
+mod profile;
 mod receipts;
 mod rich;
 mod room_settings;
@@ -477,6 +478,8 @@ pub struct MatrixClient {
     thread_draft: Entity<Input>,
     field: Entity<Input>,
     profile_name: Entity<Input>,
+    profile: profile::Panel,
+    public_profiles: Cache<profile::Public>,
     settings_room: Option<OwnedRoomId>,
     room_name: Entity<Input>,
     room_topic: Entity<Input>,
@@ -614,6 +617,8 @@ impl MatrixClient {
             thread_draft: cx.new(|cx| Input::new("huddle-thread-hint", cx).tucked().growing()),
             field: cx.new(|cx| Input::new("huddle-join-hint", cx)),
             profile_name: cx.new(|cx| Input::new("huddle-profile-hint", cx)),
+            profile: profile::Panel::new(cx),
+            public_profiles: Cache::new(512 * 1024, 128, profile::Public::bytes),
             settings_room: None,
             room_name: cx.new(|cx| Input::new("Room name", cx)),
             room_topic: cx.new(|cx| Input::new("Room topic", cx).growing()),
@@ -655,6 +660,45 @@ impl MatrixClient {
             return;
         }
         match update {
+            Update::ProfileDetails {
+                user,
+                ticket,
+                details,
+            } => {
+                if self.dialog != Some(Dialog::Profile)
+                    || ticket != self.profile.ticket
+                    || !self.me.as_ref().is_some_and(|me| me.id == user)
+                {
+                    return;
+                }
+                self.profile.loading = false;
+                match details {
+                    Ok(details) => {
+                        let name = details.name.clone();
+                        if let Some(me) = &mut self.me {
+                            me.name.clone_from(&name);
+                            me.avatar.clone_from(&details.avatar);
+                        }
+                        self.public_profiles
+                            .insert(user.to_string(), details.public.clone());
+                        self.profile_name
+                            .update(cx, |input, cx| input.set_text(name, cx));
+                        self.profile.loaded(details, cx);
+                    }
+                    Err(error) => self.profile.error = Some(error),
+                }
+            }
+            Update::PublicProfile {
+                user,
+                viewer,
+                details,
+            } => {
+                if !self.me.as_ref().is_some_and(|me| me.id == viewer) {
+                    return;
+                }
+                self.public_profiles
+                    .insert(user.to_string(), details.unwrap_or_default());
+            }
             Update::Receipts { room, readers } => {
                 if let Some(timeline) = self.timelines.get_mut(&room) {
                     let messages = &timeline.messages;
@@ -770,6 +814,9 @@ impl MatrixClient {
                 }
             }
             Update::SignedOut => {
+                self.public_profiles.clear();
+                self.profile.begin(cx);
+                self.profile.loading = false;
                 self.readers_view = None;
                 self.stop_typing();
                 self.typing = typing::Remote::default();
@@ -841,7 +888,19 @@ impl MatrixClient {
                 self.signup_busy = false;
                 self.sign_in_error = Some(problem.into());
             }
-            Update::Profile { name, avatar } => {
+            Update::Profile(saved) => {
+                if !self.me.as_ref().is_some_and(|me| me.id == saved.user) {
+                    return;
+                }
+                let profile::Saved {
+                    user: _,
+                    name,
+                    avatar,
+                    public,
+                    changed_name,
+                    changed_avatar,
+                    room: room_nickname,
+                } = saved;
                 self.profile_busy = false;
                 self.dialog = None;
                 if let Some(uri) = &avatar
@@ -860,19 +919,40 @@ impl MatrixClient {
                     me.avatar.clone_from(&avatar);
                 }
                 if let Some(id) = id {
-                    for members in self.members.values_mut() {
+                    self.public_profiles.insert(id.to_string(), public);
+                    for (room, members) in self.members.iter_mut() {
+                        let nickname = room_nickname
+                            .as_ref()
+                            .filter(|(id, _)| id == room)
+                            .map(|(_, name)| name);
                         for member in members.iter_mut() {
                             if member.id == id {
-                                member.name.clone_from(&name);
-                                member.avatar.clone_from(&avatar);
+                                if let Some(nickname) = nickname {
+                                    member.name.clone_from(nickname);
+                                } else if changed_name {
+                                    member.name.clone_from(&name);
+                                }
+                                if changed_avatar {
+                                    member.avatar.clone_from(&avatar);
+                                }
                             }
                         }
                     }
-                    for timeline in self.timelines.values_mut() {
+                    for (room, timeline) in self.timelines.iter_mut() {
+                        let nickname = room_nickname
+                            .as_ref()
+                            .filter(|(id, _)| id == room)
+                            .map(|(_, name)| name);
                         let rename = |message: &mut Message| {
                             if message.sender == id {
-                                message.sender_name.clone_from(&name);
-                                message.avatar.clone_from(&avatar);
+                                if let Some(nickname) = nickname {
+                                    message.sender_name.clone_from(nickname);
+                                } else if changed_name {
+                                    message.sender_name.clone_from(&name);
+                                }
+                                if changed_avatar {
+                                    message.avatar.clone_from(&avatar);
+                                }
                             }
                         };
                         for message in &mut timeline.messages {
@@ -2086,6 +2166,10 @@ impl MatrixClient {
     }
 
     fn pick_photo(&mut self, cx: &mut Context<Self>) {
+        if self.profile_busy || self.profile.loading {
+            return;
+        }
+        let ticket = self.profile.ticket;
         let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: true,
             directories: false,
@@ -2099,13 +2183,24 @@ impl MatrixClient {
             let Some(path) = paths.into_iter().next() else {
                 return;
             };
-            let name = path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "photo".into());
-            let bytes = std::fs::read(&path).ok();
+            let result = cx
+                .background_spawn(async move { upload::read(&path) })
+                .await;
             this.update(cx, |this, cx| {
-                if let Some(photo) = this.read_image(&name, bytes, cx) {
+                if this.dialog != Some(Dialog::Profile)
+                    || this.profile.ticket != ticket
+                    || this.profile_busy
+                {
+                    return;
+                }
+                let (name, bytes) = match result {
+                    Ok(file) => file,
+                    Err(error) => {
+                        this.notify(error, true, cx);
+                        return;
+                    }
+                };
+                if let Some(photo) = this.read_image(&name, Some(bytes), cx) {
                     this.profile_photo = Some(photo);
                     this.profile_remove = false;
                     cx.notify();
@@ -2265,30 +2360,6 @@ impl MatrixClient {
             width,
             height,
         })
-    }
-
-    fn save_profile(&mut self, cx: &mut Context<Self>) {
-        if self.profile_busy {
-            return;
-        }
-        let name = self.profile_name.read(cx).text().trim().to_owned();
-        if name.is_empty() {
-            self.notify("Add a display name.", true, cx);
-            return;
-        }
-        let (bytes, mime) = match &self.profile_photo {
-            Some(photo) => (Some(photo.bytes.clone()), Some(photo.mime.clone())),
-            None => (None, None),
-        };
-        let remove = self.profile_remove && bytes.is_none();
-        self.profile_busy = true;
-        self.command(Command::Profile {
-            name,
-            bytes,
-            mime,
-            remove,
-        });
-        cx.notify();
     }
 
     fn start_reply(&mut self, message: &Message, window: &mut Window, cx: &mut Context<Self>) {
@@ -2609,8 +2680,7 @@ impl MatrixClient {
             .id(id.into())
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.person = Some(person.clone());
-                cx.notify();
+                this.open_person(person.clone(), cx);
             }))
     }
 
@@ -2723,6 +2793,11 @@ impl MatrixClient {
             | Dialog::Profile => "",
         };
         if dialog == Dialog::Profile {
+            self.profile.begin(cx);
+            self.command(Command::LoadProfile {
+                room: self.room.clone(),
+                ticket: self.profile.ticket,
+            });
             self.profile_busy = false;
             self.profile_photo = None;
             self.profile_remove = false;
@@ -2747,6 +2822,9 @@ impl MatrixClient {
     }
 
     fn close_dialog(&mut self, cx: &mut Context<Self>) {
+        if self.dialog == Some(Dialog::Profile) && self.profile_busy {
+            return;
+        }
         if self.dialog == Some(Dialog::RoomSettings) && self.room_settings_busy {
             return;
         }
@@ -6780,6 +6858,7 @@ impl MatrixClient {
                 cx.notify();
             }))
             .child(div().flex().justify_center().py_2().child(face))
+            .child(self.public_profile_body(&person.id, cx))
             .action(match mine {
                 true => Button::new("person-edit")
                     .primary()
@@ -6798,87 +6877,6 @@ impl MatrixClient {
                         this.notify("Starting the conversation…", false, cx);
                     })),
             })
-            .into_any_element()
-    }
-
-    fn render_profile(&self, cx: &mut Context<Self>) -> AnyElement {
-        let (id, name, picture) = self
-            .me
-            .as_ref()
-            .map(|me| (me.id.to_string(), me.name.clone(), me.avatar.clone()))
-            .unwrap_or_default();
-        let face = if self.profile_remove {
-            avatar(&id, &name, px(72.)).into_any_element()
-        } else if let Some(photo) = &self.profile_photo {
-            img(photo.preview.clone().expect("profile image preview"))
-                .size(px(72.))
-                .flex_none()
-                .rounded_full()
-                .object_fit(ObjectFit::Cover)
-                .into_any_element()
-        } else {
-            self.face(&id, &name, picture.as_ref(), px(72.))
-        };
-        let has_photo = self.profile_photo.is_some() || (picture.is_some() && !self.profile_remove);
-        let busy = self.profile_busy;
-        Modal::new("dialog-profile", "Edit profile")
-            .w(px(440.))
-            .detail("This is how you appear in rooms.")
-            .close_button()
-            .on_dismiss(cx.listener(|this, _: &(), _, cx| this.close_dialog(cx)))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .on_action(cx.listener(|this, _: &Submit, _, cx| this.save_profile(cx)))
-                    .child(
-                        div().flex().items_center().gap_3().child(face).child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .items_start()
-                                .gap_2()
-                                .child(
-                                    Button::new("profile-photo")
-                                        .small()
-                                        .label("Change photo")
-                                        .disabled(busy)
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| this.pick_photo(cx)),
-                                        ),
-                                )
-                                .when(has_photo, |column| {
-                                    column.child(
-                                        Button::new("profile-remove")
-                                            .ghost()
-                                            .small()
-                                            .label("Remove photo")
-                                            .disabled(busy)
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.profile_photo = None;
-                                                this.profile_remove = true;
-                                                cx.notify();
-                                            })),
-                                    )
-                                }),
-                        ),
-                    )
-                    .child(div().flex().h(px(40.)).child(self.profile_name.clone())),
-            )
-            .action(
-                Button::new("profile-cancel")
-                    .ghost()
-                    .label("Cancel")
-                    .on_click(cx.listener(|this, _, _, cx| this.close_dialog(cx))),
-            )
-            .action(
-                Button::new("profile-save")
-                    .primary()
-                    .label(if busy { "Saving…" } else { "Save" })
-                    .disabled(busy)
-                    .on_click(cx.listener(|this, _, _, cx| this.save_profile(cx))),
-            )
             .into_any_element()
     }
 

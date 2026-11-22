@@ -415,8 +415,7 @@ impl MatrixClient {
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.readers_view = None;
-                        this.person = Some(person.clone());
-                        cx.notify();
+                        this.open_person(person.clone(), cx);
                     })),
             );
         }

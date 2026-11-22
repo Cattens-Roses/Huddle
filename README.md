@@ -113,6 +113,14 @@ remove, ban, and unban users. Space settings also manage linked rooms, their ord
 and whether they are suggested, and can create new rooms. Actions use current Matrix permissions; enabling
 encryption is permanent. Room IDs and room versions are shown as information.
 
+## Profile
+
+**Edit profile** supports a display name, photo, About me, pronouns, website,
+and time zone. Additional public fields depend on homeserver capabilities and
+are shown on Huddle profile cards. When a room is open, you can also set a nickname
+just for that room. Unsupported fields remain read-only; leaving a supported
+additional field blank removes it.
+
 ## Read receipts
 
 Read markers show who has reached a message. Click **Read by** or the read-receipt

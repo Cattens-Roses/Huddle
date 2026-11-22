@@ -52,6 +52,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use super::profile;
 use super::receipts;
 use super::rich::{self, Rich};
 
@@ -209,6 +210,11 @@ pub enum Answer {
 }
 
 pub enum Command {
+    LoadProfile {
+        room: Option<OwnedRoomId>,
+        ticket: u64,
+    },
+    LoadPublicProfile(OwnedUserId),
     Typing {
         room: OwnedRoomId,
         active: bool,
@@ -269,12 +275,7 @@ pub enum Command {
         reply: Option<(OwnedEventId, OwnedUserId)>,
         thread: Option<(OwnedEventId, OwnedEventId)>,
     },
-    Profile {
-        name: String,
-        bytes: Option<Vec<u8>>,
-        mime: Option<String>,
-        remove: bool,
-    },
+    Profile(profile::Edit),
     Edit {
         room: OwnedRoomId,
         event: OwnedEventId,
@@ -332,6 +333,16 @@ pub enum Command {
 }
 
 pub enum Update {
+    ProfileDetails {
+        user: OwnedUserId,
+        ticket: u64,
+        details: std::result::Result<Box<profile::Details>, String>,
+    },
+    PublicProfile {
+        user: OwnedUserId,
+        viewer: OwnedUserId,
+        details: Option<profile::Public>,
+    },
     Receipts {
         room: OwnedRoomId,
         readers: Vec<receipts::Reader>,
@@ -364,10 +375,7 @@ pub enum Update {
         name: String,
         avatar: Option<OwnedMxcUri>,
     },
-    Profile {
-        name: String,
-        avatar: Option<OwnedMxcUri>,
-    },
+    Profile(profile::Saved),
     Rooms(Vec<RoomSummary>),
     History {
         room: OwnedRoomId,
@@ -1153,6 +1161,44 @@ async fn handle(
     command: Command,
 ) -> Result<()> {
     match command {
+        Command::LoadProfile { room, ticket } => {
+            let user = client
+                .user_id()
+                .ok_or_else(|| anyhow!("not signed in"))?
+                .to_owned();
+            let details = profile::load(client, room.as_ref())
+                .await
+                .map(Box::new)
+                .map_err(|error| problem(&error));
+            post(
+                outbox,
+                Update::ProfileDetails {
+                    user,
+                    ticket,
+                    details,
+                },
+            );
+        }
+        Command::LoadPublicProfile(user) => {
+            let viewer = client
+                .user_id()
+                .ok_or_else(|| anyhow!("not signed in"))?
+                .to_owned();
+            let details = client
+                .account()
+                .fetch_user_profile_of(&user)
+                .await
+                .ok()
+                .map(|raw| profile::Public::read(&raw));
+            post(
+                outbox,
+                Update::PublicProfile {
+                    user,
+                    viewer,
+                    details,
+                },
+            );
+        }
         Command::LoadRoomAdmin(room) => {
             let result = admin::load(client, &room)
                 .await
@@ -1444,26 +1490,9 @@ async fn handle(
                 }
             }
         }
-        Command::Profile {
-            name,
-            bytes,
-            mime,
-            remove,
-        } => {
-            let account = client.account();
-            let avatar = if let Some(bytes) = bytes {
-                let mime = mime
-                    .and_then(|mime| mime.parse().ok())
-                    .unwrap_or(mime::IMAGE_PNG);
-                Some(account.upload_avatar(&mime, bytes).await?)
-            } else if remove {
-                account.set_avatar_url(None).await?;
-                None
-            } else {
-                account.get_avatar_url().await?
-            };
-            account.set_display_name(Some(&name)).await?;
-            post(outbox, Update::Profile { name, avatar });
+        Command::Profile(edit) => {
+            let saved = profile::save(client, edit).await?;
+            post(outbox, Update::Profile(saved));
         }
         Command::Edit {
             room: id,
@@ -2429,6 +2458,8 @@ fn problem(error: &anyhow::Error) -> String {
         "That doesn't look",
         "That key didn't",
         "Your account",
+        "Your server",
+        "Some profile changes",
         "The request has",
         "The comparison has",
         "The call",

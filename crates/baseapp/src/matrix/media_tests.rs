@@ -13,6 +13,9 @@ mod room_admin_tests;
 #[path = "receipt_tests.rs"]
 mod receipt_tests;
 
+#[path = "profile_tests.rs"]
+mod profile_tests;
+
 fn decode_component(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut result = Vec::new();
@@ -34,6 +37,10 @@ fn decode_component(value: &str) -> String {
 
 #[derive(Default)]
 struct Traffic {
+    profile: serde_json::Value,
+    capabilities: Option<serde_json::Value>,
+    profile_writes: Vec<(String, serde_json::Value)>,
+    reject_profile_field: Option<String>,
     room_state: Option<Vec<serde_json::Value>>,
     admin_requests: Vec<(String, serde_json::Value)>,
     directory: String,
@@ -321,7 +328,50 @@ impl Server {
                 let mut traffic = captured.lock().unwrap();
                 let mut status = "200 OK";
                 let mut content_type = "application/json";
-                let response = if path.contains("/keys/upload") {
+                let response = if path.contains("/capabilities") {
+                    serde_json::to_vec(&serde_json::json!({"capabilities":traffic.capabilities.clone().unwrap_or_else(|| serde_json::json!({}))})).unwrap()
+                } else if let Some((_, suffix)) = path.split_once("/profile/") {
+                    let field = suffix
+                        .split_once('/')
+                        .map(|(_, field)| decode_component(field.split('?').next().unwrap()));
+                    if let Some(field) = field {
+                        if header.starts_with("GET ") {
+                            let mut body = serde_json::Map::new();
+                            if let Some(value) = traffic.profile.get(&field) {
+                                body.insert(field.clone(), value.clone());
+                            }
+                            serde_json::to_vec(&body).unwrap()
+                        } else if traffic.reject_profile_field.as_ref() == Some(&field) {
+                            status = "403 Forbidden";
+                            br#"{"errcode":"M_FORBIDDEN","error":"Profile field disabled"}"#
+                                .to_vec()
+                        } else {
+                            if !traffic.profile.is_object() {
+                                traffic.profile = serde_json::json!({});
+                            }
+                            if header.starts_with("DELETE ") {
+                                traffic.profile.as_object_mut().unwrap().remove(&field);
+                                traffic
+                                    .profile_writes
+                                    .push((field, serde_json::Value::Null));
+                            } else {
+                                let body: serde_json::Value = serde_json::from_slice(
+                                    &request[header_end..header_end + length],
+                                )
+                                .unwrap();
+                                traffic.profile[&field] = body[&field].clone();
+                                traffic.profile_writes.push((field, body));
+                            }
+                            b"{}".to_vec()
+                        }
+                    } else {
+                        if traffic.profile.is_object() {
+                            serde_json::to_vec(&traffic.profile).unwrap()
+                        } else {
+                            b"{}".to_vec()
+                        }
+                    }
+                } else if path.contains("/keys/upload") {
                     br#"{"one_time_key_counts":{"signed_curve25519":50}}"#.to_vec()
                 } else if let Some((_, alias)) = path.split_once("/directory/room/") {
                     let alias = decode_component(alias);
@@ -455,8 +505,20 @@ impl Server {
                         b"{}".to_vec()
                     }
                 } else if path.contains("/state/") {
-                    status = "404 Not Found";
-                    br#"{"errcode":"M_NOT_FOUND","error":"No state"}"#.to_vec()
+                    let suffix = path.split_once("/state/").unwrap().1;
+                    let (kind, key) = suffix.split_once('/').unwrap_or((suffix, ""));
+                    let kind = decode_component(kind);
+                    let key = decode_component(key.split('?').next().unwrap());
+                    if let Some(event) = traffic.room_state.as_ref().and_then(|state| {
+                        state
+                            .iter()
+                            .find(|event| event["type"] == kind && event["state_key"] == key)
+                    }) {
+                        serde_json::to_vec(&event["content"]).unwrap()
+                    } else {
+                        status = "404 Not Found";
+                        br#"{"errcode":"M_NOT_FOUND","error":"No state"}"#.to_vec()
+                    }
                 } else if path.contains("/state") {
                     serde_json::to_vec(&traffic.room_state.as_deref().unwrap_or_default()).unwrap()
                 } else if path.contains("/members") {
