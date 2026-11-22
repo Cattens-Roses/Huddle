@@ -16,6 +16,9 @@ mod receipt_tests;
 #[path = "profile_tests.rs"]
 mod profile_tests;
 
+#[path = "unread_tests.rs"]
+mod unread_tests;
+
 fn decode_component(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut result = Vec::new();

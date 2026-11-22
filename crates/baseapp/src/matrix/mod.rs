@@ -6,6 +6,7 @@ mod receipts;
 mod rich;
 mod room_settings;
 mod typing;
+mod unread;
 mod upload;
 
 use crate::cache::Cache;
@@ -1030,6 +1031,13 @@ impl MatrixClient {
                     && !self.rooms.iter().any(|known| &known.id == space)
                 {
                     self.space = None;
+                }
+            }
+            Update::Unread(counts) => {
+                for (id, unread) in counts {
+                    if let Some(room) = self.rooms.iter_mut().find(|room| room.id == id) {
+                        room.unread = unread;
+                    }
                 }
             }
             Update::History {
@@ -3714,79 +3722,98 @@ impl MatrixClient {
 
     fn render_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.theme();
-        let home_unread = self
-            .rooms
-            .iter()
-            .any(|room| room.invite || (room.kind == RoomKind::Direct && room.unread > 0));
+        let home_count = unread::home(&self.rooms);
+        let home_unread = home_count > 0 || self.rooms.iter().any(|room| room.invite);
         type Press = Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
-        let item =
-            |id: SharedString, active: bool, unread: bool, content: AnyElement, press: Press| {
-                div()
-                    .relative()
-                    .flex()
-                    .justify_center()
-                    .w_full()
-                    .child({
-                        let height = if active {
-                            40.
-                        } else if unread {
-                            10.
+        let item = |id: SharedString,
+                    active: bool,
+                    unread: bool,
+                    count: u64,
+                    content: AnyElement,
+                    press: Press| {
+            div()
+                .relative()
+                .flex()
+                .justify_center()
+                .w_full()
+                .child({
+                    let height = if active {
+                        40.
+                    } else if unread {
+                        10.
+                    } else {
+                        0.
+                    };
+                    div()
+                        .absolute()
+                        .left_0()
+                        .w(px(4.))
+                        .rounded_r(px(4.))
+                        .bg(theme.foreground)
+                        .motion(
+                            SharedString::from(format!(
+                                "rail-mark-{id}-{}-{}",
+                                u8::from(active),
+                                u8::from(unread)
+                            )),
+                            ui::motion::Motion::Quick,
+                            move |mark, progress| {
+                                let (top, size) = if active {
+                                    (19. - 15. * progress, 8. + (height - 8.) * progress)
+                                } else if unread {
+                                    (19., height * progress)
+                                } else {
+                                    (19., 10. * (1. - progress))
+                                };
+                                mark.top(px(top)).h(px(size.max(0.)))
+                            },
+                        )
+                })
+                .child(
+                    div()
+                        .id(id)
+                        .relative()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(48.))
+                        .rounded_full()
+                        .bg(if active {
+                            theme.primary
                         } else {
-                            0.
-                        };
-                        div()
-                            .absolute()
-                            .left_0()
-                            .w(px(4.))
-                            .rounded_r(px(4.))
-                            .bg(theme.foreground)
-                            .motion(
-                                SharedString::from(format!(
-                                    "rail-mark-{id}-{}-{}",
-                                    u8::from(active),
-                                    u8::from(unread)
-                                )),
-                                ui::motion::Motion::Quick,
-                                move |mark, progress| {
-                                    let (top, size) = if active {
-                                        (19. - 15. * progress, 8. + (height - 8.) * progress)
-                                    } else if unread {
-                                        (19., height * progress)
-                                    } else {
-                                        (19., 10. * (1. - progress))
-                                    };
-                                    mark.top(px(top)).h(px(size.max(0.)))
-                                },
+                            theme.secondary
+                        })
+                        .text_color(if active {
+                            theme.primary_foreground
+                        } else {
+                            theme.foreground
+                        })
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme.primary).text_color(theme.primary_foreground))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .size_full()
+                                .overflow_hidden()
+                                .rounded_full()
+                                .child(content),
+                        )
+                        .when(count > 0, |item| {
+                            item.child(
+                                unread::badge(count, cx)
+                                    .absolute()
+                                    .right(px(-5.))
+                                    .bottom(px(-3.))
+                                    .border_2()
+                                    .border_color(theme.sidebar),
                             )
-                    })
-                    .child(
-                        div()
-                            .id(id)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .size(px(48.))
-                            .overflow_hidden()
-                            .rounded_full()
-                            .bg(if active {
-                                theme.primary
-                            } else {
-                                theme.secondary
-                            })
-                            .text_color(if active {
-                                theme.primary_foreground
-                            } else {
-                                theme.foreground
-                            })
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .cursor_pointer()
-                            .hover(|style| {
-                                style.bg(theme.primary).text_color(theme.primary_foreground)
-                            })
-                            .child(content)
-                            .on_click(press),
-                    )
-            };
+                        })
+                        .on_click(press),
+                )
+        };
 
         let grouped = self
             .rooms
@@ -3805,7 +3832,7 @@ impl MatrixClient {
                     room.id.clone(),
                     room.name.clone(),
                     room.avatar.clone(),
-                    room.unread > 0 || room.mentions > 0,
+                    room.unread,
                 )
             })
             .collect::<Vec<_>>();
@@ -3815,6 +3842,7 @@ impl MatrixClient {
             "rail-home".into(),
             home_active,
             home_unread,
+            home_count,
             svg()
                 .path(icons::path("icons/house.svg"))
                 .size(px(22.))
@@ -3852,6 +3880,7 @@ impl MatrixClient {
                 item(
                     SharedString::from(format!("rail-room-{}", id)),
                     self.space.is_none() && self.room.as_ref() == Some(&id),
+                    unread > 0,
                     unread,
                     match picture {
                         Some(image) => img(image)
@@ -3875,10 +3904,7 @@ impl MatrixClient {
             .filter(|room| room.kind == RoomKind::Space && !room.invite)
             .map(|space| {
                 let id = space.id.clone();
-                let unread = self
-                    .rooms
-                    .iter()
-                    .any(|room| room.unread > 0 && space.children.contains(&room.id));
+                let unread = unread::space(&self.rooms, &space.id);
                 let picture = space.avatar.as_ref().and_then(|uri| {
                     match self.want(
                         &format!("{uri}#avatar"),
@@ -3892,6 +3918,7 @@ impl MatrixClient {
                 item(
                     SharedString::from(format!("rail-{}", space.id)),
                     self.space.as_ref() == Some(&space.id),
+                    unread > 0,
                     unread,
                     match picture {
                         Some(image) => img(image)
@@ -3953,7 +3980,7 @@ impl MatrixClient {
     fn render_room_row(&self, room: &RoomSummary, cx: &mut Context<Self>) -> AnyElement {
         let theme = *cx.theme();
         let active = self.room.as_ref() == Some(&room.id);
-        let unread = room.unread > 0 && !active;
+        let unread = room.unread > 0;
         let id = room.id.clone();
         let leading = match room.kind {
             RoomKind::Direct => {
@@ -4001,19 +4028,7 @@ impl MatrixClient {
             .when(room.encrypted && room.kind != RoomKind::Direct, |row| {
                 row.child(icon("icons/lock.svg", px(12.), theme.muted_foreground))
             })
-            .when(unread && room.mentions > 0, |row| {
-                row.child(
-                    div()
-                        .flex_none()
-                        .px(px(6.))
-                        .rounded_full()
-                        .bg(theme.danger)
-                        .text_color(theme.danger_foreground)
-                        .text_size(px(11.))
-                        .font_weight(FontWeight::BOLD)
-                        .child(room.mentions.to_string()),
-                )
-            })
+            .when(unread, |row| row.child(unread::badge(room.unread, cx)))
             .on_click(cx.listener(move |this, _, window, cx| this.open(id.clone(), window, cx)))
             .into_any_element()
     }

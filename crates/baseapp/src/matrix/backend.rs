@@ -97,7 +97,6 @@ pub struct RoomSummary {
     pub invite: bool,
     pub encrypted: bool,
     pub unread: u64,
-    pub mentions: u64,
     pub members: u64,
     pub children: Vec<OwnedRoomId>,
 }
@@ -348,6 +347,7 @@ pub enum Update {
         ticket: u64,
         details: profile::Public,
     },
+    Unread(Vec<(OwnedRoomId, u64)>),
     Receipts {
         room: OwnedRoomId,
         readers: Vec<receipts::Reader>,
@@ -1016,6 +1016,35 @@ impl Worker {
             }
         }));
 
+        // Client-side counts include messages that do not trigger a notification.
+        // The event cache also updates them after local and remote read receipts.
+        let mut changes = client.room_info_notable_update_receiver();
+        if let Err(error) = client.event_cache().subscribe() {
+            log::warn!("matrix: could not start unread message tracking: {error}");
+        }
+        let outbox = self.outbox.clone();
+        let watched = client.clone();
+        self.tasks.push(tokio::spawn(async move {
+            loop {
+                match changes.recv().await {
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                }
+                // Coalesce a sync batch without reloading room names or members.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                while changes.try_recv().is_ok() {}
+                post(
+                    &outbox,
+                    Update::Unread(
+                        watched
+                            .rooms()
+                            .into_iter()
+                            .map(|room| (room.room_id().to_owned(), room.num_unread_messages()))
+                            .collect(),
+                    ),
+                );
+            }
+        }));
         post(&self.outbox, Update::Rooms(summaries(&client).await));
 
         let outbox = self.outbox.clone();
@@ -2041,7 +2070,6 @@ async fn summaries(client: &Client) -> Vec<RoomSummary> {
             RoomKind::Space => space_children(&room).await,
             _ => Vec::new(),
         };
-        let counts = room.unread_notification_counts();
         let permissions = if state == RoomState::Joined {
             match (client.user_id(), room.power_levels().await) {
                 (Some(user), Ok(levels)) => admin::Permissions::new(&levels, user),
@@ -2062,8 +2090,7 @@ async fn summaries(client: &Client) -> Vec<RoomSummary> {
             kind,
             invite: state == RoomState::Invited,
             encrypted: room.encryption_state().is_encrypted(),
-            unread: counts.notification_count,
-            mentions: counts.highlight_count,
+            unread: room.num_unread_messages(),
             members: room.joined_members_count(),
             children,
         });
