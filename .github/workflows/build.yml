@@ -51,7 +51,8 @@ jobs:
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             VER="$BASE"
           else
-            VER="${BASE}+${SHORT}"
+            # Use -gSHA (not +SHA): '+' breaks some apt/URL clients on GitHub Pages.
+            VER="${BASE}-g${SHORT}"
           fi
           echo "version=$VER" >> "$GITHUB_OUTPUT"
           echo "base=$BASE" >> "$GITHUB_OUTPUT"
@@ -198,7 +199,7 @@ jobs:
         run: |
           BASE="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
           SHORT="${GITHUB_SHA:0:7}"
-          echo "version=${BASE}+${SHORT}" >> "$GITHUB_OUTPUT"
+          echo "version=${BASE}-g${SHORT}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/download-artifact@v4
         with:
@@ -314,21 +315,25 @@ jobs:
 
       - name: Publish apt repo
         run: |
+          set -euo pipefail
           mkdir -p gh-pages/pool/main
+          # Bypass Jekyll so Packages / pool/*.deb are served as-is.
+          touch gh-pages/.nojekyll
           cp -f artifacts/deb/*.deb gh-pages/pool/main/
+          # Keep the repo small for GitHub Pages: only the newest few packages.
+          ls -1t gh-pages/pool/main/huddle_*.deb | tail -n +6 | xargs -r rm -f
           cd gh-pages
           dpkg-scanpackages --multiversion pool/ > Packages
           gzip -k -f Packages
-          cat > Release <<'EOF'
-          Origin: huddle
-          Label: huddle
-          Suite: stable
-          Codename: stable
-          Architectures: amd64
-          Components: main
-          Description: Huddle apt repository
-          EOF
-          apt-ftparchive release . >> Release || true
+          # Replace Release entirely (do not append) so metadata stays valid.
+          apt-ftparchive -o APT::FTPArchive::Release::Origin=huddle \
+            -o APT::FTPArchive::Release::Label=huddle \
+            -o APT::FTPArchive::Release::Suite=stable \
+            -o APT::FTPArchive::Release::Codename=stable \
+            -o APT::FTPArchive::Release::Architectures=amd64 \
+            -o APT::FTPArchive::Release::Components=main \
+            -o APT::FTPArchive::Release::Description="Huddle apt repository" \
+            release . > Release
 
       - name: Write install page
         run: |
@@ -349,8 +354,11 @@ jobs:
             <p>Source: <a href="https://github.com/Cattens-Roses/Huddle">github.com/Cattens-Roses/Huddle</a></p>
 
             <h2>Debian / Ubuntu (apt)</h2>
-            <pre>echo "deb [trusted=yes] https://cattens-roses.github.io/Huddle ./" \
-              | sudo tee /etc/apt/sources.list.d/huddle.list
+            <pre>curl -fsSL https://cattens-roses.github.io/Huddle/huddle.sources \
+              | sudo tee /etc/apt/sources.list.d/huddle.sources
+            # Or classic one-liner:
+            # echo "deb [trusted=yes] https://cattens-roses.github.io/Huddle ./" \
+            #   | sudo tee /etc/apt/sources.list.d/huddle.list
             sudo apt update
             sudo apt install huddle</pre>
 
@@ -358,6 +366,12 @@ jobs:
             <a href="https://github.com/Cattens-Roses/Huddle/releases/tag/beta">beta</a> GitHub release.</p>
           </body>
           </html>
+          EOF
+          cat > gh-pages/huddle.sources <<'EOF'
+          Types: deb
+          URIs: https://cattens-roses.github.io/Huddle
+          Suites: ./
+          Trusted: yes
           EOF
 
       - name: Commit & push gh-pages

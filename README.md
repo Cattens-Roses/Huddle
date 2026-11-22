@@ -35,6 +35,15 @@
 ### Linux (apt)
 
 ```sh
+curl -fsSL https://cattens-roses.github.io/Huddle/huddle.sources \
+  | sudo tee /etc/apt/sources.list.d/huddle.sources
+sudo apt update
+sudo apt install huddle
+```
+
+Classic `sources.list` form:
+
+```sh
 echo "deb [trusted=yes] https://cattens-roses.github.io/Huddle ./" \
   | sudo tee /etc/apt/sources.list.d/huddle.list
 sudo apt update
