@@ -1,64 +1,4 @@
 Package: huddle
-Version: 0.42.2+1991d84
-Architecture: amd64
-Maintainer: Huddle <hdmain@users.noreply.github.com>
-Depends: libasound2, libc6, libgcc-s1, libstdc++6, libfontconfig1, libfreetype6, libx11-6, libxcb1, libxcursor1, libxi6, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libwayland-cursor0, libwayland-egl1, libvulkan1, libgtk-3-0, libwebkit2gtk-4.1-0, libjavascriptcoregtk-4.1-0, libsoup-3.0-0
-Filename: pool/main/huddle_0.42.2+1991d84_amd64.deb
-Size: 27269872
-MD5sum: 8184ad4d363494c252e286f46dfa8a99
-SHA1: 3895a3e4c7a62f6622582d9e77294c38b7561fde
-SHA256: 7409fdb1dbca1d246d0d62d50c41f9110cd055c1cd96f0bf4cd61e041da44e8d
-Section: net
-Priority: optional
-Description: Matrix chat client
- A desktop Matrix client.
-
-Package: huddle
-Version: 0.42.2+2148440
-Architecture: amd64
-Maintainer: Huddle <hdmain@users.noreply.github.com>
-Depends: libasound2, libc6, libgcc-s1, libstdc++6, libfontconfig1, libfreetype6, libx11-6, libxcb1, libxcursor1, libxi6, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libwayland-cursor0, libwayland-egl1, libvulkan1, libgtk-3-0, libwebkit2gtk-4.1-0, libjavascriptcoregtk-4.1-0, libsoup-3.0-0
-Filename: pool/main/huddle_0.42.2+2148440_amd64.deb
-Size: 27606988
-MD5sum: 5745a4da615f9a14733cc8c35f0bbfd1
-SHA1: 3a55ec71b1eacad36776fa1c3f8262ded027c804
-SHA256: a0b799d098e4e19f3efb95ec3f85374e4c581f57b1dd5b0867587879d05181d9
-Section: net
-Priority: optional
-Description: Matrix chat client
- A desktop Matrix client.
-
-Package: huddle
-Version: 0.42.2+452551b
-Architecture: amd64
-Maintainer: Huddle <hdmain@users.noreply.github.com>
-Depends: libasound2, libc6, libgcc-s1, libstdc++6, libfontconfig1, libfreetype6, libx11-6, libxcb1, libxcursor1, libxi6, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libwayland-cursor0, libwayland-egl1, libvulkan1, libgtk-3-0, libwebkit2gtk-4.1-0, libjavascriptcoregtk-4.1-0, libsoup-3.0-0
-Filename: pool/main/huddle_0.42.2+452551b_amd64.deb
-Size: 27280938
-MD5sum: e93831c96b77642d4740ef22741d0899
-SHA1: fb4d70d50628de90ae04556fa87d07403612476e
-SHA256: b88369eb56e61bb855d981972a056415a0ddca0ae5628d8a57e024271ec0f7ca
-Section: net
-Priority: optional
-Description: Matrix chat client
- A desktop Matrix client.
-
-Package: huddle
-Version: 0.42.2+4591954
-Architecture: amd64
-Maintainer: Huddle <hdmain@users.noreply.github.com>
-Depends: libasound2, libc6, libgcc-s1, libstdc++6, libfontconfig1, libfreetype6, libx11-6, libxcb1, libxcursor1, libxi6, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libwayland-cursor0, libwayland-egl1, libvulkan1, libgtk-3-0, libwebkit2gtk-4.1-0, libjavascriptcoregtk-4.1-0, libsoup-3.0-0
-Filename: pool/main/huddle_0.42.2+4591954_amd64.deb
-Size: 27245864
-MD5sum: 99419cc9f3c1959cc9eae3ec43d80e10
-SHA1: 953503c8be7543dfd4cdbf3b5c9769bc4091107e
-SHA256: 48cca0d3c47c19f304af21760ca4f345b10d779c74b133b3c0becbc4f1b4d62c
-Section: net
-Priority: optional
-Description: Matrix chat client
- A desktop Matrix client.
-
-Package: huddle
 Version: 0.42.2+487fabf
 Architecture: amd64
 Maintainer: Huddle <hdmain@users.noreply.github.com>
@@ -113,6 +53,21 @@ Size: 27541278
 MD5sum: 9a7c686919d7dc061941baa225d4b3d7
 SHA1: 7a845db89de1f9d2520d936dfc666d695e9f7fe0
 SHA256: 44ac46fb7d1bd713c823ab755c7688431e90f91a6b60d830c7ba9fb758f00101
+Section: net
+Priority: optional
+Description: Matrix chat client
+ A desktop Matrix client.
+
+Package: huddle
+Version: 0.42.2-gef2b440
+Architecture: amd64
+Maintainer: Huddle <hdmain@users.noreply.github.com>
+Depends: libasound2, libc6, libgcc-s1, libstdc++6, libfontconfig1, libfreetype6, libx11-6, libxcb1, libxcursor1, libxi6, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libwayland-cursor0, libwayland-egl1, libvulkan1, libgtk-3-0, libwebkit2gtk-4.1-0, libjavascriptcoregtk-4.1-0, libsoup-3.0-0
+Filename: pool/main/huddle_0.42.2-gef2b440_amd64.deb
+Size: 27594946
+MD5sum: 532caabb688b3a1684de866a9f9c5595
+SHA1: b1c436546f98d69b7187de3161c9dd7b3c5d3af7
+SHA256: 44da49f80c8973d65b0cb129fe6b0149a6ac3cefbed117899370459eeb3ce0f4
 Section: net
 Priority: optional
 Description: Matrix chat client

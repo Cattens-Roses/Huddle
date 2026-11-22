@@ -14,8 +14,11 @@
   <p>Source: <a href="https://github.com/Cattens-Roses/Huddle">github.com/Cattens-Roses/Huddle</a></p>
 
   <h2>Debian / Ubuntu (apt)</h2>
-  <pre>echo "deb [trusted=yes] https://cattens-roses.github.io/Huddle ./" \
-    | sudo tee /etc/apt/sources.list.d/huddle.list
+  <pre>curl -fsSL https://cattens-roses.github.io/Huddle/huddle.sources \
+    | sudo tee /etc/apt/sources.list.d/huddle.sources
+  # Or classic one-liner:
+  # echo "deb [trusted=yes] https://cattens-roses.github.io/Huddle ./" \
+  #   | sudo tee /etc/apt/sources.list.d/huddle.list
   sudo apt update
   sudo apt install huddle</pre>
 
