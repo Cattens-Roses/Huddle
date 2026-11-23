@@ -15,6 +15,7 @@
   <a href="https://github.com/Cattens-Roses/Huddle/network/members"><img src="https://img.shields.io/github/forks/Cattens-Roses/Huddle?style=flat-square" alt="Forks"></a>
   <a href="https://github.com/Cattens-Roses/Huddle/issues"><img src="https://img.shields.io/github/issues/Cattens-Roses/Huddle?style=flat-square" alt="Issues"></a>
   <a href="https://github.com/Cattens-Roses/Huddle/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Cattens-Roses/Huddle/ci.yml?style=flat-square&label=ci" alt="CI"></a>
+  <a href="https://snapcraft.io/huddle"><img src="https://snapcraft.io/huddle/badge.svg" alt="huddle"></a>
   <a href="COPYING"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue?style=flat-square" alt="License"></a>
 </p>
 
