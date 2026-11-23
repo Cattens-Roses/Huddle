@@ -1,6 +1,8 @@
 name: huddle
 title: Huddle
 base: core24
+version: git
+adopt-info: huddle
 summary: Native Matrix desktop client
 description: |
   Huddle is a native Matrix desktop client built with Rust and GPUI.
@@ -114,4 +116,8 @@ parts:
       sed -i 's|^Icon=.*|Icon=huddle|' "$CRAFT_PART_INSTALL/usr/share/applications/huddle.desktop"
     override-prime: |
       craftctl default
-      craftctl set version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$CRAFT_PROJECT_DIR/Cargo.toml" | head -n 1)"
+      ver="$(sed -n 's/^version = "\(.*\)"/\1/p' "$CRAFT_PROJECT_DIR/Cargo.toml" | head -n 1)"
+      if [ -n "${GITHUB_SHA:-}" ]; then
+        ver="${ver}-g${GITHUB_SHA:0:7}"
+      fi
+      craftctl set version="$ver"
