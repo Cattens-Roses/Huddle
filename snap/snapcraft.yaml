@@ -48,16 +48,40 @@ apps:
       LD_LIBRARY_PATH: $SNAP/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 
 parts:
+  # Required by the rust plugin when the host has no rustup (CI / destructive-mode).
+  rust-deps:
+    plugin: nil
+    build-packages:
+      - curl
+      - ca-certificates
+    override-pull: |
+      set -euo pipefail
+      if ! command -v rustup >/dev/null 2>&1; then
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+          | sh -s -- -y --default-toolchain none --profile minimal --no-modify-path
+      fi
+      export PATH="${HOME}/.cargo/bin:/root/.cargo/bin:${PATH}"
+      rustup --version
+    override-build: |
+      set -euo pipefail
+      export PATH="${HOME}/.cargo/bin:/root/.cargo/bin:${PATH}"
+      rustup --version
+
   huddle:
+    after: [rust-deps]
     plugin: rust
     source: .
     rust-channel: "1.98.1"
     rust-path: [crates/baseapp]
+    build-environment:
+      - PATH: ${HOME}/.cargo/bin:/root/.cargo/bin:${PATH}
     build-packages:
       - build-essential
       - cmake
       - pkg-config
       - mold
+      - curl
+      - ca-certificates
       - libasound2-dev
       - libfontconfig1-dev
       - libfreetype-dev
@@ -95,6 +119,7 @@ parts:
       - libegl1
     override-build: |
       set -euo pipefail
+      export PATH="${HOME}/.cargo/bin:/root/.cargo/bin:${PATH}"
       export HUDDLE_BUILD_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$CRAFT_PROJECT_DIR/Cargo.toml" | head -n 1)"
       if [ -n "${GITHUB_SHA:-}" ]; then
         export HUDDLE_BUILD_VERSION="${HUDDLE_BUILD_VERSION}-g${GITHUB_SHA:0:7}"
