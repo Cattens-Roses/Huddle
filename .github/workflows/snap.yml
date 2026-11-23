@@ -117,10 +117,7 @@ jobs:
           retention-days: 14
 
       - name: Publish to Snap Store (stable)
-        if: >
-          startsWith(github.ref, 'refs/tags/v') &&
-          steps.build.outputs.built == 'true' &&
-          secrets.SNAPCRAFT_STORE_CREDENTIALS != ''
+        if: startsWith(github.ref, 'refs/tags/v') && steps.build.outputs.built == 'true'
         uses: snapcore/action-publish@v1
         env:
           SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
@@ -131,23 +128,16 @@ jobs:
       - name: Publish to Snap Store (beta / edge)
         if: >
           steps.build.outputs.built == 'true' &&
-          github.event_name == 'push' &&
-          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') &&
-          secrets.SNAPCRAFT_STORE_CREDENTIALS != ''
+          (
+            github.event_name == 'workflow_dispatch' ||
+            (
+              github.event_name == 'push' &&
+              (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+            )
+          )
         uses: snapcore/action-publish@v1
         env:
           SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
         with:
           snap: ${{ steps.build.outputs.snap }}
           release: beta,edge
-
-      - name: Remind when credentials are missing
-        if: >
-          steps.build.outputs.built == 'true' &&
-          secrets.SNAPCRAFT_STORE_CREDENTIALS == '' &&
-          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
-        run: |
-          echo "::warning::SNAPCRAFT_STORE_CREDENTIALS secret is not set. Snap was built but not published."
-          echo "Register the name, then:"
-          echo "  snapcraft export-login snap-creds.txt"
-          echo "  gh secret set SNAPCRAFT_STORE_CREDENTIALS < snap-creds.txt"
