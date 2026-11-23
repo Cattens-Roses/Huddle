@@ -83,6 +83,15 @@ jobs:
       - name: Build huddle
         run: cargo build --release --locked -p baseapp --target ${{ matrix.target }}
 
+      - name: Upload Linux binary
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: huddle-linux-bin
+          path: target/${{ matrix.target }}/release/huddle
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Build the Debian package
         if: runner.os == 'Linux'
         env:
@@ -91,12 +100,48 @@ jobs:
           HUDDLE_VERSION: ${{ steps.ver.outputs.version }}
         run: bash packaging/linux/build-deb.sh
 
+      - name: Build the RPM package
+        if: runner.os == 'Linux'
+        env:
+          TARGET: ${{ matrix.target }}
+          HUDDLE_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          sudo apt-get install -y --no-install-recommends rpm
+          bash packaging/linux/build-rpm.sh
+
+      - name: Build the AppImage
+        if: runner.os == 'Linux'
+        env:
+          TARGET: ${{ matrix.target }}
+          HUDDLE_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          sudo apt-get install -y --no-install-recommends file zsync libfuse2 || true
+          bash packaging/linux/build-appimage.sh
+
       - name: Upload the Debian package
         if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
           name: huddle-linux-deb
           path: dist/*.deb
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload the RPM package
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: huddle-linux-rpm
+          path: dist/*.rpm
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload the AppImage
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: huddle-linux-appimage
+          path: dist/*.AppImage
           if-no-files-found: error
           retention-days: 14
 
@@ -181,14 +226,74 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  package-arch:
+    name: Arch Linux package
+    if: |
+      always() &&
+      needs.build.result == 'success' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+    needs: [build]
+    runs-on: ubuntu-22.04
+    container:
+      image: archlinux:latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Version
+        id: ver
+        shell: bash
+        run: |
+          BASE="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          SHORT="${GITHUB_SHA:0:7}"
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VER="$BASE"
+          else
+            VER="${BASE}-g${SHORT}"
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "HUDDLE_VERSION=$VER" >> "$GITHUB_ENV"
+
+      - name: Install packaging tools
+        run: |
+          pacman -Sy --noconfirm base-devel
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: huddle-linux-bin
+          path: target/x86_64-unknown-linux-gnu/release
+
+      - name: Prepare binary
+        run: |
+          chmod +x target/x86_64-unknown-linux-gnu/release/huddle
+          # makepkg refuses to run as root; use a build user.
+          useradd -m builder
+          mkdir -p dist
+          chown -R builder:builder .
+
+      - name: Build Arch package
+        env:
+          TARGET: x86_64-unknown-linux-gnu
+          HUDDLE_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          su builder -c 'bash packaging/linux/build-arch.sh'
+
+      - name: Upload Arch package
+        uses: actions/upload-artifact@v4
+        with:
+          name: huddle-linux-arch
+          path: dist/*.pkg.tar.zst
+          if-no-files-found: error
+          retention-days: 14
+
   beta:
     name: Publish beta release
     if: |
       always() &&
       github.event_name == 'push' &&
       (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') &&
-      needs.build.result == 'success'
-    needs: [build]
+      needs.build.result == 'success' &&
+      needs.package-arch.result == 'success'
+    needs: [build, package-arch]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
@@ -211,6 +316,9 @@ jobs:
           set -euo pipefail
           mkdir -p dist update-windows
           cp -f artifacts/huddle-linux-deb/*.deb dist/
+          cp -f artifacts/huddle-linux-rpm/*.rpm dist/
+          cp -f artifacts/huddle-linux-appimage/*.AppImage dist/
+          cp -f artifacts/huddle-linux-arch/*.pkg.tar.zst dist/
           cp -f artifacts/huddle-windows-setup/Huddle-Setup.exe dist/
           cp -f artifacts/huddle-windows-exe/Huddle.exe dist/
           MANIFEST="$(find artifacts/huddle-update-windows -name 'update-manifest-windows-x64.json' | head -n 1)"
@@ -237,9 +345,13 @@ jobs:
 
           This is an automated prerelease. Prefer a tagged \`v*\` release for day-to-day use when available.
 
+          ### Packages
+          - Linux: \`.deb\`, \`.rpm\`, AppImage, Arch \`.pkg.tar.zst\`
+          - Windows: \`Huddle-Setup.exe\` / \`Huddle.exe\`
+
           ### Auto-updates
           - **Windows** - in-app differential updates from this \`beta\` channel
-          - **Linux** - apt repository at https://cattens-roses.github.io/Huddle/
+          - **Linux** - package repos at https://cattens-roses.github.io/Huddle/
           EOF
 
       - name: Replace previous beta release
@@ -259,6 +371,9 @@ jobs:
           target_commitish: ${{ github.sha }}
           files: |
             dist/*.deb
+            dist/*.rpm
+            dist/*.AppImage
+            dist/*.pkg.tar.zst
             dist/Huddle-Setup.exe
             dist/Huddle.exe
 
@@ -275,20 +390,20 @@ jobs:
             exit 1
           fi
 
-  apt-repo:
-    name: Publish apt repository
+  packages:
+    name: Publish package repositories
     if: |
       always() &&
       github.event_name == 'push' &&
       (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) &&
-      needs.build.result == 'success'
-    needs: [build]
+      needs.build.result == 'success' &&
+      needs.package-arch.result == 'success'
+    needs: [build, package-arch]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: huddle-linux-deb
-          path: artifacts/deb
+          path: artifacts
 
       - name: Checkout gh-pages
         uses: actions/checkout@v5
@@ -311,29 +426,43 @@ jobs:
       - name: Install repo tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y dpkg-dev apt-utils
+          sudo apt-get install -y dpkg-dev apt-utils createrepo-c
 
-      - name: Publish apt repo
+      - name: Publish apt / rpm / arch repos
         run: |
           set -euo pipefail
-          mkdir -p gh-pages/pool/main
-          # Bypass Jekyll so Packages / pool/*.deb are served as-is.
           touch gh-pages/.nojekyll
-          cp -f artifacts/deb/*.deb gh-pages/pool/main/
-          # Keep the repo small for GitHub Pages: only the newest few packages.
+
+          # apt
+          mkdir -p gh-pages/pool/main
+          cp -f artifacts/huddle-linux-deb/*.deb gh-pages/pool/main/
           ls -1t gh-pages/pool/main/huddle_*.deb | tail -n +6 | xargs -r rm -f
-          cd gh-pages
-          dpkg-scanpackages --multiversion pool/ > Packages
-          gzip -k -f Packages
-          # Replace Release entirely (do not append) so metadata stays valid.
-          apt-ftparchive -o APT::FTPArchive::Release::Origin=huddle \
-            -o APT::FTPArchive::Release::Label=huddle \
-            -o APT::FTPArchive::Release::Suite=stable \
-            -o APT::FTPArchive::Release::Codename=stable \
-            -o APT::FTPArchive::Release::Architectures=amd64 \
-            -o APT::FTPArchive::Release::Components=main \
-            -o APT::FTPArchive::Release::Description="Huddle apt repository" \
-            release . > Release
+          (
+            cd gh-pages
+            dpkg-scanpackages --multiversion pool/ > Packages
+            gzip -k -f Packages
+            apt-ftparchive -o APT::FTPArchive::Release::Origin=huddle \
+              -o APT::FTPArchive::Release::Label=huddle \
+              -o APT::FTPArchive::Release::Suite=stable \
+              -o APT::FTPArchive::Release::Codename=stable \
+              -o APT::FTPArchive::Release::Architectures=amd64 \
+              -o APT::FTPArchive::Release::Components=main \
+              -o APT::FTPArchive::Release::Description="Huddle apt repository" \
+              release . > Release
+          )
+
+          # rpm / dnf
+          mkdir -p gh-pages/rpm
+          cp -f artifacts/huddle-linux-rpm/*.rpm gh-pages/rpm/
+          ls -1t gh-pages/rpm/huddle-*.rpm | tail -n +6 | xargs -r rm -f
+          createrepo_c gh-pages/rpm
+
+          # arch / pacman
+          mkdir -p gh-pages/arch
+          cp -f artifacts/huddle-linux-arch/*.pkg.tar.zst gh-pages/arch/
+          ls -1t gh-pages/arch/huddle-*.pkg.tar.zst | tail -n +6 | xargs -r rm -f
+          docker run --rm -v "$GITHUB_WORKSPACE/gh-pages/arch:/repo" archlinux:latest \
+            bash -c "pacman -Sy --noconfirm pacman-contrib && cd /repo && rm -f huddle.db* huddle.files* && repo-add huddle.db.tar.gz *.pkg.tar.zst"
 
       - name: Write install page
         run: |
@@ -344,26 +473,47 @@ jobs:
             <meta charset="utf-8">
             <title>Huddle packages</title>
             <style>
-              body{font-family:monospace;max-width:820px;margin:40px auto;background:#0d1117;color:#c9d1d9;line-height:1.5}
+              body{font-family:monospace;max-width:860px;margin:40px auto;background:#0d1117;color:#c9d1d9;line-height:1.5}
               h1,h2{color:#58a6ff} pre{background:#161b22;padding:16px;border-radius:6px;overflow-x:auto}
               a{color:#79c0ff}
             </style>
           </head>
           <body>
             <h1>Huddle packages</h1>
-            <p>Source: <a href="https://github.com/Cattens-Roses/Huddle">github.com/Cattens-Roses/Huddle</a></p>
+            <p>Source: <a href="https://github.com/Cattens-Roses/Huddle">github.com/Cattens-Roses/Huddle</a>
+            · Releases: <a href="https://github.com/Cattens-Roses/Huddle/releases/tag/beta">beta</a></p>
 
             <h2>Debian / Ubuntu (apt)</h2>
             <pre>curl -fsSL https://cattens-roses.github.io/Huddle/huddle.sources \
               | sudo tee /etc/apt/sources.list.d/huddle.sources
-            # Or classic one-liner:
-            # echo "deb [trusted=yes] https://cattens-roses.github.io/Huddle ./" \
-            #   | sudo tee /etc/apt/sources.list.d/huddle.list
             sudo apt update
             sudo apt install huddle</pre>
 
-            <p>After that, system updates keep Huddle current. Rolling builds also publish to the
-            <a href="https://github.com/Cattens-Roses/Huddle/releases/tag/beta">beta</a> GitHub release.</p>
+            <h2>Fedora / AlmaLinux / RHEL (dnf)</h2>
+            <pre>sudo tee /etc/yum.repos.d/huddle.repo &lt;&lt;'REPO'
+            [huddle]
+            name=Huddle
+            baseurl=https://cattens-roses.github.io/Huddle/rpm
+            enabled=1
+            gpgcheck=0
+            REPO
+            sudo dnf install huddle</pre>
+
+            <h2>Arch Linux (pacman)</h2>
+            <pre>sudo tee -a /etc/pacman.conf &lt;&lt;'REPO'
+
+            [huddle]
+            SigLevel = Optional TrustAll
+            Server = https://cattens-roses.github.io/Huddle/arch/
+            REPO
+            sudo pacman -Sy huddle</pre>
+
+            <h2>AppImage</h2>
+            <p>Download the <code>.AppImage</code> from the
+            <a href="https://github.com/Cattens-Roses/Huddle/releases/tag/beta">beta release</a>,
+            then:</p>
+            <pre>chmod +x Huddle-*-x86_64.AppImage
+            ./Huddle-*-x86_64.AppImage</pre>
           </body>
           </html>
           EOF
@@ -380,5 +530,5 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git diff --cached --quiet || git commit -m "packages: apt repo"
+          git diff --cached --quiet || git commit -m "packages: apt rpm arch"
           git push origin HEAD:gh-pages --force

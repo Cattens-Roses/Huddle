@@ -38,11 +38,15 @@
 - **Cache** - disk and memory media caches with size limits and one-click clear
 - **Appearance** - customizable UI using the shared GPUI design system
 - **Desktop extras** - system tray, background presence, and packaged Linux/Windows builds
-- **Auto-updates** - Windows in-app differential updates; Linux apt repository updates
+- **Auto-updates** - Windows in-app differential updates; Linux apt / dnf / pacman repos
 
 ## Install
 
-### Linux (apt)
+Package repos and install commands live at
+[cattens-roses.github.io/Huddle](https://cattens-roses.github.io/Huddle/).
+Rolling binaries are also on the [beta](https://github.com/Cattens-Roses/Huddle/releases/tag/beta) release.
+
+### Linux (apt / Debian / Ubuntu)
 
 ```sh
 curl -fsSL https://cattens-roses.github.io/Huddle/huddle.sources \
@@ -51,16 +55,40 @@ sudo apt update
 sudo apt install huddle
 ```
 
-Classic `sources.list` form:
+### Linux (dnf / Fedora / AlmaLinux / RHEL)
 
 ```sh
-echo "deb [trusted=yes] https://cattens-roses.github.io/Huddle ./" \
-  | sudo tee /etc/apt/sources.list.d/huddle.list
-sudo apt update
-sudo apt install huddle
+sudo tee /etc/yum.repos.d/huddle.repo <<'REPO'
+[huddle]
+name=Huddle
+baseurl=https://cattens-roses.github.io/Huddle/rpm
+enabled=1
+gpgcheck=0
+REPO
+sudo dnf install huddle
 ```
 
-Details: [cattens-roses.github.io/Huddle](https://cattens-roses.github.io/Huddle/).
+### Linux (pacman / Arch)
+
+```sh
+sudo tee -a /etc/pacman.conf <<'REPO'
+
+[huddle]
+SigLevel = Optional TrustAll
+Server = https://cattens-roses.github.io/Huddle/arch/
+REPO
+sudo pacman -Sy huddle
+```
+
+### Linux (AppImage)
+
+Download `Huddle-*-x86_64.AppImage` from the
+[beta release](https://github.com/Cattens-Roses/Huddle/releases/tag/beta):
+
+```sh
+chmod +x Huddle-*-x86_64.AppImage
+./Huddle-*-x86_64.AppImage
+```
 
 ### Windows
 
@@ -68,7 +96,7 @@ Install [Huddle-Setup.exe](https://github.com/Cattens-Roses/Huddle/releases/tag/
 
 ### Beta builds
 
-Every push to `main` refreshes the rolling [beta](https://github.com/Cattens-Roses/Huddle/releases/tag/beta) prerelease (`.deb`, Windows setup/exe, and update blobs).
+Every push to `main` refreshes the rolling [beta](https://github.com/Cattens-Roses/Huddle/releases/tag/beta) prerelease (`.deb`, `.rpm`, AppImage, Arch package, Windows setup/exe, and update blobs) and republishes the apt / dnf / pacman repos.
 
 ## How to run
 
@@ -105,9 +133,9 @@ cargo test -p baseapp system_audio_and_video_playback_smoke -- --ignored
 - `crates/ui` - GPUI components and theme tokens
 - `crates/icons` / `crates/i18n` / `crates/embed` - icons, localization, embedding helpers
 - `assets` - app icon and UI icon sets
-- `packaging` - Linux `.deb`, Windows installer, and update manifest scripts
-- `flatpak` / `nix` - packaging and Nix flake support
-- `.github` - CI, beta release, apt repo publish, issue templates
+- `packaging` - Linux `.deb` / `.rpm` / AppImage / Arch, Windows installer, update manifests
+- `flatpak` / `nix` - Flatpak and Nix flake support
+- `.github` - CI, beta release, apt/dnf/pacman repo publish, issue templates
 
 The Cargo package remains `baseapp`; its executable is `huddle` (`huddle.exe` on Windows).
 Windows releases ship it as `Huddle.exe`. Build an installer with

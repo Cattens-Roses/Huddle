@@ -1,0 +1,31 @@
+# Maintainer: Huddle <hdmain@users.noreply.github.com>
+# CI / local binary package. Set HUDDLE_BIN if the binary is not ./huddle.
+pkgname=huddle
+pkgver=${HUDDLE_PKGVER:-0.42.2}
+pkgrel=1
+pkgdesc="Native Matrix desktop client"
+arch=('x86_64')
+url="https://github.com/Cattens-Roses/Huddle"
+license=('GPL-3.0-or-later')
+depends=(
+  'alsa-lib'
+  'fontconfig'
+  'freetype2'
+  'libx11'
+  'libxcursor'
+  'libxi'
+  'libxkbcommon'
+  'wayland'
+  'vulkan-icd-loader'
+  'gtk3'
+  'webkit2gtk-4.1'
+)
+options=('!strip' '!debug')
+source=('huddle' 'huddle.desktop' 'huddle.svg')
+sha256sums=('SKIP' 'SKIP' 'SKIP')
+
+package() {
+  install -Dm755 "$srcdir/huddle" "$pkgdir/usr/bin/huddle"
+  install -Dm644 "$srcdir/huddle.desktop" "$pkgdir/usr/share/applications/huddle.desktop"
+  install -Dm644 "$srcdir/huddle.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/huddle.svg"
+}
