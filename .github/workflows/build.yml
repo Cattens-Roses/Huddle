@@ -508,6 +508,9 @@ jobs:
             REPO
             sudo pacman -Sy huddle</pre>
 
+            <h2>Snap</h2>
+            <pre>sudo snap install huddle --beta</pre>
+
             <h2>AppImage</h2>
             <p>Download the <code>.AppImage</code> from the
             <a href="https://github.com/Cattens-Roses/Huddle/releases/tag/beta">beta release</a>,

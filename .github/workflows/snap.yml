@@ -1,0 +1,153 @@
+name: Snap
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "snap/**"
+      - ".github/workflows/snap.yml"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "packaging/linux/**"
+      - "assets/linux/**"
+  workflow_dispatch:
+
+concurrency:
+  group: snap-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  snap:
+    name: Build snap (amd64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install snapcraft
+        id: snapcraft
+        env:
+          REQUIRE_SNAP: ${{ startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch' }}
+        run: |
+          set -euo pipefail
+          echo "ready=false" >> "$GITHUB_OUTPUT"
+          if snap list snapcraft >/dev/null 2>&1; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          attempt=0
+          until sudo snap install snapcraft --classic; do
+            attempt=$((attempt + 1))
+            if [ "$attempt" -ge 4 ]; then
+              if [ "$REQUIRE_SNAP" = "true" ]; then
+                echo "::error::Snap Store unreachable after $attempt tries."
+                exit 1
+              fi
+              echo "::warning::Snap Store unreachable; skipping snap build."
+              exit 0
+            fi
+            sleep $((attempt * 20))
+          done
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Build snap
+        id: build
+        if: steps.snapcraft.outputs.ready == 'true'
+        env:
+          SNAPCRAFT_BUILD_INFO: "1"
+          GITHUB_SHA: ${{ github.sha }}
+          REQUIRE_SNAP: ${{ startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch' }}
+        run: |
+          set -euo pipefail
+          echo "built=false" >> "$GITHUB_OUTPUT"
+          is_store_error() {
+            printf '%s' "$1" | grep -Eqi \
+              'Error installing snap|unable to contact snap store|api\.snapcraft\.io|Client\.Timeout|connection refused|connection reset|temporarily unavailable|Too Many Requests|Fetch and check assertions'
+          }
+          attempt=0
+          while true; do
+            attempt=$((attempt + 1))
+            rm -f ./*.snap
+            set +e
+            log="$(mktemp)"
+            sudo --preserve-env=GITHUB_SHA,SNAPCRAFT_BUILD_INFO \
+              /snap/bin/snapcraft pack --destructive-mode >"$log" 2>&1
+            status=$?
+            set -e
+            cat "$log"
+            if [ "$status" -eq 0 ]; then
+              SNAP_PATH="$(find "$GITHUB_WORKSPACE" -maxdepth 1 -type f -name '*.snap' | head -n 1)"
+              if [ -z "$SNAP_PATH" ]; then
+                echo "No .snap was produced" >&2
+                exit 1
+              fi
+              echo "snap=$SNAP_PATH" >> "$GITHUB_OUTPUT"
+              echo "built=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            output="$(cat "$log")"
+            rm -f "$log"
+            if ! is_store_error "$output"; then
+              echo "::error::snapcraft pack failed."
+              exit "$status"
+            fi
+            if [ "$attempt" -ge 4 ]; then
+              if [ "$REQUIRE_SNAP" = "true" ]; then
+                echo "::error::Snap Store unreachable after $attempt pack tries."
+                exit 1
+              fi
+              echo "::warning::Skipping snap on this run due to Snap Store outage."
+              exit 0
+            fi
+            sleep $((attempt * 20))
+          done
+
+      - name: Upload snap
+        if: steps.build.outputs.built == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: huddle-linux-snap
+          path: ${{ steps.build.outputs.snap }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish to Snap Store (stable)
+        if: >
+          startsWith(github.ref, 'refs/tags/v') &&
+          steps.build.outputs.built == 'true' &&
+          secrets.SNAPCRAFT_STORE_CREDENTIALS != ''
+        uses: snapcore/action-publish@v1
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        with:
+          snap: ${{ steps.build.outputs.snap }}
+          release: stable,candidate,beta,edge
+
+      - name: Publish to Snap Store (beta / edge)
+        if: >
+          steps.build.outputs.built == 'true' &&
+          github.event_name == 'push' &&
+          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') &&
+          secrets.SNAPCRAFT_STORE_CREDENTIALS != ''
+        uses: snapcore/action-publish@v1
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        with:
+          snap: ${{ steps.build.outputs.snap }}
+          release: beta,edge
+
+      - name: Remind when credentials are missing
+        if: >
+          steps.build.outputs.built == 'true' &&
+          secrets.SNAPCRAFT_STORE_CREDENTIALS == '' &&
+          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
+        run: |
+          echo "::warning::SNAPCRAFT_STORE_CREDENTIALS secret is not set. Snap was built but not published."
+          echo "Register the name, then:"
+          echo "  snapcraft export-login snap-creds.txt"
+          echo "  gh secret set SNAPCRAFT_STORE_CREDENTIALS < snap-creds.txt"

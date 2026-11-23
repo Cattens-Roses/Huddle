@@ -1,0 +1,117 @@
+name: huddle
+title: Huddle
+base: core24
+summary: Native Matrix desktop client
+description: |
+  Huddle is a native Matrix desktop client built with Rust and GPUI.
+  Chat in rooms and DMs, use threads, encrypted messaging, voice and
+  video calls, and native media playback with customizable appearance.
+grade: stable
+confinement: strict
+license: GPL-3.0-or-later
+icon: assets/linux/icons/hicolor/512x512/apps/huddle.png
+website: https://github.com/Cattens-Roses/Huddle
+source-code: https://github.com/Cattens-Roses/Huddle
+issues: https://github.com/Cattens-Roses/Huddle/issues
+contact: https://github.com/Cattens-Roses/Huddle/issues
+
+platforms:
+  amd64:
+
+apps:
+  huddle:
+    extensions: [gnome]
+    common-id: huddle
+    desktop: usr/share/applications/huddle.desktop
+    command: bin/huddle
+    plugs:
+      - audio-playback
+      - audio-record
+      - camera
+      - home
+      - network
+      - network-bind
+      - opengl
+      - removable-media
+      - wayland
+      - x11
+      - desktop
+      - desktop-legacy
+      - gsettings
+      - unity7
+    environment:
+      # Package manager owns updates inside the Snap Store.
+      HUDDLE_DISABLE_UPDATE: "1"
+      LIBGL_DRIVERS_PATH: $SNAP/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/dri
+      LD_LIBRARY_PATH: $SNAP/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+
+parts:
+  huddle:
+    plugin: rust
+    source: .
+    rust-channel: "1.98.1"
+    rust-path: [crates/baseapp]
+    build-packages:
+      - build-essential
+      - cmake
+      - pkg-config
+      - mold
+      - libasound2-dev
+      - libfontconfig1-dev
+      - libfreetype-dev
+      - libx11-dev
+      - libxcb1-dev
+      - libxcursor-dev
+      - libxi-dev
+      - libxkbcommon-dev
+      - libxkbcommon-x11-dev
+      - libwayland-dev
+      - libvulkan-dev
+      - libgtk-3-dev
+      - libwebkit2gtk-4.1-dev
+      - libsoup-3.0-dev
+      - libjavascriptcoregtk-4.1-dev
+    stage-packages:
+      - libasound2t64
+      - libfontconfig1
+      - libfreetype6
+      - libx11-6
+      - libxcb1
+      - libxcursor1
+      - libxi6
+      - libxkbcommon0
+      - libxkbcommon-x11-0
+      - libwayland-client0
+      - libwayland-cursor0
+      - libwayland-egl1
+      - libvulkan1
+      - libgtk-3-0t64
+      - libwebkit2gtk-4.1-0
+      - libjavascriptcoregtk-4.1-0
+      - libsoup-3.0-0
+      - libgl1
+      - libegl1
+    override-build: |
+      set -euo pipefail
+      export HUDDLE_BUILD_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$CRAFT_PROJECT_DIR/Cargo.toml" | head -n 1)"
+      if [ -n "${GITHUB_SHA:-}" ]; then
+        export HUDDLE_BUILD_VERSION="${HUDDLE_BUILD_VERSION}-g${GITHUB_SHA:0:7}"
+      fi
+      craftctl default
+      install -Dm644 "$CRAFT_PROJECT_DIR/packaging/linux/huddle.desktop" \
+        "$CRAFT_PART_INSTALL/usr/share/applications/huddle.desktop"
+      install -Dm644 "$CRAFT_PROJECT_DIR/assets/linux/huddle.svg" \
+        "$CRAFT_PART_INSTALL/usr/share/icons/hicolor/scalable/apps/huddle.svg"
+      for size in 16 24 32 48 64 128 256 512; do
+        src="$CRAFT_PROJECT_DIR/assets/linux/icons/hicolor/${size}x${size}/apps/huddle.png"
+        if [ -f "$src" ]; then
+          install -Dm644 "$src" \
+            "$CRAFT_PART_INSTALL/usr/share/icons/hicolor/${size}x${size}/apps/huddle.png"
+        fi
+      done
+      # Snap desktop Exec must be the app name, not an absolute path.
+      sed -i 's|^Exec=.*|Exec=huddle|' "$CRAFT_PART_INSTALL/usr/share/applications/huddle.desktop"
+      sed -i 's|^Icon=.*|Icon=huddle|' "$CRAFT_PART_INSTALL/usr/share/applications/huddle.desktop"
+    override-prime: |
+      craftctl default
+      craftctl set version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$CRAFT_PROJECT_DIR/Cargo.toml" | head -n 1)"

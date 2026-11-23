@@ -80,6 +80,15 @@ REPO
 sudo pacman -Sy huddle
 ```
 
+### Linux (Snap)
+
+```sh
+sudo snap install huddle --beta
+```
+
+Stable channel publishes on version tags. Edge/beta track every `main` build once
+`SNAPCRAFT_STORE_CREDENTIALS` is configured.
+
 ### Linux (AppImage)
 
 Download `Huddle-*-x86_64.AppImage` from the
