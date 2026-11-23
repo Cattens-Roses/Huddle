@@ -48,33 +48,37 @@ apps:
       LD_LIBRARY_PATH: $SNAP/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 
 parts:
-  # Required by the rust plugin when the host has no rustup (CI / destructive-mode).
+  # Snapcraft < 9.3 does not auto-provision rustup in clean CI.
+  # Workaround: rust-channel: none + rust-deps that stages cargo/rustc.
+  # See https://github.com/canonical/snapcraft/issues/6330
   rust-deps:
     plugin: nil
     build-packages:
       - curl
       - ca-certificates
-    override-pull: |
-      set -euo pipefail
-      if ! command -v rustup >/dev/null 2>&1; then
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-          | sh -s -- -y --default-toolchain none --profile minimal --no-modify-path
-      fi
-      export PATH="${HOME}/.cargo/bin:/root/.cargo/bin:${PATH}"
-      rustup --version
     override-build: |
       set -euo pipefail
-      export PATH="${HOME}/.cargo/bin:/root/.cargo/bin:${PATH}"
-      rustup --version
+      export RUSTUP_HOME="${CRAFT_PART_INSTALL}/usr/lib/rustup"
+      export CARGO_HOME="${CRAFT_PART_INSTALL}/usr"
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain 1.98.1 --profile minimal --no-modify-path
+      "${CARGO_HOME}/bin/rustc" --version
+      "${CARGO_HOME}/bin/cargo" --version
+    # Build-only toolchain; never ship it in the snap.
+    prime:
+      - -*
 
   huddle:
     after: [rust-deps]
     plugin: rust
     source: .
-    rust-channel: "1.98.1"
+    # Must be "none" when depending on rust-deps (plugin conflict otherwise).
+    rust-channel: none
     rust-path: [crates/baseapp]
     build-environment:
-      - PATH: ${HOME}/.cargo/bin:/root/.cargo/bin:${PATH}
+      - RUSTUP_HOME: $CRAFT_STAGE/usr/lib/rustup
+      - CARGO_HOME: $CRAFT_STAGE/usr
+      - PATH: $CRAFT_STAGE/usr/bin:$PATH
     build-packages:
       - build-essential
       - cmake
@@ -119,7 +123,9 @@ parts:
       - libegl1
     override-build: |
       set -euo pipefail
-      export PATH="${HOME}/.cargo/bin:/root/.cargo/bin:${PATH}"
+      export RUSTUP_HOME="${CRAFT_STAGE}/usr/lib/rustup"
+      export CARGO_HOME="${CRAFT_STAGE}/usr"
+      export PATH="${CRAFT_STAGE}/usr/bin:${PATH}"
       export HUDDLE_BUILD_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$CRAFT_PROJECT_DIR/Cargo.toml" | head -n 1)"
       if [ -n "${GITHUB_SHA:-}" ]; then
         export HUDDLE_BUILD_VERSION="${HUDDLE_BUILD_VERSION}-g${GITHUB_SHA:0:7}"
