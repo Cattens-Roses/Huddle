@@ -450,6 +450,8 @@ pub struct MatrixClient {
     cache_status: Option<String>,
     viewing: Option<View>,
     player: Option<playback::Player>,
+    player_audio: Option<String>,
+    audio_thread_timeline: ScrubberState,
     player_image: Option<Arc<gpui::RenderImage>>,
     painted_player_image: Option<Arc<gpui::RenderImage>>,
     player_timeline: ScrubberState,
@@ -588,6 +590,8 @@ impl MatrixClient {
             cache_status: None,
             viewing: None,
             player: None,
+            player_audio: None,
+            audio_thread_timeline: ScrubberState::new("audio-thread-timeline"),
             player_image: None,
             painted_player_image: None,
             player_timeline: ScrubberState::new("media-timeline"),
@@ -872,6 +876,7 @@ impl MatrixClient {
                 self.mark = None;
                 self.viewing = None;
                 self.player = None;
+                self.player_audio = None;
                 self.pending_play = None;
                 self.player_image = None;
                 self.player_scrub = None;
@@ -1504,6 +1509,7 @@ impl MatrixClient {
             self.focused = false;
             self.pending_play = None;
             self.player = None;
+            self.player_audio = None;
             self.player_image = None;
             self.release_player_texture(window);
             self.player_scrub = None;
@@ -4643,6 +4649,16 @@ impl MatrixClient {
                     .when(!message.rich.is_empty(), |body| body.child(rich(false, cx)))
                     .into_any_element()
             }
+            MessageKind::Attachment
+                if message.picture.as_ref().is_some_and(|media| {
+                    media
+                        .mime
+                        .as_deref()
+                        .is_some_and(|mime| mime.starts_with("audio/"))
+                }) =>
+            {
+                self.render_audio(message.picture.as_ref().unwrap(), &key, spot, cx)
+            }
             MessageKind::Attachment => div()
                 .flex()
                 .items_center()
@@ -5081,8 +5097,213 @@ impl MatrixClient {
             .into_any_element()
     }
 
+    fn render_audio(
+        &self,
+        media: &Picture,
+        key: &str,
+        spot: Spot,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = *cx.theme();
+        let player = self
+            .player
+            .as_ref()
+            .filter(|_| self.player_audio.as_ref() == Some(&media.key));
+        let state = player.map(|player| player.state.lock().unwrap_or_else(|e| e.into_inner()));
+        let loading = self
+            .pending_play
+            .as_ref()
+            .is_some_and(|pending| pending.key == media.key);
+        let failed = state.as_ref().is_some_and(|state| state.error.is_some());
+        let finished = state.as_ref().is_some_and(|state| state.finished);
+        let playing = player.is_some_and(|player| !player.is_paused()) && !finished && !failed;
+        let duration = state
+            .as_ref()
+            .and_then(|state| state.duration)
+            .or(media.duration)
+            .filter(|duration| !duration.is_zero());
+        let position = state.as_ref().map_or(Duration::ZERO, |state| {
+            self.player_scrub.unwrap_or(state.position)
+        });
+        let fraction = duration.map_or(0., |duration| {
+            (position.as_secs_f64() / duration.as_secs_f64()).clamp(0., 1.) as f32
+        });
+        let action = if loading {
+            "Loading…"
+        } else if failed {
+            "Retry"
+        } else if finished {
+            "Replay"
+        } else if playing {
+            "Pause"
+        } else {
+            "Play"
+        };
+        let open = media.clone();
+        let timeline = if spot == Spot::Thread {
+            &self.audio_thread_timeline
+        } else {
+            &self.player_timeline
+        };
+        let track = if player.is_some() {
+            Scrubber::new(timeline, fraction)
+                .colors(theme.primary, theme.border, theme.primary)
+                .enabled(duration.is_some() && !failed)
+                .when_some(self.player_scrub, |bar, time| {
+                    bar.bubble(fraction, playback::time_label(time))
+                })
+                .on_move(cx.listener(move |this, fraction: &f32, _, cx| {
+                    if let Some(duration) = duration {
+                        this.player_scrub =
+                            Some(duration.mul_f64((*fraction as f64).clamp(0., 1.)));
+                        cx.notify();
+                    }
+                }))
+                .on_release(cx.listener(|this, _, _, cx| {
+                    if let Some(position) = this.player_scrub.take() {
+                        if let Some(player) = &this.player {
+                            player.seek_to(position);
+                        }
+                        cx.notify();
+                    }
+                }))
+                .into_any_element()
+        } else {
+            div()
+                .h(px(18.))
+                .flex()
+                .items_center()
+                .child(div().w_full().h(px(3.)).rounded_full().bg(theme.border))
+                .into_any_element()
+        };
+        div()
+            .mt_1()
+            .w(px(340.))
+            .max_w_full()
+            .p_3()
+            .rounded(px(16.))
+            .border_1()
+            .border_color(if playing {
+                theme.primary.opacity(0.35)
+            } else {
+                theme.border
+            })
+            .bg(theme.secondary)
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        Button::new(SharedString::from(format!("{key}-audio-play")))
+                            .primary()
+                            .size(px(44.))
+                            .p_0()
+                            .flex_none()
+                            .rounded_full()
+                            .icon(if playing {
+                                "icons/pause-filled.svg"
+                            } else {
+                                "icons/play-filled.svg"
+                            })
+                            .tooltip(action)
+                            .disabled(loading)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if !failed
+                                    && this.player_audio.as_ref() == Some(&open.key)
+                                    && let Some(player) = &this.player
+                                {
+                                    if finished {
+                                        player.restart();
+                                    } else {
+                                        player.toggle();
+                                    }
+                                } else {
+                                    this.open_media(open.clone(), cx);
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .text_size(theme.text(Text::Small))
+                                    .child(
+                                        div()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(theme.foreground)
+                                            .child("Audio message"),
+                                    )
+                                    .child(div().text_color(theme.muted_foreground).child(
+                                        if loading {
+                                            "Loading…"
+                                        } else if state.as_ref().is_some_and(|state| state.seeking)
+                                        {
+                                            "Seeking…"
+                                        } else if playing {
+                                            "Playing"
+                                        } else if finished {
+                                            "Finished"
+                                        } else if player.is_some() && !failed {
+                                            "Paused"
+                                        } else {
+                                            ""
+                                        },
+                                    )),
+                            )
+                            .child(track)
+                            .child(
+                                div()
+                                    .flex()
+                                    .justify_between()
+                                    .text_size(px(11.))
+                                    .text_color(theme.muted_foreground)
+                                    .child(playback::time_label(position))
+                                    .child(
+                                        duration
+                                            .map(playback::time_label)
+                                            .unwrap_or_else(|| "—".into()),
+                                    ),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .text_size(px(11.))
+                    .text_color(theme.muted_foreground)
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(media.name.clone()),
+            )
+            .when_some(
+                state.as_ref().and_then(|state| state.error.as_ref()),
+                |card, error| {
+                    card.child(
+                        div()
+                            .text_size(theme.text(Text::Small))
+                            .text_color(theme.muted_foreground)
+                            .child(error.clone()),
+                    )
+                },
+            )
+            .into_any_element()
+    }
+
     fn open_media(&mut self, media: Picture, cx: &mut Context<Self>) {
         self.player = None;
+        self.player_audio = None;
         self.player_image = None;
         self.player_scrub = None;
         self.pending_play = None;
@@ -5102,6 +5323,11 @@ impl MatrixClient {
     fn start_media(&mut self, media: Picture, bytes: Vec<u8>, cx: &mut Context<Self>) {
         self.player_image = None;
         self.player_scrub = None;
+        self.player_audio = media
+            .mime
+            .as_deref()
+            .is_some_and(|mime| mime.starts_with("audio/"))
+            .then(|| media.key.clone());
         self.player = Some(playback::Player::new(
             media.name,
             bytes,
@@ -5156,6 +5382,9 @@ impl MatrixClient {
     }
 
     fn render_player(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.player_audio.is_some() {
+            return div().into_any_element();
+        }
         let Some(player) = &self.player else {
             return div().into_any_element();
         };
@@ -5190,6 +5419,7 @@ impl MatrixClient {
                     .bg(theme.background.opacity(0.94))
                     .on_action(cx.listener(|this, _: &Dismiss, _, cx| {
                         this.player = None;
+                        this.player_audio = None;
                         this.player_image = None;
                         this.player_scrub = None;
                         cx.notify();
@@ -5352,6 +5582,7 @@ impl MatrixClient {
                                             .label("Close")
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.player = None;
+                                                this.player_audio = None;
                                                 this.player_image = None;
                                                 this.player_scrub = None;
                                                 cx.notify();
