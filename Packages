@@ -1,13 +1,13 @@
 Package: huddle
-Version: 0.42.2-g7be73f3
+Version: 0.42.2-g45f0fce
 Architecture: amd64
 Maintainer: Huddle <hdmain@users.noreply.github.com>
 Depends: libasound2, libc6, libgcc-s1, libstdc++6, libfontconfig1, libfreetype6, libx11-6, libxcb1, libxcursor1, libxi6, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libwayland-cursor0, libwayland-egl1, libvulkan1, libgtk-3-0, libwebkit2gtk-4.1-0, libjavascriptcoregtk-4.1-0, libsoup-3.0-0
-Filename: pool/main/huddle_0.42.2-g7be73f3_amd64.deb
-Size: 28829564
-MD5sum: 27b3cd3fe28fb4027f87fbc2f1deb973
-SHA1: cc7e3c3d7dc18a477c74bf5c2f1842280bcb8572
-SHA256: 6604ba2695dbbca8adcfb3ba46cf2740f79068934c49788d5db95f551ee5c21a
+Filename: pool/main/huddle_0.42.2-g45f0fce_amd64.deb
+Size: 28720214
+MD5sum: 8bc49d62a2def2bf9e301294c468f729
+SHA1: 157f368cf27449f85e4b0809552b107e5f18fd85
+SHA256: a5268b6b1c14e89dca8ed26e1f67bcad51a833307c649518c678a91ccbeb6277
 Section: net
 Priority: optional
 Description: Matrix chat client
