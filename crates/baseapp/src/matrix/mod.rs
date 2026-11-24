@@ -5248,6 +5248,8 @@ impl MatrixClient {
                                     .child(div().text_color(theme.muted_foreground).child(
                                         if loading {
                                             "Loading…"
+                                        } else if failed {
+                                            "Couldn't play"
                                         } else if state.as_ref().is_some_and(|state| state.seeking)
                                         {
                                             "Seeking…"

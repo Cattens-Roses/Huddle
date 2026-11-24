@@ -1,5 +1,6 @@
 //! Native media decoding and playback. No browser or external player is used.
 mod audio;
+mod opus;
 
 use std::io::Cursor;
 use std::sync::{
@@ -122,14 +123,16 @@ pub(super) fn mime(name: &str) -> Option<&'static str> {
             "aac" => "audio/aac",
             "wav" => "audio/wav",
             "flac" => "audio/flac",
-            "ogg" | "oga" => "audio/ogg",
+            "ogg" | "oga" | "opus" => "audio/ogg",
             _ => return None,
         },
     )
 }
 
 fn audio_source(bytes: Vec<u8>) -> Result<Box<dyn Source<Item = f32> + Send>> {
-    if bytes.get(4..8) == Some(b"ftyp") {
+    if opus::is_opus(&bytes) {
+        Ok(Box::new(opus::OggOpus::new(bytes)?))
+    } else if bytes.get(4..8) == Some(b"ftyp") {
         Ok(Box::new(audio::Mp4Audio::new(bytes)?))
     } else {
         Ok(Box::new(
@@ -249,6 +252,8 @@ fn inspect_inner(bytes: &[u8], mime: &str) -> Result<Metadata> {
         // Drive decoding so a header alone is not enough to accept the file.
         let count = if mime == "audio/mp4" {
             audio::Mp4Audio::new(bytes.to_vec())?.validate()?
+        } else if opus::is_opus(bytes) {
+            opus::OggOpus::new(bytes.to_vec())?.validate()?
         } else {
             source.count()
         };
@@ -1195,6 +1200,35 @@ mod tests {
     }
 
     #[test]
+    fn ogg_opus_voice_messages_decode_and_seek() {
+        for (bytes, channels) in [
+            (include_bytes!("../../tests/media/voice.ogg").as_slice(), 1),
+            (
+                include_bytes!("../../tests/media/voice-stereo.ogg").as_slice(),
+                2,
+            ),
+        ] {
+            let source = audio_source(bytes.to_vec()).unwrap();
+            assert_eq!(source.channels(), channels);
+            assert_eq!(source.sample_rate(), 48000);
+            assert_eq!(source.total_duration(), Some(Duration::from_millis(250)));
+            let decoded: Vec<_> = source.collect();
+            assert_eq!(decoded.len(), 12000 * channels as usize);
+            assert!(decoded.iter().all(|sample| sample.is_finite()));
+            assert!(decoded.iter().any(|sample| sample.abs() > 0.01));
+            let skipped: Vec<_> = audio_source(bytes.to_vec())
+                .unwrap()
+                .skip_duration(Duration::from_millis(100))
+                .collect();
+            assert_eq!(skipped, decoded[4800 * channels as usize..]);
+            assert_eq!(
+                inspect(bytes, "audio/ogg").unwrap().duration,
+                Some(Duration::from_millis(250))
+            );
+        }
+    }
+
+    #[test]
     fn audio_validation_reads_samples_and_duration() {
         let metadata = inspect(&wav(), "audio/wav").unwrap();
         assert_eq!(metadata.duration, Some(Duration::from_millis(1)));
@@ -1531,6 +1565,8 @@ mod tests {
             include_bytes!("../../tests/media/tone.wav").as_slice(),
             include_bytes!("../../tests/media/tone.flac").as_slice(),
             include_bytes!("../../tests/media/tone.ogg").as_slice(),
+            include_bytes!("../../tests/media/voice.ogg").as_slice(),
+            include_bytes!("../../tests/media/voice-stereo.ogg").as_slice(),
         ] {
             let (sink, output) = Sink::new_idle();
             sink.append(audio_source(bytes.to_vec()).unwrap());

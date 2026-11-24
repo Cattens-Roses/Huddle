@@ -42,3 +42,7 @@ for extension, codec in [("mp3", "libmp3lame"), ("m4a", "aac"), ("aac", "aac"),
                          ("wav", "pcm_s16le"), ("flac", "flac"), ("ogg", "libvorbis")]:
     run("-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=0.25",
         "-c:a", codec, root / f"tone.{extension}")
+
+for name, channels, frequency in [("voice", 1, 440), ("voice-stereo", 2, 660)]:
+    run("-f", "lavfi", "-i", f"sine=frequency={frequency}:sample_rate=48000:duration=0.25",
+        "-c:a", "libopus", "-application", "voip", "-ac", channels, root / f"{name}.ogg")

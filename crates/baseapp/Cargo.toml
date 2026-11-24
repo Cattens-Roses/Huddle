@@ -21,6 +21,7 @@ matrix-sdk.workspace = true
 ruma.workspace = true
 rumpeg = "0.1.4"
 rodio = { version = "0.19", features = ["symphonia-aac", "symphonia-isomp4"] }
+ogg = "0.8"
 matroska-demuxer = "0.8"
 symphonia = { version = "0.5.5", default-features = false, features = ["aac", "isomp4"] }
 serde.workspace = true

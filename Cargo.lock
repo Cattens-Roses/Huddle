@@ -814,6 +814,7 @@ dependencies = [
  "matrix-sdk",
  "matroska-demuxer",
  "mime",
+ "ogg",
  "raw-window-handle",
  "reqwest",
  "rodio",
