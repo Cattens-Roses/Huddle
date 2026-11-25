@@ -416,6 +416,8 @@ pub struct MatrixClient {
     rooms: Vec<RoomSummary>,
     space: Option<OwnedRoomId>,
     space_trail: spaces::Trail,
+    space_transition: u64,
+    space_backwards: bool,
     linked_names: HashMap<OwnedRoomId, String>,
     linked_name_requests: HashMap<OwnedRoomId, Instant>,
     removing_space: Option<(OwnedRoomId, String)>,
@@ -543,6 +545,8 @@ impl MatrixClient {
             rooms: Vec::new(),
             space: None,
             space_trail: spaces::Trail::default(),
+            space_transition: 0,
+            space_backwards: false,
             linked_names: HashMap::new(),
             linked_name_requests: HashMap::new(),
             removing_space: None,
@@ -4637,6 +4641,12 @@ impl MatrixClient {
         self.command(Command::LoadSpaceNames(id));
     }
 
+    fn animate_space_navigation(&mut self, backwards: bool) {
+        self.space_transition = self.space_transition.wrapping_add(1);
+        self.space_backwards = backwards;
+        self.rail_hover = None;
+    }
+
     fn enter_space(&mut self, id: OwnedRoomId, nested: bool, cx: &mut Context<Self>) {
         if !self
             .summary(&id)
@@ -4646,6 +4656,9 @@ impl MatrixClient {
         }
         self.space_trail
             .enter(&self.rooms, self.space.as_ref(), &id, nested);
+        if self.space.as_ref() != Some(&id) {
+            self.animate_space_navigation(false);
+        }
         self.space = Some(id);
         self.load_linked_names();
         cx.notify();
@@ -4655,8 +4668,16 @@ impl MatrixClient {
         let theme = *cx.theme();
         let id = space.id.clone();
         let unread = unread::space(&self.rooms, &id);
+        let hover_key = format!("subspace-{id}");
+        let hovered = self.rail_hover.as_deref() == Some(&hover_key);
+        let hover_target = if hovered { 1. } else { 0. };
+        let arrow_id = SharedString::from(format!("subspace-arrow-{id}"));
+        let hover_id = SharedString::from(format!("subspace-hover-{id}"));
         div()
-            .id(SharedString::from(format!("subspace-{id}")))
+            .id(SharedString::from(hover_key.clone()))
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                this.rail_hover(&hover_key, *hovered, cx);
+            }))
             .flex()
             .items_center()
             .gap_2()
@@ -4666,7 +4687,6 @@ impl MatrixClient {
             .cursor_pointer()
             .text_color(theme.foreground)
             .tip_label(space.name.clone(), Perch::Right)
-            .hover(|style| style.bg(theme.secondary_hover))
             .child(self.face(id.as_str(), &space.name, space.avatar.as_ref(), px(26.)))
             .child(
                 div()
@@ -4677,12 +4697,28 @@ impl MatrixClient {
                     .child(space.name.clone()),
             )
             .when(unread > 0, |row| row.child(unread::badge(unread, cx)))
-            .child(icon(
-                "icons/chevron-right.svg",
-                px(14.),
-                theme.muted_foreground,
-            ))
+            .child(
+                div()
+                    .flex_none()
+                    .child(icon(
+                        "icons/chevron-right.svg",
+                        px(14.),
+                        theme.muted_foreground,
+                    ))
+                    .with_spring(
+                        arrow_id,
+                        SpringAnimation::new(ui::Springs::RESPONSIVE).to(hover_target),
+                        |arrow, amount| {
+                            arrow.layer_translate(point(px(3. * amount.clamp(0., 1.)), px(0.)))
+                        },
+                    ),
+            )
             .on_click(cx.listener(move |this, _, _, cx| this.enter_space(id.clone(), true, cx)))
+            .with_spring(
+                hover_id,
+                SpringAnimation::new(ui::Springs::RESPONSIVE).to(hover_target),
+                move |row, amount| row.bg(theme.secondary_hover.opacity(amount.clamp(0., 1.))),
+            )
             .into_any_element()
     }
 
@@ -4820,6 +4856,9 @@ impl MatrixClient {
             );
         }
 
+        let direction = if self.space_backwards { -1. } else { 1. };
+        let transition_id =
+            SharedString::from(format!("space-navigation-{}", self.space_transition));
         div()
             .flex()
             .flex_col()
@@ -4830,82 +4869,102 @@ impl MatrixClient {
             .bg(theme.secondary)
             .border_r_1()
             .border_color(theme.border)
+            .overflow_hidden()
             .child(
                 div()
                     .flex()
-                    .flex_none()
-                    .items_center()
-                    .h(px(48.))
-                    .px_4()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(theme.foreground)
-                    .gap_2()
-                    .when_some(parent, |header, parent| {
-                        header.child(
-                            Button::new("space-back")
-                                .ghost()
-                                .small()
-                                .p_0()
-                                .size(px(28.))
-                                .icon("icons/chevron-left.svg")
-                                .tooltip(format!("Back to {}", parent.name))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(current) = &this.space
-                                        && let Some(parent) =
-                                            this.space_trail.back(&this.rooms, current)
-                                    {
-                                        this.space = Some(parent);
-                                        this.load_linked_names();
-                                        cx.notify();
-                                    }
-                                })),
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .h(px(48.))
+                            .px_4()
+                            .border_b_1()
+                            .border_color(theme.border)
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(theme.foreground)
+                            .gap_2()
+                            .when_some(parent, |header, parent| {
+                                header.child(
+                                    Button::new("space-back")
+                                        .ghost()
+                                        .small()
+                                        .p_0()
+                                        .size(px(28.))
+                                        .icon("icons/chevron-left.svg")
+                                        .tooltip(format!("Back to {}", parent.name))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if let Some(current) = &this.space
+                                                && let Some(parent) =
+                                                    this.space_trail.back(&this.rooms, current)
+                                            {
+                                                this.animate_space_navigation(true);
+                                                this.space = Some(parent);
+                                                this.load_linked_names();
+                                                cx.notify();
+                                            }
+                                        })),
+                                )
+                            })
+                            .child(div().flex_1().min_w_0().truncate().child(title)),
+                    )
+                    .when_some(space, |sidebar, space| {
+                        let id = space.id.clone();
+                        let settings_id = id.clone();
+                        sidebar.child(
+                            div()
+                                .px_2()
+                                .py_2()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .when(space.can_manage, |body| {
+                                    body.child(
+                                        Button::new("space-settings")
+                                            .ghost()
+                                            .small()
+                                            .w_full()
+                                            .icon("icons/settings.svg")
+                                            .label("Space settings")
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.open_room_settings_for(
+                                                    settings_id.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            })),
+                                    )
+                                })
+                                .child(
+                                    Button::new("remove-space")
+                                        .ghost()
+                                        .small()
+                                        .w_full()
+                                        .icon("icons/log-out.svg")
+                                        .label("Remove space")
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.remove_space(id.clone(), window, cx)
+                                        })),
+                                ),
                         )
                     })
-                    .child(div().flex_1().min_w_0().truncate().child(title)),
+                    .child(list)
+                    .motion(
+                        transition_id,
+                        ui::motion::Motion::Base,
+                        move |panel, amount| {
+                            let amount = amount.clamp(0., 1.);
+                            panel
+                                .opacity(amount)
+                                .layer_translate(point(px(direction * 18. * (1. - amount)), px(0.)))
+                        },
+                    ),
             )
-            .when_some(space, |sidebar, space| {
-                let id = space.id.clone();
-                let settings_id = id.clone();
-                sidebar.child(
-                    div()
-                        .px_2()
-                        .py_2()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .when(space.can_manage, |body| {
-                            body.child(
-                                Button::new("space-settings")
-                                    .ghost()
-                                    .small()
-                                    .w_full()
-                                    .icon("icons/settings.svg")
-                                    .label("Space settings")
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.open_room_settings_for(
-                                            settings_id.clone(),
-                                            window,
-                                            cx,
-                                        );
-                                    })),
-                            )
-                        })
-                        .child(
-                            Button::new("remove-space")
-                                .ghost()
-                                .small()
-                                .w_full()
-                                .icon("icons/log-out.svg")
-                                .label("Remove space")
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.remove_space(id.clone(), window, cx)
-                                })),
-                        ),
-                )
-            })
-            .child(list)
             .child(self.render_user_panel(cx))
     }
 
