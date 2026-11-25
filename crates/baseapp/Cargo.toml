@@ -18,6 +18,8 @@ dirs = "6"
 env_logger.workspace = true
 futures.workspace = true
 matrix-sdk.workspace = true
+matrix-sdk-crypto = "0.19"
+tempfile = "3"
 ruma.workspace = true
 rumpeg = "0.1.4"
 rodio = { version = "0.19", features = ["symphonia-aac", "symphonia-isomp4"] }

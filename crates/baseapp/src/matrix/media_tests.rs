@@ -61,6 +61,7 @@ struct Traffic {
     sent: Vec<serde_json::Value>,
     files: HashMap<String, Vec<u8>>,
     downloads: Vec<String>,
+    slow_downloads: bool,
     reject_uploads: bool,
     created_rooms: usize,
     leaves: Vec<String>,
@@ -295,6 +296,9 @@ impl Server {
                     Err(error) => panic!("{error}"),
                 };
                 stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(3)))
                     .unwrap();
@@ -579,9 +583,19 @@ impl Server {
                 } else {
                     b"{}".to_vec()
                 };
+                let slow = traffic.slow_downloads && path.contains("/download/");
                 drop(traffic);
                 write!(stream, "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len()).unwrap();
-                stream.write_all(&response).ok();
+                if slow {
+                    for chunk in response.chunks(16 * 1024) {
+                        if stream.write_all(chunk).is_err() {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(40));
+                    }
+                } else {
+                    stream.write_all(&response).ok();
+                }
             }
         });
         Self {
@@ -1065,4 +1079,93 @@ async fn child_previews_recover_names_when_space_hierarchy_is_unavailable() {
         assert!(!traffic.preview_requests.iter().any(|path| path.contains("removed")));
         assert!(traffic.state_writes.is_empty());
     }).await.expect("Child room preview test timed out");
+}
+
+#[tokio::test]
+async fn file_downloads_report_progress_eta_and_clean_up_after_cancellation() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let (server, client, _) = room_admin_tests::setup(false).await;
+        let bytes = (0..512 * 1024).map(|n| (n % 251) as u8).collect::<Vec<_>>();
+        {
+            let mut traffic = server.traffic.lock().unwrap();
+            traffic.files.insert("installer".into(), bytes.clone());
+            traffic.slow_downloads = true;
+        }
+        let source = MediaSource::Plain("mxc://example.org/installer".into());
+        let destination = tempfile::tempdir().unwrap();
+        let cancel = Arc::new(crate::downloads::Cancel::default());
+        let mut progress = Vec::new();
+        let path = crate::downloads::receive(&client, source.clone(), destination.path().into(), "setup.exe".into(), Some(bytes.len() as u64), cancel, |event| progress.push(event)).await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(progress.iter().any(|event| matches!(event, crate::downloads::Progress::Receiving { received, total:Some(total), speed, eta:Some(_)} if *received > 0 && *total == bytes.len() as u64 && *speed > 0.)));
+        assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 1);
+        let destination = tempfile::tempdir().unwrap();
+        let cancel = Arc::new(crate::downloads::Cancel::default());
+        let signal = cancel.clone();
+        let result = crate::downloads::receive(&client, source, destination.path().into(), "setup.exe".into(), None, cancel, move |event| {
+            if matches!(event, crate::downloads::Progress::Receiving { .. }) { signal.cancel(); }
+        }).await;
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 0);
+    }).await.expect("File download integration test timed out");
+}
+
+#[tokio::test]
+async fn encrypted_file_downloads_verify_hashes_before_publishing() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let (server, client, _) = room_admin_tests::setup(false).await;
+        let content = b"A private attachment, not executable code";
+        let mut reader = std::io::Cursor::new(content);
+        let mut encryptor = matrix_sdk_crypto::AttachmentEncryptor::new(&mut reader);
+        let mut ciphertext = Vec::new();
+        encryptor.read_to_end(&mut ciphertext).unwrap();
+        let info = encryptor.finish();
+        let mut json = serde_json::to_value(info).unwrap();
+        json["url"] = serde_json::json!("mxc://example.org/private-file");
+        let source = MediaSource::Encrypted(Box::new(serde_json::from_value(json).unwrap()));
+        server
+            .traffic
+            .lock()
+            .unwrap()
+            .files
+            .insert("private-file".into(), ciphertext.clone());
+        let destination = tempfile::tempdir().unwrap();
+        let path = crate::downloads::receive(
+            &client,
+            source.clone(),
+            destination.path().into(),
+            "secret.zip".into(),
+            None,
+            Arc::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), content);
+        assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 1);
+        ciphertext[0] ^= 1;
+        server
+            .traffic
+            .lock()
+            .unwrap()
+            .files
+            .insert("private-file".into(), ciphertext);
+        let destination = tempfile::tempdir().unwrap();
+        assert!(
+            crate::downloads::receive(
+                &client,
+                source,
+                destination.path().into(),
+                "secret.zip".into(),
+                None,
+                Arc::default(),
+                |_| {}
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 0);
+    })
+    .await
+    .expect("Encrypted download test timed out");
 }

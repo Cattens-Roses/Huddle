@@ -113,6 +113,7 @@ pub enum MessageKind {
 
 #[derive(Clone)]
 pub struct Picture {
+    pub size: Option<u64>,
     pub mime: Option<String>,
     pub thumbnail: Option<MediaSource>,
     pub duration: Option<Duration>,
@@ -209,6 +210,12 @@ pub enum Answer {
 }
 
 pub enum Command {
+    Download {
+        ticket: u64,
+        media: Picture,
+        directory: PathBuf,
+        cancel: Arc<crate::downloads::Cancel>,
+    },
     LoadSpaceNames(OwnedRoomId),
     LoadProfile {
         room: Option<OwnedRoomId>,
@@ -337,6 +344,10 @@ pub enum Command {
 }
 
 pub enum Update {
+    Download {
+        ticket: u64,
+        progress: crate::downloads::Progress,
+    },
     SpaceNames {
         user: OwnedUserId,
         names: Vec<(OwnedRoomId, String)>,
@@ -1200,6 +1211,35 @@ async fn handle(
     command: Command,
 ) -> Result<()> {
     match command {
+        Command::Download {
+            ticket,
+            media,
+            directory,
+            cancel,
+        } => {
+            let progress_outbox = outbox.clone();
+            let result = crate::downloads::receive(
+                client,
+                media.source,
+                directory,
+                media.name,
+                media.size,
+                cancel.clone(),
+                move |progress| {
+                    post(&progress_outbox, Update::Download { ticket, progress });
+                },
+            )
+            .await;
+            let progress = match result {
+                Ok(path) => crate::downloads::Progress::Complete(path),
+                Err(_) if cancel.is_cancelled() => crate::downloads::Progress::Cancelled,
+                Err(error) => {
+                    log::warn!("Download failed: {error:#}");
+                    crate::downloads::Progress::Failed(error.to_string())
+                }
+            };
+            post(outbox, Update::Download { ticket, progress });
+        }
         Command::LoadSpaceNames(room) => {
             if let Some(user) = client.user_id().map(ToOwned::to_owned) {
                 let names = space_names(client, &room, Some(outbox)).await;
@@ -2424,6 +2464,7 @@ fn describe(msgtype: &MessageType) -> (String, Rich, MessageKind, Option<Picture
                 .filter(|name| !name.trim().is_empty())
                 .unwrap_or_else(|| body.clone());
             let picture = Picture {
+                size: info.and_then(|info| info.size).map(u64::from),
                 mime: None,
                 thumbnail: None,
                 duration: None,
@@ -2458,6 +2499,7 @@ fn describe(msgtype: &MessageType) -> (String, Rich, MessageKind, Option<Picture
                         .unwrap_or("video/mp4".into()),
                 );
                 if let Some(info) = &video.info {
+                    picture.size = info.size.map(u64::from);
                     picture.width = size(info.width);
                     picture.height = size(info.height);
                     picture.duration = info.duration;
@@ -2471,23 +2513,65 @@ fn describe(msgtype: &MessageType) -> (String, Rich, MessageKind, Option<Picture
             };
             (body, caption, kind, picture)
         }
-        MessageType::Audio(audio) => playable(
-            &audio.body,
-            audio.filename.as_deref(),
-            &audio.source,
-            audio
-                .info
-                .as_ref()
-                .and_then(|info| info.mimetype.as_deref()),
-        ),
+        MessageType::Audio(audio) => {
+            let (body, rich, kind, mut picture) = playable(
+                &audio.body,
+                audio.filename.as_deref(),
+                &audio.source,
+                audio
+                    .info
+                    .as_ref()
+                    .and_then(|info| info.mimetype.as_deref()),
+            );
+            if let Some(picture) = &mut picture
+                && let Some(info) = &audio.info
+            {
+                picture.size = info.size.map(u64::from);
+                picture.duration = info.duration;
+            }
+            (body, rich, kind, picture)
+        }
         MessageType::File(file) => {
             let mime = file.info.as_ref().and_then(|info| info.mimetype.as_deref());
             if mime.is_some_and(|mime| mime.starts_with("audio/") || mime.starts_with("video/"))
                 || super::playback::mime(file.filename.as_deref().unwrap_or(&file.body)).is_some()
             {
-                playable(&file.body, file.filename.as_deref(), &file.source, mime)
+                let (body, rich, kind, mut picture) =
+                    playable(&file.body, file.filename.as_deref(), &file.source, mime);
+                if let Some(picture) = &mut picture {
+                    picture.size = file.info.as_ref().and_then(|info| info.size).map(u64::from);
+                }
+                (body, rich, kind, picture)
             } else {
-                attachment(format!("Shared a file: {}", file.body))
+                let name = file
+                    .filename
+                    .clone()
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| file.body.clone());
+                (
+                    file.body.clone(),
+                    if file
+                        .filename
+                        .as_ref()
+                        .is_some_and(|name| name != &file.body)
+                    {
+                        rich::plain(&file.body)
+                    } else {
+                        Rich::new()
+                    },
+                    MessageKind::Attachment,
+                    Some(Picture {
+                        size: file.info.as_ref().and_then(|info| info.size).map(u64::from),
+                        key: format!("{}#file", media_url(&file.source)),
+                        source: file.source.clone(),
+                        name,
+                        mime: mime.map(str::to_owned),
+                        width: 0,
+                        height: 0,
+                        thumbnail: None,
+                        duration: None,
+                    }),
+                )
             }
         }
         other => (
@@ -2516,6 +2600,7 @@ fn playable(
         Rich::new(),
         MessageKind::Attachment,
         Some(Picture {
+            size: None,
             key: format!("{}#playback", media_url(source)),
             source: source.clone(),
             width: 0,
@@ -2525,15 +2610,6 @@ fn playable(
             thumbnail: None,
             duration: None,
         }),
-    )
-}
-
-fn attachment(label: String) -> (String, Rich, MessageKind, Option<Picture>) {
-    (
-        label.clone(),
-        rich::plain(&label),
-        MessageKind::Attachment,
-        None,
     )
 }
 
@@ -2692,6 +2768,22 @@ mod tests {
         assert!(!caption.is_empty());
         assert!(matches!(video.thumbnail, Some(MediaSource::Encrypted(_))));
         assert_eq!(video.mime.as_deref(), Some("video/mp4"));
+    }
+
+    #[test]
+    fn executable_attachments_keep_their_download_source_and_filename() {
+        let msgtype: MessageType = serde_json::from_value(serde_json::json!({
+            "msgtype":"m.file", "body":"Installer", "filename":"setup.exe",
+            "url":"mxc://example.org/installer", "info":{"mimetype":"application/octet-stream","size":12345}
+        })).unwrap();
+        let (_, _, kind, file) = describe(&msgtype);
+        assert!(kind == MessageKind::Attachment);
+        let file = file.unwrap();
+        assert_eq!(file.name, "setup.exe");
+        assert_eq!(file.size, Some(12345));
+        assert!(
+            matches!(file.source, MediaSource::Plain(uri) if uri.as_str() == "mxc://example.org/installer")
+        );
     }
 
     #[test]

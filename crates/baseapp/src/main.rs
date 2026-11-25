@@ -19,6 +19,7 @@ use ui::{
 };
 
 mod cache;
+mod downloads;
 mod matrix;
 mod notifications;
 mod updater;
@@ -47,6 +48,7 @@ enum Page {
     Appearance,
     Notifications,
     Cache,
+    Downloads,
     Updates,
 }
 
@@ -178,6 +180,7 @@ struct Huddle {
     auto_update: bool,
     download_updates: bool,
     restart_prompt: bool,
+    download_directory_status: Option<String>,
     _updater: Option<gpui::Task<()>>,
 }
 
@@ -478,6 +481,7 @@ impl Huddle {
             auto_update: prefs.auto_update,
             download_updates: prefs.download_updates,
             restart_prompt: false,
+            download_directory_status: None,
             _updater: Some(updater_tick),
             matrix: {
                 let matrix = cx.new(|cx| {
@@ -578,6 +582,7 @@ impl Huddle {
                     "Notifications",
                 ),
                 (Page::Cache, "settings-cache", "Cache"),
+                (Page::Downloads, "settings-downloads", "Downloads"),
                 (Page::Updates, "settings-updates", "Updates"),
             ]
             .into_iter()
@@ -757,6 +762,61 @@ impl Huddle {
                     )
                     .child(self.settings_card("App updates", rows, cx)),
             )
+            .into_any_element()
+    }
+
+    fn choose_download_directory(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose download folder".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let result = downloads::set_directory(Some(path));
+            this.update(cx, |this, cx| {
+                this.download_directory_status = Some(match result {
+                    Ok(()) => "Download folder updated.".into(),
+                    Err(error) => format!("Couldn't save folder: {error}"),
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn download_settings(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = *cx.theme();
+        let directory = downloads::directory();
+        Scroller::new("download-settings", &self.notifications_scrollbar)
+            .flex_1().min_h_0().min_w_0().flex_col().items_center()
+            .child(div().flex().flex_col().gap_5().w_full().max_w(px(860.)).p_6()
+                .child(self.settings_tabs(cx))
+                .child(div().text_size(theme.text(ui::Text::Title)).font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.foreground).child("Downloads"))
+                .child(self.settings_card("Save files", vec![
+                    div().text_color(theme.foreground).child(directory.display().to_string()).into_any_element(),
+                    div().text_color(theme.muted_foreground).child("Attachments, photos and videos are saved here. Changing this folder applies to new downloads.").into_any_element(),
+                    div().flex().flex_wrap().gap_2()
+                        .child(Button::new("choose-download-directory").secondary().label("Choose folder")
+                            .on_click(cx.listener(|this, _, _, cx| this.choose_download_directory(cx))))
+                        .child(Button::new("reset-download-directory").ghost().label("Use default")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.download_directory_status = Some(match downloads::set_directory(None) {
+                                    Ok(()) => "Using the default download folder.".into(),
+                                    Err(error) => format!("Couldn't save folder: {error}"),
+                                });
+                                cx.notify();
+                            }))).into_any_element(),
+                ], cx))
+                .when_some(self.download_directory_status.clone(), |body, status| body.child(status)))
             .into_any_element()
     }
 
@@ -1026,6 +1086,7 @@ impl Render for Huddle {
             Page::Home => self.matrix.clone().into_any_element(),
             Page::Notifications => self.notification_settings(cx),
             Page::Cache => self.cache_settings(cx),
+            Page::Downloads => self.download_settings(cx),
             Page::Updates => self.update_settings(cx),
             Page::Appearance => {
                 let packs = icons::packs().collect::<Vec<_>>();

@@ -1,4 +1,5 @@
 mod backend;
+mod download_ui;
 mod media_ui;
 mod media_zoom;
 mod photo;
@@ -457,6 +458,10 @@ pub struct MatrixClient {
     cache_status: Option<String>,
     viewing: Option<View>,
     media_zoom: media_zoom::Zoom,
+    download_jobs: Vec<download_ui::Job>,
+    download_ticket: u64,
+    media_menu: Option<(Picture, gpui::Point<Pixels>)>,
+    player_media: Option<Picture>,
     player: Option<playback::Player>,
     player_audio: Option<String>,
     audio_thread_timeline: ScrubberState,
@@ -466,7 +471,6 @@ pub struct MatrixClient {
     player_volume: ScrubberState,
     player_scrub: Option<Duration>,
     pending_play: Option<Picture>,
-    saving: Option<Task<()>>,
     person: Option<Person>,
     line: Option<Line>,
     replying: Option<Target>,
@@ -607,6 +611,10 @@ impl MatrixClient {
             cache_status: None,
             viewing: None,
             media_zoom: media_zoom::Zoom::default(),
+            download_jobs: Vec::new(),
+            download_ticket: 0,
+            media_menu: None,
+            player_media: None,
             player: None,
             player_audio: None,
             audio_thread_timeline: ScrubberState::new("audio-thread-timeline"),
@@ -616,7 +624,6 @@ impl MatrixClient {
             player_volume: ScrubberState::new("media-volume"),
             player_scrub: None,
             pending_play: None,
-            saving: None,
             person: None,
             line: None,
             replying: None,
@@ -887,6 +894,11 @@ impl MatrixClient {
                 self.cache_status = None;
                 cx.emit(CacheChanged);
                 self.phase = Phase::SignedOut;
+                for job in &self.download_jobs {
+                    job.cancel.cancel();
+                }
+                self.download_jobs.clear();
+                self.media_menu = None;
                 self.me = None;
                 self.rail_groups = rail_groups::Layout::default();
                 self.rail_hover = None;
@@ -916,7 +928,6 @@ impl MatrixClient {
                 self.player_scrub = None;
                 self.files.clear();
                 self.media.borrow_mut().clear();
-                self.saving = None;
                 self.person = None;
                 self.line = None;
                 self.profile_photo = None;
@@ -1057,6 +1068,15 @@ impl MatrixClient {
                 self.sign_in_error = None;
                 for input in [&self.password, &self.confirm_password, &self.step_field] {
                     input.update(cx, |input, cx| input.set_text("", cx));
+                }
+            }
+            Update::Download { ticket, progress } => {
+                if let Some(job) = self
+                    .download_jobs
+                    .iter_mut()
+                    .find(|job| job.ticket == ticket)
+                {
+                    job.progress = progress;
                 }
             }
             Update::SpaceNames { user, names } => {
@@ -2128,6 +2148,7 @@ impl MatrixClient {
                 MessageKind::Attachment
             },
             picture: Some(Picture {
+                size: Some(shot.bytes.len() as u64),
                 mime: (!shot.mime.starts_with("image/")).then(|| shot.mime.clone()),
                 thumbnail: None,
                 duration: shot.duration,
@@ -3248,42 +3269,6 @@ fn fit(width: u32, height: u32) -> (f32, f32) {
     let (width, height) = (width as f32, height as f32);
     let scale = (400. / width).min(300. / height).min(1.);
     ((width * scale).max(48.), (height * scale).max(48.))
-}
-
-fn save_name(name: &str, bytes: &[u8]) -> String {
-    let cleaned = name
-        .trim()
-        .chars()
-        .map(|glyph| match glyph {
-            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            glyph if glyph.is_control() => '_',
-            glyph => glyph,
-        })
-        .collect::<String>();
-    let cleaned = cleaned.trim().trim_matches('.').trim();
-    let extension = sniff(bytes).map(ImageFormat::extension).unwrap_or("png");
-    if cleaned.is_empty() {
-        return format!("image.{extension}");
-    }
-    match cleaned.rsplit_once('.') {
-        Some((_, ext))
-            if !ext.is_empty()
-                && ext.len() <= 5
-                && ext.chars().all(|glyph| glyph.is_ascii_alphanumeric()) =>
-        {
-            cleaned.to_owned()
-        }
-        _ => format!("{cleaned}.{extension}"),
-    }
-}
-
-fn downloads() -> std::path::PathBuf {
-    let home = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let folder = home.join("Downloads");
-    if folder.is_dir() { folder } else { home }
 }
 
 fn icon(path: &str, size: Pixels, color: Hsla) -> impl IntoElement {
@@ -5348,25 +5333,19 @@ impl MatrixClient {
             {
                 self.render_audio(message.picture.as_ref().unwrap(), &key, spot, cx)
             }
-            MessageKind::Attachment => div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .text_color(theme.muted_foreground)
-                .child(icon("icons/link.svg", px(14.), theme.muted_foreground))
-                .child(message.body.clone())
-                .when_some(message.picture.as_ref(), |row, media| {
-                    let media = media.clone();
-                    row.child(
-                        Button::new(SharedString::from(format!("{key}-play")))
-                            .secondary()
-                            .label("Play")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.open_media(media.clone(), cx)
-                            })),
-                    )
-                })
-                .into_any_element(),
+            MessageKind::Attachment => match &message.picture {
+                Some(file) => div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(self.render_file_download(file, &key, cx))
+                    .when(!message.rich.is_empty(), |body| body.child(rich(false, cx)))
+                    .into_any_element(),
+                None => div()
+                    .text_color(theme.muted_foreground)
+                    .child(message.body.clone())
+                    .into_any_element(),
+            },
             MessageKind::Encrypted => {
                 let verified = self.security.is_none_or(|(verified, _)| verified);
                 div()
@@ -5786,12 +5765,19 @@ impl MatrixClient {
                         )
                     }),
             )
-            .child(media_ui::caption(
-                &video.name,
-                "Video",
-                video.duration.map(playback::time_label).unwrap_or_default(),
-                cx,
-            ))
+            .child(
+                media_ui::caption(
+                    &video.name,
+                    "Video",
+                    video.duration.map(playback::time_label).unwrap_or_default(),
+                    cx,
+                )
+                .child(self.media_more(
+                    video,
+                    SharedString::from(format!("video-more-{}", video.key)),
+                    cx,
+                )),
+            )
             .into_any_element()
     }
 
@@ -5893,7 +5879,15 @@ impl MatrixClient {
             .mt_1()
             .w(px(340.))
             .max_w_full()
-            .child(media_ui::caption(&media.name, "Audio", status.into(), cx).border_t_0())
+            .child(
+                media_ui::caption(&media.name, "Audio", status.into(), cx)
+                    .border_t_0()
+                    .child(self.media_more(
+                        media,
+                        SharedString::from(format!("{key}-audio-more")),
+                        cx,
+                    )),
+            )
             .child(
                 div()
                     .flex()
@@ -5981,6 +5975,7 @@ impl MatrixClient {
     }
 
     fn start_media(&mut self, media: Picture, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        self.player_media = Some(media.clone());
         self.player_image = None;
         self.player_scrub = None;
         self.player_audio = media
@@ -6042,6 +6037,7 @@ impl MatrixClient {
     }
 
     fn close_media(&mut self, cx: &mut Context<Self>) {
+        self.player_media = None;
         self.player = None;
         self.player_audio = None;
         self.player_image = None;
@@ -6470,6 +6466,13 @@ impl MatrixClient {
                 "Video",
                 vec![
                     self.render_zoom_controls(self.player_image.is_some(), cx),
+                    self.player_media
+                        .as_ref()
+                        .map(|media| {
+                            self.media_more(media, "video-file-options".into(), cx)
+                                .into_any_element()
+                        })
+                        .unwrap_or_else(|| div().into_any_element()),
                     close.into_any_element(),
                 ],
                 cx,
@@ -6517,33 +6520,6 @@ impl MatrixClient {
         cx.notify();
     }
 
-    fn download_picture(&mut self, cx: &mut Context<Self>) {
-        let Some(view) = self.viewing.clone() else {
-            return;
-        };
-        let key = format!("{}#original", view.picture.key);
-        let Some(bytes) = self.files.get(&key).cloned() else {
-            self.notify("The image is still loading.", false, cx);
-            return;
-        };
-        let name = save_name(&view.name, &bytes);
-        let directory = downloads();
-        let receiver = cx.prompt_for_new_path(&directory, Some(&name));
-        self.saving = Some(cx.spawn(async move |this, cx| {
-            let chosen = match receiver.await {
-                Ok(Ok(path)) => path,
-                _ => None,
-            };
-            let Some(path) = chosen else { return };
-            let saved = std::fs::write(&path, bytes);
-            this.update(cx, |this, cx| match saved {
-                Ok(()) => this.notify("Image saved.", false, cx),
-                Err(_) => this.notify("That image couldn't be saved.", true, cx),
-            })
-            .ok();
-        }));
-    }
-
     fn render_picture(&self, picture: &Picture, cx: &mut Context<Self>) -> AnyElement {
         let theme = *cx.theme();
         let (width, height) = fit(picture.width, picture.height);
@@ -6586,7 +6562,13 @@ impl MatrixClient {
             .w(px(width))
             .max_w_full()
             .child(frame)
-            .child(media_ui::caption(&picture.name, "Image", detail, cx))
+            .child(
+                media_ui::caption(&picture.name, "Image", detail, cx).child(self.media_more(
+                    picture,
+                    SharedString::from(format!("image-more-{}", picture.key)),
+                    cx,
+                )),
+            )
             .into_any_element()
     }
 
@@ -6666,8 +6648,7 @@ impl MatrixClient {
         );
         let actions = vec![
             self.render_zoom_controls(image.is_some(), cx),
-            media_ui::tool("image-download", "icons/download.svg", "Download image")
-                .on_click(cx.listener(|this, _, _, cx| this.download_picture(cx)))
+            self.media_more(&view.picture, "image-file-options".into(), cx)
                 .into_any_element(),
             media_ui::tool("image-close", "icons/x.svg", "Close (Esc)")
                 .on_click(cx.listener(|this, _, _, cx| this.close_picture(cx)))
@@ -8566,6 +8547,8 @@ impl Render for MatrixClient {
             .when(self.player.is_some(), |root| {
                 root.child(self.render_player(window, cx))
             })
+            .children(self.render_download_menu(cx))
+            .children(self.render_download_panel(window, cx))
             .when_some(self.notice.clone(), |root, (text, failed)| {
                 let toast =
                     Toast::new("huddle-notice", text).on_dismiss(cx.listener(|this, _, _, cx| {
