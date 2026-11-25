@@ -2205,7 +2205,7 @@ async fn space_names(
                 .map(|(id, via)| async move {
                     let address: OwnedRoomOrAliasId = id.clone().into();
                     let preview = tokio::time::timeout(
-                        Duration::from_secs(10),
+                        Duration::from_secs(30),
                         client.get_room_preview(&address, via),
                     )
                     .await;
