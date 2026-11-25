@@ -1202,7 +1202,7 @@ async fn handle(
     match command {
         Command::LoadSpaceNames(room) => {
             if let Some(user) = client.user_id().map(ToOwned::to_owned) {
-                let names = space_names(client, &room).await;
+                let names = space_names(client, &room, Some(outbox)).await;
                 post(outbox, Update::SpaceNames { user, names });
             }
         }
@@ -2111,6 +2111,16 @@ async fn summaries(client: &Client) -> Vec<RoomSummary> {
 }
 
 async fn space_children(space: &Room) -> Vec<OwnedRoomId> {
+    space_child_routes(space)
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
+}
+
+async fn space_child_routes(
+    space: &Room,
+) -> Vec<(OwnedRoomId, Vec<matrix_sdk::ruma::OwnedServerName>)> {
     let Ok(events) = space
         .get_state_events_static::<SpaceChildEventContent>()
         .await
@@ -2122,7 +2132,7 @@ async fn space_children(space: &Room) -> Vec<OwnedRoomId> {
         .filter_map(|event| match event {
             RawSyncOrStrippedState::Sync(raw) => match raw.deserialize().ok()? {
                 SyncStateEvent::Original(event) if !event.content.via.is_empty() => {
-                    Some(event.state_key)
+                    Some((event.state_key, event.content.via))
                 }
                 _ => None,
             },
@@ -2133,7 +2143,11 @@ async fn space_children(space: &Room) -> Vec<OwnedRoomId> {
 
 /// Space discovery includes metadata for children without joining them. Keep
 /// earlier pages usable if a later page is unavailable or access is restricted.
-async fn space_names(client: &Client, room: &OwnedRoomId) -> Vec<(OwnedRoomId, String)> {
+async fn space_names(
+    client: &Client,
+    room: &OwnedRoomId,
+    publish: Option<&Outbox>,
+) -> Vec<(OwnedRoomId, String)> {
     use matrix_sdk::ruma::api::client::space::get_hierarchy;
     let mut names = Vec::new();
     let mut from = None;
@@ -2146,7 +2160,9 @@ async fn space_names(client: &Client, room: &OwnedRoomId) -> Vec<(OwnedRoomId, S
         let response = match client
             .send(request)
             .with_request_config(
-                matrix_sdk::config::RequestConfig::short_retry().timeout(Duration::from_secs(10)),
+                matrix_sdk::config::RequestConfig::short_retry()
+                    .retry_limit(0)
+                    .timeout(Duration::from_secs(5)),
             )
             .await
         {
@@ -2175,6 +2191,53 @@ async fn space_names(client: &Client, room: &OwnedRoomId) -> Vec<(OwnedRoomId, S
         };
         if !seen.insert(token.clone()) {
             break;
+        }
+    }
+    // Some homeservers reject hierarchy discovery or omit otherwise public
+    // children. Preview those rooms through the servers advertised by the link.
+    if let Some(parent) = client.get_room(room) {
+        let known: std::collections::HashSet<_> = names.iter().map(|(id, _)| id.clone()).collect();
+        let routes = space_child_routes(&parent).await;
+        let mut previews = futures::stream::iter(
+            routes
+                .into_iter()
+                .filter(|(id, _)| id != room && !known.contains(id))
+                .map(|(id, via)| async move {
+                    let address: OwnedRoomOrAliasId = id.clone().into();
+                    let preview = tokio::time::timeout(
+                        Duration::from_secs(10),
+                        client.get_room_preview(&address, via),
+                    )
+                    .await;
+                    let name = match preview {
+                        Ok(Ok(preview)) => preview
+                            .name
+                            .filter(|name| !name.trim().is_empty())
+                            .or_else(|| preview.canonical_alias.map(|alias| alias.to_string())),
+                        Ok(Err(error)) => {
+                            log::debug!("Linked room preview unavailable for {id}: {error}");
+                            None
+                        }
+                        Err(_) => None,
+                    };
+                    (id, name)
+                }),
+        )
+        .buffer_unordered(4);
+        while let Some((id, name)) = previews.next().await {
+            let Some(name) = name else {
+                continue;
+            };
+            if let (Some(outbox), Some(user)) = (publish, client.user_id()) {
+                post(
+                    outbox,
+                    Update::SpaceNames {
+                        user: user.to_owned(),
+                        names: vec![(id.clone(), name.clone())],
+                    },
+                );
+            }
+            names.push((id, name));
         }
     }
     names

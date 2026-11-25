@@ -4761,8 +4761,26 @@ impl MatrixClient {
                     .children(rooms.into_iter().map(|room| self.render_room_row(room, cx)));
             }
             if !unjoined.is_empty() {
-                list = list.child(self.section("NOT JOINED", None, cx)).children(
-                    unjoined.into_iter().map(|id| {
+                list = list
+                    .child(
+                        self.section("NOT JOINED", None, cx).child(
+                            Button::new("reload-linked-room-names")
+                                .ghost()
+                                .small()
+                                .p_0()
+                                .size(px(22.))
+                                .icon("icons/refresh-cw.svg")
+                                .tooltip("Reload names")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(space) = &this.space {
+                                        this.linked_name_requests.remove(space);
+                                    }
+                                    this.load_linked_names();
+                                    cx.notify();
+                                })),
+                        ),
+                    )
+                    .children(unjoined.into_iter().map(|id| {
                         let address = id.to_string();
                         let name = spaces::linked_name(&self.rooms, &self.linked_names, &id);
                         Button::new(SharedString::from(format!("join-space-child-{id}")))
@@ -4776,8 +4794,7 @@ impl MatrixClient {
                                 this.command(Command::Join(address.clone()));
                                 this.notify("Joining…", false, cx);
                             }))
-                    }),
-                );
+                    }));
             }
         }
         if space.is_none() {

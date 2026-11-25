@@ -40,6 +40,9 @@ fn decode_component(value: &str) -> String {
 
 #[derive(Default)]
 struct Traffic {
+    room_previews: HashMap<String, serde_json::Value>,
+    preview_requests: Vec<String>,
+    public_room_previews: Vec<serde_json::Value>,
     hierarchy_pages: HashMap<String, serde_json::Value>,
     hierarchy_requests: Vec<String>,
     presence: Option<serde_json::Value>,
@@ -349,6 +352,28 @@ impl Server {
                         status = "403 Forbidden";
                         br#"{"errcode":"M_FORBIDDEN","error":"Space not accessible"}"#.to_vec()
                     }
+                } else if path.contains("/summary") || path.contains("/room_summary/") {
+                    traffic.preview_requests.push(path.to_owned());
+                    let encoded = path
+                        .split("/rooms/")
+                        .nth(1)
+                        .and_then(|suffix| suffix.split('/').next())
+                        .or_else(|| {
+                            path.split("/room_summary/")
+                                .nth(1)
+                                .map(|suffix| suffix.split('?').next().unwrap())
+                        });
+                    let id = encoded.map(decode_component).unwrap_or_default();
+                    if let Some(preview) = traffic.room_previews.get(&id) {
+                        serde_json::to_vec(preview).unwrap()
+                    } else {
+                        status = "404 Not Found";
+                        br#"{"errcode":"M_UNRECOGNIZED","error":"No room summary"}"#.to_vec()
+                    }
+                } else if path.contains("/publicRooms") {
+                    traffic.preview_requests.push(path.to_owned());
+                    serde_json::to_vec(&serde_json::json!({"chunk":traffic.public_room_previews}))
+                        .unwrap()
                 } else if path.contains("/capabilities") {
                     serde_json::to_vec(&serde_json::json!({"capabilities":traffic.capabilities.clone().unwrap_or_else(|| serde_json::json!({}))})).unwrap()
                 } else if path.contains("/presence/") {
@@ -981,9 +1006,63 @@ async fn space_discovery_loads_child_names_across_pages_without_joining() {
         }
         // A forbidden later page must not discard names already discovered.
         server.traffic.lock().unwrap().hierarchy_pages.remove("page two");
-        assert_eq!(space_names(&client, &parent).await.len(), 1);
+        assert_eq!(space_names(&client, &parent, None).await.len(), 1);
         // Failure on the first page is non-fatal and leaves the UI's ID fallback available.
         server.traffic.lock().unwrap().hierarchy_pages.clear();
-        assert!(space_names(&client, &parent).await.is_empty());
+        assert!(space_names(&client, &parent, None).await.is_empty());
     }).await.expect("Space discovery test timed out");
+}
+
+#[tokio::test]
+async fn child_previews_recover_names_when_space_hierarchy_is_unavailable() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let (server, client, parent) = room_admin_tests::setup(true).await;
+        let child: OwnedRoomId = "!foreign:remote.org".parse().unwrap();
+        let directory_child: OwnedRoomId = "!directory:remote.org".parse().unwrap();
+        let private: OwnedRoomId = "!private:remote.org".parse().unwrap();
+        let removed: OwnedRoomId = "!removed:remote.org".parse().unwrap();
+        let events = [&child, &directory_child, &private, &removed, &parent].into_iter().map(|id| serde_json::json!({
+            "type":"m.space.child", "state_key":id.as_str(), "event_id":format!("$link{id}"),
+            "sender":"@tester:example.org", "origin_server_ts":2,
+            "content":{"via":if id == &removed { vec![] } else { vec!["routing.example.org"] }}
+        })).collect::<Vec<_>>();
+        {
+            let mut traffic = server.traffic.lock().unwrap();
+            traffic.sync = Some(serde_json::json!({"next_batch":"child-previews", "rooms":{"join":{
+                parent.as_str():{"state":{"events":events}, "timeline":{"events":[],"limited":false}}
+            }}}));
+            traffic.room_previews.insert(child.to_string(), serde_json::json!({
+                "room_id":child, "name":"Hackerspace Warszawa", "num_joined_members":2,
+                "world_readable":false, "guest_can_join":false, "join_rule":"public", "membership":"leave"
+            }));
+            traffic.room_previews.insert(private.to_string(), serde_json::json!({
+                "room_id":private, "num_joined_members":2, "world_readable":false,
+                "guest_can_join":false, "join_rule":"invite", "membership":"leave"
+            }));
+            traffic.public_room_previews.push(serde_json::json!({
+                "room_id":directory_child, "name":"Hackerspace Kraków", "num_joined_members":2,
+                "world_readable":false, "guest_can_join":false, "join_rule":"public"
+            }));
+        }
+        client.sync_once(SyncSettings::default()).await.unwrap();
+        let (outbox, mut updates) = ui::unbounded();
+        let names = space_names(&client, &parent, Some(&outbox)).await.into_iter().collect::<HashMap<_, _>>();
+        assert_eq!(names.get(&child).map(String::as_str), Some("Hackerspace Warszawa"));
+        assert_eq!(names.get(&directory_child).map(String::as_str), Some("Hackerspace Kraków"));
+        assert_eq!(names.len(), 2);
+        // Publish results as they arrive so slow or unnamed children don't hold up the list.
+        for _ in 0..2 {
+            let Some(Update::SpaceNames { user, names }) = updates.next().await else { panic!("Expected preview name update"); };
+            assert_eq!(user.as_str(), "@tester:example.org");
+            assert_eq!(names.len(), 1);
+        }
+        assert_eq!(client.rooms().len(), 1);
+        let traffic = server.traffic.lock().unwrap();
+        assert_eq!(traffic.hierarchy_requests.len(), 1);
+        assert!(traffic.preview_requests.iter().any(|path| path.contains("/publicRooms") && path.contains("routing.example.org")));
+        assert!(traffic.preview_requests.iter().filter(|path| path.contains("/summary") || path.contains("/room_summary/"))
+            .all(|path| path.contains("routing.example.org")));
+        assert!(!traffic.preview_requests.iter().any(|path| path.contains("removed")));
+        assert!(traffic.state_writes.is_empty());
+    }).await.expect("Child room preview test timed out");
 }
