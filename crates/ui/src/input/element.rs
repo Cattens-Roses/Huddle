@@ -477,11 +477,11 @@ fn selection_quads(
             let from = selected.start.max(start);
             let to = selected.end.min(end);
             if from < to {
-                let x = |offset: usize| {
-                    line.position_for_index(offset - at, line_height)
-                        .map(|pos| pos.x)
-                        .unwrap_or(px(0.))
-                };
+                // A wrap boundary is also the previous row's end. Resolve both
+                // edges relative to this row, rather than a caret position that
+                // can put the start at the previous row's right edge.
+                let row_x = line.unwrapped_layout.x_for_index(local_start);
+                let x = |offset: usize| line.unwrapped_layout.x_for_index(offset - at) - row_x;
                 let y = bounds.top() + top - line_height * scroll as f32;
                 quads.push(fill(
                     Bounds::from_corners(
@@ -665,5 +665,106 @@ impl Render for Input {
                 )
             })
             .when_some(context_menu, |this, menu| this.child(menu))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    fn wrapped(cx: &mut TestAppContext, text: &str, width: Pixels) -> Vec<WrappedLine> {
+        let run = TextRun {
+            len: text.len(),
+            font: gpui::font("Arial"),
+            color: gpui::white(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        cx.add_empty_window().update(|window, _| {
+            window
+                .text_system()
+                .shape_text(text.to_owned().into(), px(14.), &[run], Some(width), None)
+                .unwrap()
+                .into_iter()
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    fn select_all_highlights_every_wrapped_row_and_copies_the_entire_message(
+        cx: &mut TestAppContext,
+    ) {
+        let text = "Wiadomość z polskimi znakami i emoji 🦀 zajmuje kilka zawiniętych linii w polu tekstowym.";
+        let lines = wrapped(cx, text, px(120.));
+        let rows = lines
+            .iter()
+            .map(|line| line.wrap_boundaries.len() + 1)
+            .sum::<usize>();
+        assert!(rows >= 3);
+        let visual = cx.add_empty_window();
+        let selected = visual.update(|window, cx| {
+            let field = cx.new(|cx| {
+                let mut field = Input::new("Message", cx).growing();
+                field.set_text(text, cx);
+                field
+            });
+            field.update(cx, |field, cx| {
+                field.select_all(&SelectAll, window, cx);
+                field.copy(&Copy, window, cx);
+                field.selected_range.clone()
+            })
+        });
+        assert_eq!(selected, 0..text.len());
+        assert_eq!(
+            cx.read_from_clipboard().unwrap().text().as_deref(),
+            Some(text)
+        );
+        let bounds = Bounds::new(point(px(10.), px(20.)), size(px(120.), px(200.)));
+        let quads = selection_quads(&lines, text, &selected, bounds, px(20.), 0, gpui::white());
+        assert_eq!(quads.len(), rows);
+        for (row, quad) in quads.iter().enumerate() {
+            assert_eq!(
+                quad.bounds.left(),
+                bounds.left(),
+                "row {row} must start at the left edge"
+            );
+            assert!(
+                quad.bounds.size.width > px(0.),
+                "row {row} must have a visible highlight"
+            );
+            assert!(quad.bounds.size.width <= bounds.size.width);
+            assert_eq!(quad.bounds.top(), bounds.top() + px(20.) * row as f32);
+        }
+    }
+
+    #[gpui::test]
+    fn selection_starting_at_a_wrap_boundary_handles_newlines_and_scroll(cx: &mut TestAppContext) {
+        let text = "Pierwszy długi akapit wiadomości zawijany na kilka wierszy.\nDrugi akapit również ma więcej niż jeden wiersz.";
+        let lines = wrapped(cx, text, px(120.));
+        let boundary = lines[0].wrap_boundaries.first().unwrap();
+        let start = lines[0].unwrapped_layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index;
+        let bounds = Bounds::new(point(px(10.), px(20.)), size(px(120.), px(80.)));
+        let quads = selection_quads(
+            &lines,
+            text,
+            &(start..text.len()),
+            bounds,
+            px(20.),
+            1,
+            gpui::white(),
+        );
+        let rows = lines
+            .iter()
+            .map(|line| line.wrap_boundaries.len() + 1)
+            .sum::<usize>();
+        assert_eq!(quads.len(), rows - 1);
+        assert_eq!(quads[0].bounds.origin, bounds.origin);
+        for quad in quads {
+            assert_eq!(quad.bounds.left(), bounds.left());
+            assert!(quad.bounds.size.width > px(0.));
+            assert!(quad.bounds.size.width <= bounds.size.width);
+        }
     }
 }
