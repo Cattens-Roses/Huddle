@@ -20,6 +20,8 @@ pub enum Perch {
     Pointer,
     /// Centred above the pointer, clear of a small control under it.
     Above,
+    /// To the right of the pointer, for icons in a navigation rail.
+    Right,
     /// Placed like `Pointer`, but shown the moment the pointer arrives and moved along with it.
     Follow,
 }
@@ -107,6 +109,7 @@ impl Render for Tooltip {
                 point(at.x, at.y - theme.metrics.control_small / 2.),
                 Anchor::BottomCenter,
             ),
+            Perch::Right => (at + point(px(32.), px(0.)), Anchor::LeftCenter),
         };
 
         anchored()
@@ -115,6 +118,7 @@ impl Render for Tooltip {
             .snap_to_window_with_margin(MARGIN)
             .child(
                 div()
+                    .max_w(px(320.))
                     .px_2()
                     .py_1()
                     .rounded(theme.radius)
@@ -136,7 +140,7 @@ impl Render for Tooltip {
 fn timed<E: StatefulInteractiveElement>(element: E, perch: Perch) -> E {
     match perch {
         Perch::Follow => element.tooltip_show_delay(Duration::ZERO),
-        Perch::Pointer | Perch::Above => element,
+        Perch::Pointer | Perch::Above | Perch::Right => element,
     }
 }
 

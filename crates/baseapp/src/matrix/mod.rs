@@ -2,6 +2,7 @@ mod backend;
 mod photo;
 mod playback;
 mod profile;
+mod rail_groups;
 mod receipts;
 mod rich;
 mod room_settings;
@@ -32,7 +33,8 @@ use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedUse
 use tokio::sync::mpsc::UnboundedSender;
 use ui::{
     ActiveTheme as _, Button, Checkbox, Copy, Dismiss, Fading as _, Input, Modal, Motioned as _,
-    PastedPicture, Scrollbar, Scroller, Scrubber, ScrubberState, Submit, Text, Toast,
+    PastedPicture, Perch, Scrollbar, Scroller, Scrubber, ScrubberState, Submit, Text, Tipped as _,
+    Toast,
 };
 
 use backend::{
@@ -419,6 +421,7 @@ pub struct MatrixClient {
     space: Option<OwnedRoomId>,
     removing_space: Option<(OwnedRoomId, String)>,
     room: Option<OwnedRoomId>,
+    rail_groups: rail_groups::Layout,
     focused: bool,
     in_tray: bool,
     typing: typing::Remote,
@@ -540,6 +543,7 @@ impl MatrixClient {
             space: None,
             removing_space: None,
             room: None,
+            rail_groups: rail_groups::Layout::default(),
             focused: true,
             in_tray: false,
             typing: typing::Remote::default(),
@@ -859,6 +863,7 @@ impl MatrixClient {
                 cx.emit(CacheChanged);
                 self.phase = Phase::SignedOut;
                 self.me = None;
+                self.rail_groups = rail_groups::Layout::default();
                 self.rooms.clear();
                 self.timelines.clear();
                 self.members.clear();
@@ -1006,6 +1011,11 @@ impl MatrixClient {
             }
             Update::SignedIn { user, name, avatar } => {
                 self.phase = Phase::SignedIn;
+                self.rail_groups =
+                    rail_groups::Layout::load(user.as_str()).unwrap_or_else(|error| {
+                        log::warn!("Could not load navigation groups: {error:#}");
+                        rail_groups::Layout::default()
+                    });
                 cx.emit(CacheChanged);
                 self.me = Some(Me {
                     id: user,
@@ -3726,12 +3736,166 @@ impl MatrixClient {
             .into_any_element()
     }
 
+    fn save_rail_groups(&mut self, cx: &mut Context<Self>) {
+        if let Some(me) = &self.me
+            && let Err(error) = self.rail_groups.save(me.id.as_str())
+        {
+            log::warn!("Could not save navigation groups: {error:#}");
+            self.notify("Couldn't save groups. Try again.", true, cx);
+        }
+        cx.notify();
+    }
+
+    fn render_rail_group(
+        &self,
+        group: &rail_groups::Group,
+        members: &[&RoomSummary],
+        children: Vec<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = *cx.theme();
+        let id = group.id;
+        let expanded = group.expanded;
+        let names = members
+            .iter()
+            .map(|room| room.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let unread = unread::group(&self.rooms, group.rooms.iter());
+        let active = members.iter().any(|room| {
+            self.space.as_ref() == Some(&room.id)
+                || (self.space.is_none() && self.room.as_ref() == Some(&room.id))
+        });
+        div()
+            .w_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_2()
+            .py_1()
+            .rounded(px(18.))
+            .bg(theme.primary.opacity(if active { 0.14 } else { 0.06 }))
+            .child(
+                div()
+                    .id(SharedString::from(format!("rail-group-{id}")))
+                    .relative()
+                    .size(px(48.))
+                    .rounded(px(16.))
+                    .bg(theme.primary.opacity(0.15))
+                    .cursor_pointer()
+                    .tip_label(
+                        format!(
+                            "{names} · {}",
+                            if expanded {
+                                "Collapse group"
+                            } else {
+                                "Expand group"
+                            }
+                        ),
+                        Perch::Right,
+                    )
+                    .hover(|style| style.bg(theme.primary.opacity(0.25)))
+                    .drag_over::<rail_groups::DraggedRoom>(move |style, _, _, _| {
+                        style.bg(theme.primary.opacity(0.4))
+                    })
+                    .on_drop(
+                        cx.listener(move |this, dragged: &rail_groups::DraggedRoom, _, cx| {
+                            if this.rail_groups.move_into(dragged.room.clone(), id) {
+                                this.save_rail_groups(cx);
+                            }
+                        }),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(group) = this
+                            .rail_groups
+                            .groups
+                            .iter_mut()
+                            .find(|group| group.id == id)
+                        {
+                            group.expanded = !group.expanded;
+                            this.save_rail_groups(cx);
+                        }
+                    }))
+                    .child(if expanded {
+                        div()
+                            .size_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(icon("icons/folder-plus.svg", px(24.), theme.primary))
+                            .into_any_element()
+                    } else {
+                        div()
+                            .size_full()
+                            .p_1()
+                            .flex()
+                            .flex_wrap()
+                            .gap(px(2.))
+                            .overflow_hidden()
+                            .children(members.iter().take(4).map(|room| {
+                                self.face(
+                                    room.id.as_str(),
+                                    &room.name,
+                                    room.avatar.as_ref(),
+                                    px(18.),
+                                )
+                            }))
+                            .into_any_element()
+                    })
+                    .child(
+                        div()
+                            .absolute()
+                            .right(px(-3.))
+                            .top(px(-3.))
+                            .rounded_full()
+                            .bg(theme.sidebar)
+                            .child(icon(
+                                if expanded {
+                                    "icons/chevron-down.svg"
+                                } else {
+                                    "icons/chevron-right.svg"
+                                },
+                                px(12.),
+                                theme.primary,
+                            )),
+                    )
+                    .when(!expanded && unread > 0, |header| {
+                        header.child(
+                            unread::badge(unread, cx)
+                                .absolute()
+                                .right(px(-5.))
+                                .bottom(px(-3.))
+                                .border_2()
+                                .border_color(theme.sidebar),
+                        )
+                    }),
+            )
+            .children(children)
+            .when(expanded, |folder| {
+                folder.child(
+                    Button::new(SharedString::from(format!("rail-group-remove-{id}")))
+                        .ghost()
+                        .small()
+                        .icon("icons/x.svg")
+                        .tooltip("Ungroup rooms and spaces")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.rail_groups.groups.retain(|group| group.id != id);
+                            this.save_rail_groups(cx);
+                        })),
+                )
+            })
+            .into_any_element()
+    }
+
     fn render_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.theme();
         let home_count = unread::home(&self.rooms);
         let home_unread = home_count > 0 || self.rooms.iter().any(|room| room.invite);
         type Press = Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
         let item = |id: SharedString,
+                    name: SharedString,
+                    room: Option<OwnedRoomId>,
                     active: bool,
                     unread: bool,
                     count: u64,
@@ -3739,6 +3903,7 @@ impl MatrixClient {
                     press: Press| {
             div()
                 .relative()
+                .flex_none()
                 .flex()
                 .justify_center()
                 .w_full()
@@ -3778,6 +3943,7 @@ impl MatrixClient {
                 .child(
                     div()
                         .id(id)
+                        .tip_label(name.clone(), Perch::Right)
                         .relative()
                         .flex()
                         .items_center()
@@ -3817,6 +3983,38 @@ impl MatrixClient {
                                     .border_color(theme.sidebar),
                             )
                         })
+                        .when_some(room, |icon, room| {
+                            let target = room.clone();
+                            let hover_target = room.clone();
+                            icon.on_drag(
+                                rail_groups::DraggedRoom {
+                                    room,
+                                    name: name.to_string(),
+                                },
+                                |dragged, _, _, cx| cx.new(|_| dragged.clone()),
+                            )
+                            .drag_over::<rail_groups::DraggedRoom>(move |style, dragged, _, _| {
+                                if dragged.room == hover_target {
+                                    style
+                                } else {
+                                    style
+                                        .bg(theme.primary)
+                                        .text_color(theme.primary_foreground)
+                                        .rounded(px(16.))
+                                }
+                            })
+                            .on_drop(cx.listener({
+                                let target = target.clone();
+                                move |this, dragged: &rail_groups::DraggedRoom, _, cx| {
+                                    if this
+                                        .rail_groups
+                                        .combine(dragged.room.clone(), target.clone())
+                                    {
+                                        this.save_rail_groups(cx);
+                                    }
+                                }
+                            }))
+                        })
                         .on_click(press),
                 )
         };
@@ -3831,7 +4029,10 @@ impl MatrixClient {
             .rooms
             .iter()
             .filter(|room| {
-                room.kind == RoomKind::Room && !room.invite && !grouped.contains(&room.id)
+                !room.invite
+                    && ((room.kind == RoomKind::Room && !grouped.contains(&room.id))
+                        || (room.kind != RoomKind::Space
+                            && self.rail_groups.group_of(&room.id).is_some()))
             })
             .map(|room| {
                 (
@@ -3846,6 +4047,8 @@ impl MatrixClient {
 
         let home = item(
             "rail-home".into(),
+            "Home · drag here to ungroup".into(),
+            None,
             home_active,
             home_unread,
             home_count,
@@ -3883,8 +4086,10 @@ impl MatrixClient {
                     }
                 });
                 let open = id.clone();
-                item(
+                let element = item(
                     SharedString::from(format!("rail-room-{}", id)),
+                    name.clone().into(),
+                    Some(id.clone()),
                     self.space.is_none() && self.room.as_ref() == Some(&id),
                     unread > 0,
                     unread,
@@ -3900,7 +4105,8 @@ impl MatrixClient {
                         this.space = None;
                         this.open(open.clone(), window, cx);
                     })),
-                )
+                );
+                (id, element.into_any_element())
             })
             .collect::<Vec<_>>();
 
@@ -3921,8 +4127,10 @@ impl MatrixClient {
                         _ => None,
                     }
                 });
-                item(
+                let element = item(
                     SharedString::from(format!("rail-{}", space.id)),
+                    space.name.clone().into(),
+                    Some(space.id.clone()),
                     self.space.as_ref() == Some(&space.id),
                     unread > 0,
                     unread,
@@ -3938,9 +4146,55 @@ impl MatrixClient {
                         this.space = Some(id.clone());
                         cx.notify();
                     })),
-                )
+                );
+                (space.id.clone(), element.into_any_element())
             })
             .collect::<Vec<_>>();
+
+        let order: Vec<_> = rooms
+            .iter()
+            .chain(&spaces)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut icons: HashMap<_, _> = rooms.into_iter().chain(spaces).collect();
+        let mut entries = Vec::new();
+        let available: std::collections::HashSet<_> = order.iter().cloned().collect();
+        for id in order {
+            if let Some(group_id) = self.rail_groups.group_of(&id) {
+                let group = self
+                    .rail_groups
+                    .groups
+                    .iter()
+                    .find(|group| group.id == group_id)
+                    .unwrap();
+                // Keep the folder at the target icon's position, even when its source came first.
+                if group
+                    .rooms
+                    .iter()
+                    .find(|member| available.contains(*member))
+                    != Some(&id)
+                {
+                    continue;
+                }
+                let members = group
+                    .rooms
+                    .iter()
+                    .filter_map(|id| self.summary(id).filter(|room| !room.invite))
+                    .collect::<Vec<_>>();
+                let children = if group.expanded {
+                    group
+                        .rooms
+                        .iter()
+                        .filter_map(|id| icons.remove(id))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                entries.push(self.render_rail_group(group, &members, children, cx));
+            } else if let Some(icon) = icons.remove(&id) {
+                entries.push(icon);
+            }
+        }
 
         div()
             .id("rail")
@@ -3954,7 +4208,23 @@ impl MatrixClient {
             .py_3()
             .bg(theme.sidebar)
             .overflow_y_scroll()
-            .child(home)
+            .child(
+                div()
+                    .id("rail-ungroup")
+                    .w_full()
+                    .tip_label("Drag here to ungroup", Perch::Right)
+                    .drag_over::<rail_groups::DraggedRoom>(move |style, _, _, _| {
+                        style.bg(theme.primary.opacity(0.15)).rounded(theme.radius)
+                    })
+                    .on_drop(
+                        cx.listener(|this, dragged: &rail_groups::DraggedRoom, _, cx| {
+                            if this.rail_groups.ungroup(&dragged.room) {
+                                this.save_rail_groups(cx);
+                            }
+                        }),
+                    )
+                    .child(home),
+            )
             .child(
                 div()
                     .w(px(32.))
@@ -3963,8 +4233,7 @@ impl MatrixClient {
                     .rounded_full()
                     .bg(theme.border),
             )
-            .children(rooms)
-            .children(spaces)
+            .children(entries)
             .child(
                 div()
                     .id("rail-add")
@@ -4003,6 +4272,28 @@ impl MatrixClient {
         };
         div()
             .id(SharedString::from(format!("room-{}", room.id)))
+            .tip_label(room.name.clone(), Perch::Right)
+            .on_drag(
+                rail_groups::DraggedRoom {
+                    room: id.clone(),
+                    name: room.name.clone(),
+                },
+                |dragged, _, _, cx| cx.new(|_| dragged.clone()),
+            )
+            .drag_over::<rail_groups::DraggedRoom>(move |style, _, _, _| {
+                style.bg(theme.primary.opacity(0.2))
+            })
+            .on_drop(cx.listener({
+                let target = id.clone();
+                move |this, dragged: &rail_groups::DraggedRoom, _, cx| {
+                    if this
+                        .rail_groups
+                        .combine(dragged.room.clone(), target.clone())
+                    {
+                        this.save_rail_groups(cx);
+                    }
+                }
+            }))
             .flex()
             .items_center()
             .gap_2()

@@ -10,8 +10,15 @@ pub(super) fn home(rooms: &[RoomSummary]) -> u64 {
 }
 
 pub(super) fn space(rooms: &[RoomSummary], root: &OwnedRoomId) -> u64 {
+    group(rooms, std::iter::once(root))
+}
+
+pub(super) fn group<'a>(
+    rooms: &[RoomSummary],
+    roots: impl IntoIterator<Item = &'a OwnedRoomId>,
+) -> u64 {
     let known: HashMap<_, _> = rooms.iter().map(|room| (&room.id, room)).collect();
-    let mut pending = vec![root];
+    let mut pending: Vec<_> = roots.into_iter().collect();
     let mut visited = HashSet::new();
     let mut total = 0u64;
     while let Some(id) = pending.pop() {
@@ -85,6 +92,20 @@ mod tests {
         rooms[1].unread = 0;
         assert_eq!(home(&rooms), 0);
     }
+    #[test]
+    fn folders_deduplicate_rooms_shared_by_spaces() {
+        let rooms = vec![
+            room("space1", RoomKind::Space, 0, &["shared", "other"]),
+            room("space2", RoomKind::Space, 0, &["shared"]),
+            room("shared", RoomKind::Room, 4, &[]),
+            room("other", RoomKind::Room, 7, &[]),
+        ];
+        assert_eq!(
+            group(&rooms, [&rooms[0].id, &rooms[1].id, &rooms[2].id]),
+            11
+        );
+    }
+
     #[test]
     fn space_counts_nested_rooms_once_and_handles_cycles_and_unknown_children() {
         let mut rooms = vec![
