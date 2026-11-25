@@ -6,6 +6,7 @@ mod rail_groups;
 mod receipts;
 mod rich;
 mod room_settings;
+mod text_selection;
 mod typing;
 mod unread;
 mod upload;
@@ -375,12 +376,6 @@ fn insert(messages: &mut Vec<Message>, message: Message, mine: bool) -> Insert {
     }
 }
 
-struct Mark {
-    id: SharedString,
-    text: String,
-    range: std::ops::Range<usize>,
-}
-
 #[derive(Clone)]
 struct View {
     picture: Picture,
@@ -497,7 +492,8 @@ pub struct MatrixClient {
     readers_view: Option<receipts::Selection>,
     own_read_targets: [Option<OwnedEventId>; 2],
     admin: room_settings::Panel,
-    mark: Option<Mark>,
+    selection: text_selection::Selection,
+    text_focus: gpui::FocusHandle,
     _updates: Task<()>,
 }
 
@@ -643,9 +639,19 @@ impl MatrixClient {
             readers_view: None,
             own_read_targets: [None, None],
             admin: room_settings::Panel::new(cx),
-            mark: None,
+            selection: text_selection::Selection::default(),
+            text_focus: cx.focus_handle(),
             _updates: listener,
         };
+        let command = if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        };
+        cx.bind_keys([
+            gpui::KeyBinding::new(&format!("{command}-a"), ui::SelectAll, Some("MessageText")),
+            gpui::KeyBinding::new("escape", Dismiss, Some("MessageText")),
+        ]);
         let this = cx.weak_entity();
         App::on_action(cx, move |_: &Copy, cx: &mut App| {
             this.update(cx, |this, cx| this.copy_mark(cx)).ok();
@@ -881,7 +887,7 @@ impl MatrixClient {
                 self.picker = None;
                 self.attachment = None;
                 self.cancel_compress();
-                self.mark = None;
+                self.selection.clear();
                 self.viewing = None;
                 self.player = None;
                 self.player_audio = None;
@@ -2522,42 +2528,64 @@ impl MatrixClient {
 
     fn on_select(&self, cx: &Context<Self>) -> rich::OnSelect {
         let this = cx.weak_entity();
-        Rc::new(move |id, range, text, _, cx| {
-            let id = id.to_owned();
-            let text = text.to_owned();
-            this.update(cx, |this, cx| this.choose(&id, range, &text, cx))
-                .ok();
+        Rc::new(move |window, cx| {
+            this.update(cx, |this, cx| {
+                this.text_focus.focus(window, cx);
+                this.release_drafts(cx);
+                cx.notify();
+            })
+            .ok();
         })
     }
 
-    fn choose(
-        &mut self,
-        id: &str,
-        range: std::ops::Range<usize>,
-        text: &str,
-        cx: &mut Context<Self>,
-    ) {
-        let start = rich::boundary(text, range.start);
-        let end = rich::boundary(text, range.end).max(start);
-        if start == end {
-            if self.mark.take().is_some() {
-                cx.notify();
+    fn prepare_selection(&self) {
+        let mut document = Vec::new();
+        if let Some(timeline) = self.timeline() {
+            for message in &timeline.messages {
+                rich::document(
+                    &format!("m-{}", message_key(message)),
+                    &message.rich,
+                    &mut document,
+                );
             }
-            return;
+            if let Some(root) = &self.thread {
+                if let Some(message) = timeline.find(root) {
+                    rich::document(
+                        &format!("t-{}", message_key(message)),
+                        &message.rich,
+                        &mut document,
+                    );
+                }
+                if let Some(messages) = timeline.threads.get(root) {
+                    for message in messages {
+                        rich::document(
+                            &format!("t-{}", message_key(message)),
+                            &message.rich,
+                            &mut document,
+                        );
+                    }
+                }
+            }
         }
-        let next = Mark {
-            id: id.into(),
-            text: text.to_owned(),
-            range: start..end,
+        self.selection.prepare(
+            self.room
+                .as_ref()
+                .map_or(String::new(), ToString::to_string),
+            document,
+        );
+    }
+
+    fn extend_selection(&self, mut position: gpui::Point<Pixels>) {
+        let list = if self.selection.thread() {
+            &self.thread_list
+        } else {
+            &self.list
         };
-        if self.mark.as_ref().is_some_and(|mark| {
-            mark.id == next.id && mark.range == next.range && mark.text == next.text
-        }) {
-            return;
+        let bounds = list.viewport_bounds();
+        if bounds.size.height > px(1.) {
+            position.y = position.y.max(bounds.top()).min(bounds.bottom() - px(0.5));
         }
-        self.release_drafts(cx);
-        self.mark = Some(next);
-        cx.notify();
+        self.selection.extend(position);
     }
 
     fn release_drafts(&mut self, cx: &mut Context<Self>) {
@@ -2571,15 +2599,10 @@ impl MatrixClient {
     }
 
     fn copy_mark(&mut self, cx: &mut Context<Self>) {
-        let Some(mark) = &self.mark else {
-            return;
-        };
-        let start = rich::boundary(&mark.text, mark.range.start);
-        let end = rich::boundary(&mark.text, mark.range.end).max(start);
-        if start == end {
-            return;
+        let text = self.selection.text();
+        if !text.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
-        cx.write_to_clipboard(ClipboardItem::new_string(mark.text[start..end].to_owned()));
     }
 
     fn stop_typing(&mut self) {
@@ -2642,7 +2665,7 @@ impl MatrixClient {
                 input.on_activity(move |_, cx| {
                     active
                         .update(cx, |this, cx| {
-                            if this.mark.take().is_some() {
+                            if this.selection.clear() {
                                 cx.notify();
                             }
                         })
@@ -5009,10 +5032,6 @@ impl MatrixClient {
         let mine = self.me.as_ref().is_some_and(|me| me.id == message.sender);
         let on_link = self.on_link(cx);
         let on_select = self.on_select(cx);
-        let marked = self
-            .mark
-            .as_ref()
-            .map(|mark| (mark.id.as_ref(), &mark.range));
         let editing = matches!(&self.editing, Some((id, at)) if Some(id) == message.id.as_ref() && *at == spot);
         let person = self.person_of(
             &message.sender,
@@ -5021,7 +5040,15 @@ impl MatrixClient {
         );
 
         let rich = |faded: bool, cx: &App| {
-            rich::render(&key, &message.rich, faded, &on_link, marked, &on_select, cx)
+            rich::render(
+                &key,
+                &message.rich,
+                faded,
+                &on_link,
+                &self.selection,
+                &on_select,
+                cx,
+            )
         };
         let body = match message.kind {
             MessageKind::Text => rich(pending, cx),
@@ -7803,6 +7830,46 @@ impl MatrixClient {
 
 impl Render for MatrixClient {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !window.is_window_active() {
+            self.selection.finish();
+        }
+        self.prepare_selection();
+        if self.selection.autoscrolling() {
+            let list = if self.selection.thread() {
+                self.thread_list.clone()
+            } else {
+                self.list.clone()
+            };
+            let bounds = list.viewport_bounds();
+            let pointer = window.mouse_position();
+            let edge = px(28.);
+            let speed = if pointer.y < bounds.top() + edge {
+                -px(8.)
+            } else if pointer.y > bounds.bottom() - edge {
+                px(8.)
+            } else {
+                px(0.)
+            };
+            if speed != px(0.) && bounds.size.height > px(0.) {
+                let this = cx.weak_entity();
+                window.on_next_frame(move |window, cx| {
+                    this.update(cx, |this, cx| {
+                        if this.selection.dragging() {
+                            let old = list.logical_scroll_top();
+                            list.scroll_by(speed);
+                            let new = list.logical_scroll_top();
+                            this.extend_selection(window.mouse_position());
+                            if old.item_ix != new.item_ix
+                                || old.offset_in_item != new.offset_in_item
+                            {
+                                cx.notify();
+                            }
+                        }
+                    })
+                    .ok();
+                });
+            }
+        }
         self.own_read_targets = [None, None];
         if let (Some(timeline), Some(me)) = (
             self.room.as_ref().and_then(|id| self.timelines.get(id)),
@@ -7906,11 +7973,43 @@ impl Render for MatrixClient {
             .min_h_0()
             .text_size(theme.text(Text::Body))
             .text_color(theme.foreground)
+            .track_focus(&self.text_focus)
+            .key_context("MessageText")
+            .on_action(cx.listener(|this, _: &ui::SelectAll, _, cx| {
+                this.selection.select_all();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &Dismiss, _, cx| {
+                if this.selection.clear() {
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
             .on_action(cx.listener(|this, _: &Copy, _, cx| this.copy_mark(cx)))
+            .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                if this.selection.dragging() {
+                    if event.pressed_button != Some(MouseButton::Left) {
+                        this.selection.finish();
+                    } else {
+                        this.extend_selection(event.position);
+                    }
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
+                    if this.selection.dragging() {
+                        this.extend_selection(event.position);
+                        this.selection.finish();
+                        cx.notify();
+                    }
+                }),
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    if this.mark.take().is_some() {
+                    if this.selection.clear() {
                         cx.notify();
                     }
                 }),

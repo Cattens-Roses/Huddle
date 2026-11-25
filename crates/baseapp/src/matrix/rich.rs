@@ -1,13 +1,13 @@
-use std::cell::Cell;
 use std::ops::Range;
 use std::rc::Rc;
 
+use super::text_selection::Selection;
 use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Bounds, CursorStyle, DispatchPhase, ElementId, FontStyle, FontWeight,
     GlobalElementId, HighlightStyle, Hitbox, HitboxBehavior, Hsla, InspectorElementId, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString,
-    StrikethroughStyle, StyledText, TextLayout, UnderlineStyle, Window, div, px,
+    MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, SharedString, StrikethroughStyle,
+    StyledText, TextLayout, UnderlineStyle, Window, div, px,
 };
 use ruma::html::{Html, NodeData, NodeRef};
 use ui::{ActiveTheme as _, Text};
@@ -371,15 +371,34 @@ fn text_of(node: &NodeRef) -> String {
 
 pub type OnLink = Rc<dyn Fn(&str, &mut Window, &mut App)>;
 
-/// `id` is the block, the range is a byte span of its text, and the string is that text.
-pub type OnSelect = Rc<dyn Fn(&str, Range<usize>, &str, &mut Window, &mut App)>;
+pub type OnSelect = Rc<dyn Fn(&mut Window, &mut App)>;
+
+pub fn document<'a>(id: &str, rich: &'a Rich, out: &mut Vec<(String, &'a str)>) {
+    fn block<'a>(id: String, value: &'a Block, out: &mut Vec<(String, &'a str)>) {
+        match value {
+            Block::Text(line) | Block::Heading(line) | Block::Item { line, .. } => {
+                out.push((id, &line.text))
+            }
+            Block::Code(text) => out.push((id, text)),
+            Block::Quote(values) => {
+                for (i, value) in values.iter().enumerate() {
+                    block(format!("{id}-{i}"), value, out);
+                }
+            }
+            Block::Rule => {}
+        }
+    }
+    for (i, value) in rich.iter().enumerate() {
+        block(format!("{id}-{i}"), value, out);
+    }
+}
 
 pub fn render(
     id: &str,
     rich: &Rich,
     faded: bool,
     on_link: &OnLink,
-    mark: Option<(&str, &Range<usize>)>,
+    mark: &Selection,
     on_select: &OnSelect,
     cx: &App,
 ) -> AnyElement {
@@ -407,19 +426,20 @@ fn render_block(
     block: &Block,
     faded: bool,
     on_link: &OnLink,
-    mark: Option<(&str, &Range<usize>)>,
+    mark: &Selection,
     on_select: &OnSelect,
     cx: &App,
 ) -> AnyElement {
     let theme = *cx.theme();
-    let chosen = mark
-        .filter(|(marked, _)| *marked == id)
-        .map(|(_, range)| range);
+    let chosen = mark.range(id);
+    let chosen = chosen.as_ref();
     match block {
-        Block::Text(line) => render_line(id, line, faded, on_link, chosen, on_select, cx),
+        Block::Text(line) => render_line(id, line, faded, on_link, chosen, mark, on_select, cx),
         Block::Heading(line) => div()
             .text_size(theme.text(Text::Large))
-            .child(render_line(id, line, faded, on_link, chosen, on_select, cx))
+            .child(render_line(
+                id, line, faded, on_link, chosen, mark, on_select, cx,
+            ))
             .into_any_element(),
         Block::Quote(blocks) => div()
             .flex()
@@ -457,6 +477,7 @@ fn render_block(
                 Vec::new(),
                 Vec::new(),
                 chosen,
+                mark,
                 on_link,
                 on_select,
                 cx,
@@ -477,12 +498,9 @@ fn render_block(
                     .text_color(theme.muted_foreground)
                     .child(bullet.clone()),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(render_line(id, line, faded, on_link, chosen, on_select, cx)),
-            )
+            .child(div().flex_1().min_w_0().child(render_line(
+                id, line, faded, on_link, chosen, mark, on_select, cx,
+            )))
             .into_any_element(),
         Block::Rule => div()
             .w_full()
@@ -499,6 +517,7 @@ fn render_line(
     faded: bool,
     on_link: &OnLink,
     selected: Option<&Range<usize>>,
+    selection: &Selection,
     on_select: &OnSelect,
     cx: &App,
 ) -> AnyElement {
@@ -561,7 +580,7 @@ fn render_line(
             theme.foreground
         })
         .child(selectable(
-            id, &line.text, highlights, code, links, selected, on_link, on_select, cx,
+            id, &line.text, highlights, code, links, selected, selection, on_link, on_select, cx,
         ))
         .into_any_element()
 }
@@ -573,6 +592,7 @@ fn selectable(
     fonts: Vec<(Range<usize>, SharedString)>,
     links: Vec<(Range<usize>, String)>,
     selected: Option<&Range<usize>>,
+    selection: &Selection,
     on_link: &OnLink,
     on_select: &OnSelect,
     cx: &App,
@@ -596,6 +616,7 @@ fn selectable(
         links,
         on_link.clone(),
         on_select.clone(),
+        selection.clone(),
     )
     .into_any_element()
 }
@@ -608,41 +629,6 @@ pub(crate) fn boundary(text: &str, mut offset: usize) -> usize {
         offset -= 1;
     }
     offset
-}
-
-fn word_at(text: &str, offset: usize) -> Range<usize> {
-    let chars: Vec<(usize, char)> = text.char_indices().collect();
-    if chars.is_empty() {
-        return 0..0;
-    }
-    let offset = boundary(text, offset);
-    let position = chars
-        .iter()
-        .position(|(index, _)| *index >= offset)
-        .unwrap_or(chars.len());
-    let index = if position < chars.len() && chars[position].0 == offset {
-        position
-    } else {
-        position.saturating_sub(1)
-    };
-    let word = |glyph: char| glyph.is_alphanumeric() || glyph == '_';
-    if !word(chars[index].1) {
-        let start = chars[index].0;
-        let end = chars
-            .get(index + 1)
-            .map(|glyph| glyph.0)
-            .unwrap_or(text.len());
-        return start..end;
-    }
-    let mut start = index;
-    while start > 0 && word(chars[start - 1].1) {
-        start -= 1;
-    }
-    let mut end = index + 1;
-    while end < chars.len() && word(chars[end].1) {
-        end += 1;
-    }
-    chars[start].0..chars.get(end).map(|glyph| glyph.0).unwrap_or(text.len())
 }
 
 /// Paints `selection` over existing highlights. Ranges stay sorted and non-overlapping.
@@ -714,11 +700,7 @@ struct SelectText {
     links: Vec<(Range<usize>, String)>,
     on_link: OnLink,
     on_select: OnSelect,
-}
-
-#[derive(Default)]
-struct SelectState {
-    anchor: Rc<Cell<Option<usize>>>,
+    selection: Selection,
 }
 
 impl SelectText {
@@ -729,6 +711,7 @@ impl SelectText {
         links: Vec<(Range<usize>, String)>,
         on_link: OnLink,
         on_select: OnSelect,
+        selection: Selection,
     ) -> Self {
         Self {
             id: id.to_owned().into(),
@@ -738,6 +721,7 @@ impl SelectText {
             links,
             on_link,
             on_select,
+            selection,
         }
     }
 }
@@ -780,7 +764,7 @@ impl Element for SelectText {
 
     fn paint(
         &mut self,
-        id: Option<&GlobalElementId>,
+        _id: Option<&GlobalElementId>,
         inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         state: &mut (),
@@ -796,110 +780,80 @@ impl Element for SelectText {
         let links = self.links.clone();
         let on_link = self.on_link.clone();
         let on_select = self.on_select.clone();
+        let on_select_up = on_select.clone();
         let hitbox = hitbox.clone();
-        window.with_element_state(id.unwrap(), |drag: Option<SelectState>, window| {
-            let drag = drag.unwrap_or_default();
-            let anchor = drag.anchor.clone();
-            if hitbox.is_hovered(window) {
-                let index = index_at(&layout, &hitbox, window.mouse_position(), source.len());
-                let cursor = if links.iter().any(|(range, _)| range.contains(&index)) {
-                    CursorStyle::PointingHand
-                } else {
-                    CursorStyle::IBeam
-                };
-                window.set_cursor_style(cursor, &hitbox);
+        self.selection
+            .register(block.clone(), layout.clone(), hitbox.bounds);
+        if hitbox.is_hovered(window) {
+            let index = match layout.index_for_position(window.mouse_position()) {
+                Ok(index) | Err(index) => index,
+            };
+            let cursor = if !self.selection.dragging()
+                && links.iter().any(|(range, _)| range.contains(&index))
+            {
+                CursorStyle::PointingHand
+            } else {
+                CursorStyle::IBeam
+            };
+            window.set_cursor_style(cursor, &hitbox);
+        }
+        let selection_down = self.selection.clone();
+        let selection_up = self.selection.clone();
+        let block_up = block.clone();
+        let layout_down = layout.clone();
+        let hitbox_down = hitbox.clone();
+        let source_down = source.clone();
+        window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+            if phase != DispatchPhase::Bubble
+                || event.button != MouseButton::Left
+                || !hitbox_down.is_hovered(window)
+            {
+                return;
             }
-
-            let anchor_down = anchor.clone();
-            let layout_down = layout.clone();
-            let hitbox_down = hitbox.clone();
-            let block_down = block.clone();
-            let source_down = source.clone();
-            let on_select_down = on_select.clone();
-            window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
-                if phase != DispatchPhase::Bubble
-                    || event.button != MouseButton::Left
-                    || !hitbox_down.is_hovered(window)
-                {
-                    return;
-                }
-                cx.stop_propagation();
-                let index = index_at(
-                    &layout_down,
-                    &hitbox_down,
-                    event.position,
-                    source_down.len(),
-                );
-                if event.click_count >= 3 {
-                    anchor_down.set(None);
-                    on_select_down(&block_down, 0..source_down.len(), &source_down, window, cx);
-                    return;
-                }
-                if event.click_count == 2 {
-                    anchor_down.set(None);
-                    on_select_down(
-                        &block_down,
-                        word_at(&source_down, index),
-                        &source_down,
-                        window,
-                        cx,
-                    );
-                    return;
-                }
-                anchor_down.set(Some(index));
-                on_select_down(&block_down, index..index, &source_down, window, cx);
-            });
-
-            let anchor_move = anchor.clone();
-            let layout_move = layout.clone();
-            let hitbox_move = hitbox.clone();
-            let block_move = block.clone();
-            let source_move = source.clone();
-            let on_select_move = on_select.clone();
-            window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
-                if phase != DispatchPhase::Bubble {
-                    return;
-                }
-                let Some(start) = anchor_move.get() else {
-                    return;
+            cx.stop_propagation();
+            let mut index = index_at_bounds(
+                &layout_down,
+                &hitbox_down.bounds,
+                event.position,
+                &source_down,
+            );
+            if event.click_count >= 2 {
+                index = match layout_down.index_for_position(event.position) {
+                    Ok(index) | Err(index) => boundary(&source_down, index),
                 };
-                cx.stop_propagation();
-                let index = index_at(
-                    &layout_move,
-                    &hitbox_move,
-                    event.position,
-                    source_move.len(),
-                );
-                let range = start.min(index)..start.max(index);
-                on_select_move(&block_move, range, &source_move, window, cx);
-            });
-
-            let layout_up = layout;
-            let hitbox_up = hitbox;
-            let block_up = block;
-            let source_up = source;
-            let on_select_up = on_select;
-            window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
-                if phase != DispatchPhase::Bubble || event.button != MouseButton::Left {
-                    return;
-                }
-                let Some(start) = anchor.take() else {
-                    return;
+            }
+            selection_down.begin(
+                &block,
+                index,
+                event.click_count,
+                event.modifiers.shift,
+                event.position,
+            );
+            on_select(window, cx);
+        });
+        window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+            if phase != DispatchPhase::Bubble
+                || event.button != MouseButton::Left
+                || !hitbox.is_hovered(window)
+                || !selection_up.dragging()
+            {
+                return;
+            }
+            cx.stop_propagation();
+            selection_up.extend(event.position);
+            let start = selection_up.click_index(&block_up);
+            if selection_up.finish() {
+                let index = match layout.index_for_position(event.position) {
+                    Ok(index) | Err(index) => index,
                 };
-                let index = index_at(&layout_up, &hitbox_up, event.position, source_up.len());
-                if start == index {
-                    if let Some((_, target)) =
-                        links.iter().find(|(range, _)| range.contains(&index))
-                    {
-                        on_link(target, window, cx);
-                    }
-                    return;
+                if let Some((_, target)) = links.iter().find(|(range, _)| {
+                    range.contains(&index)
+                        && start.is_some_and(|start| range.start <= start && start <= range.end)
+                }) {
+                    on_link(target, window, cx);
                 }
-                let range = start.min(index)..start.max(index);
-                on_select_up(&block_up, range, &source_up, window, cx);
-            });
-
-            ((), drag)
+            }
+            on_select_up(window, cx);
         });
     }
 }
@@ -912,15 +866,43 @@ impl IntoElement for SelectText {
     }
 }
 
-fn index_at(layout: &TextLayout, hitbox: &Hitbox, position: Point<Pixels>, len: usize) -> usize {
-    if position.y < hitbox.bounds.top() {
+pub(super) fn index_at_bounds(
+    layout: &TextLayout,
+    bounds: &Bounds<Pixels>,
+    position: Point<Pixels>,
+    text: &str,
+) -> usize {
+    if position.y < bounds.top() {
         return 0;
     }
-    if position.y >= hitbox.bounds.bottom() {
-        return len;
+    if position.y >= bounds.bottom() {
+        return text.len();
     }
-    match layout.index_for_position(position) {
-        Ok(index) | Err(index) => index.min(len),
+    let index = match layout.index_for_position(position) {
+        Ok(index) | Err(index) => boundary(text, index),
+    };
+    // GPUI returns the glyph under the pointer. Choose the closest caret edge,
+    // including the trailing half of a glyph, as browser text selection does.
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut edges = text
+        .grapheme_indices(true)
+        .map(|(i, _)| i)
+        .chain(std::iter::once(text.len()));
+    let before = edges
+        .by_ref()
+        .take_while(|i| *i <= index)
+        .last()
+        .unwrap_or(0);
+    let after = text[before..]
+        .graphemes(true)
+        .next()
+        .map_or(before, |glyph| before + glyph.len());
+    match (
+        layout.position_for_index(before),
+        layout.position_for_index(after),
+    ) {
+        (Some(a), Some(b)) if a.y == b.y && position.x > (a.x + b.x) / 2. => after,
+        _ => before,
     }
 }
 
@@ -1031,13 +1013,5 @@ mod tests {
         assert!(painted[1].1.background_color.is_some());
         assert_eq!(painted[2].1.font_weight, Some(FontWeight::BOLD));
         assert!(painted[2].1.background_color.is_none());
-    }
-
-    #[test]
-    fn words_follow_the_cursor() {
-        assert_eq!(word_at("hello world", 1), 0..5);
-        assert_eq!(word_at("hello world", 5), 5..6);
-        assert_eq!(word_at("hello world", 7), 6..11);
-        assert_eq!(word_at("", 3), 0..0);
     }
 }
