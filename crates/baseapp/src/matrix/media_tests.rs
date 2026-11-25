@@ -40,6 +40,8 @@ fn decode_component(value: &str) -> String {
 
 #[derive(Default)]
 struct Traffic {
+    hierarchy_pages: HashMap<String, serde_json::Value>,
+    hierarchy_requests: Vec<String>,
     presence: Option<serde_json::Value>,
     profile: serde_json::Value,
     capabilities: Option<serde_json::Value>,
@@ -332,7 +334,22 @@ impl Server {
                 let mut traffic = captured.lock().unwrap();
                 let mut status = "200 OK";
                 let mut content_type = "application/json";
-                let response = if path.contains("/capabilities") {
+                let response = if path.contains("/hierarchy") {
+                    traffic.hierarchy_requests.push(path.to_owned());
+                    let token = path
+                        .split_once('?')
+                        .into_iter()
+                        .flat_map(|(_, query)| query.split('&'))
+                        .find_map(|parameter| parameter.strip_prefix("from="))
+                        .map(|token| decode_component(&token.replace('+', " ")))
+                        .unwrap_or_default();
+                    if let Some(page) = traffic.hierarchy_pages.get(&token) {
+                        serde_json::to_vec(page).unwrap()
+                    } else {
+                        status = "403 Forbidden";
+                        br#"{"errcode":"M_FORBIDDEN","error":"Space not accessible"}"#.to_vec()
+                    }
+                } else if path.contains("/capabilities") {
                     serde_json::to_vec(&serde_json::json!({"capabilities":traffic.capabilities.clone().unwrap_or_else(|| serde_json::json!({}))})).unwrap()
                 } else if path.contains("/presence/") {
                     if let Some(presence) = &traffic.presence {
@@ -917,4 +934,56 @@ async fn uploads_video_thumbnail_and_downloads_preview_and_original() {
     })
     .await
     .expect("Media API integration test timed out");
+}
+
+#[tokio::test]
+async fn space_discovery_loads_child_names_across_pages_without_joining() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let server = Server::new();
+        let client = Client::builder().homeserver_url(&server.url)
+            .server_versions([matrix_sdk::ruma::api::MatrixVersion::V1_11]).build().await.unwrap();
+        let session: MatrixSession = serde_json::from_value(serde_json::json!({
+            "user_id":"@tester:example.org", "device_id":"NAMES", "access_token":"test-token"
+        })).unwrap();
+        client.restore_session(session).await.unwrap();
+        let entry = |id: &str, name: Option<&str>, alias: Option<&str>| serde_json::json!({
+            "room_id":id, "name":name, "canonical_alias":alias, "num_joined_members":2,
+            "world_readable":false, "guest_can_join":false, "join_rule":"public", "children_state":[]
+        });
+        {
+            let mut traffic = server.traffic.lock().unwrap();
+            traffic.hierarchy_pages.insert(String::new(), serde_json::json!({
+                "next_batch":"page two", "rooms":[
+                    entry("!parent:example.org", Some("Parent"), None),
+                    entry("!child:example.org", Some("Hackerspace Toruń"), None)
+                ]
+            }));
+            traffic.hierarchy_pages.insert("page two".into(), serde_json::json!({"rooms":[
+                entry("!alias:example.org", Some("  "), Some("#hackers:example.org")),
+                entry("!private:example.org", None, None)
+            ]}));
+        }
+        let parent: OwnedRoomId = "!parent:example.org".parse().unwrap();
+        let (outbox, mut updates) = ui::unbounded();
+        handle(&client, &outbox, &Arc::new(Shared::default()), Command::LoadSpaceNames(parent.clone())).await.unwrap();
+        let Some(Update::SpaceNames { user, names }) = updates.next().await else { panic!("Expected discovery names"); };
+        assert_eq!(user.as_str(), "@tester:example.org");
+        assert_eq!(names, vec![
+            ("!child:example.org".parse::<OwnedRoomId>().unwrap(), "Hackerspace Toruń".into()),
+            ("!alias:example.org".parse::<OwnedRoomId>().unwrap(), "#hackers:example.org".into()),
+        ]);
+        assert!(client.rooms().is_empty());
+        {
+            let traffic = server.traffic.lock().unwrap();
+            assert_eq!(traffic.hierarchy_requests.len(), 2);
+            assert!(traffic.hierarchy_requests.iter().all(|request| request.contains("max_depth=1")));
+            assert!(traffic.hierarchy_requests[1].contains("from=page%20two") || traffic.hierarchy_requests[1].contains("from=page+two"));
+        }
+        // A forbidden later page must not discard names already discovered.
+        server.traffic.lock().unwrap().hierarchy_pages.remove("page two");
+        assert_eq!(space_names(&client, &parent).await.len(), 1);
+        // Failure on the first page is non-fatal and leaves the UI's ID fallback available.
+        server.traffic.lock().unwrap().hierarchy_pages.clear();
+        assert!(space_names(&client, &parent).await.is_empty());
+    }).await.expect("Space discovery test timed out");
 }

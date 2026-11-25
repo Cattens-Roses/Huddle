@@ -19,7 +19,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{Local, NaiveDate, TimeZone as _};
 use futures::StreamExt as _;
@@ -416,6 +416,8 @@ pub struct MatrixClient {
     rooms: Vec<RoomSummary>,
     space: Option<OwnedRoomId>,
     space_trail: spaces::Trail,
+    linked_names: HashMap<OwnedRoomId, String>,
+    linked_name_requests: HashMap<OwnedRoomId, Instant>,
     removing_space: Option<(OwnedRoomId, String)>,
     room: Option<OwnedRoomId>,
     rail_groups: rail_groups::Layout,
@@ -541,6 +543,8 @@ impl MatrixClient {
             rooms: Vec::new(),
             space: None,
             space_trail: spaces::Trail::default(),
+            linked_names: HashMap::new(),
+            linked_name_requests: HashMap::new(),
             removing_space: None,
             room: None,
             rail_groups: rail_groups::Layout::default(),
@@ -882,6 +886,8 @@ impl MatrixClient {
                 self.room = None;
                 self.space = None;
                 self.space_trail.clear();
+                self.linked_names.clear();
+                self.linked_name_requests.clear();
                 self.removing_space = None;
                 self.thread = None;
                 self.dialog = None;
@@ -1043,7 +1049,26 @@ impl MatrixClient {
                     input.update(cx, |input, cx| input.set_text("", cx));
                 }
             }
+            Update::SpaceNames { user, names } => {
+                if self.me.as_ref().is_some_and(|me| me.id == user) {
+                    self.linked_names.extend(names);
+                }
+            }
             Update::Rooms(rooms) => {
+                // A new child link should be discoverable without waiting for cache expiry.
+                self.linked_name_requests.retain(|id, _| {
+                    self.rooms
+                        .iter()
+                        .find(|room| &room.id == id)
+                        .zip(rooms.iter().find(|room| &room.id == id))
+                        .is_some_and(|(old, new)| {
+                            old.children.len() == new.children.len()
+                                && old
+                                    .children
+                                    .iter()
+                                    .all(|child| new.children.contains(child))
+                        })
+                });
                 self.rooms = rooms;
                 if let Some(room) = &self.room
                     && !self
@@ -1063,6 +1088,7 @@ impl MatrixClient {
                     self.space = None;
                 }
                 self.space_trail.reconcile(&self.rooms, self.space.as_ref());
+                self.load_linked_names();
             }
             Update::Unread(counts) => {
                 for (id, unread) in counts {
@@ -4588,6 +4614,29 @@ impl MatrixClient {
             })
     }
 
+    fn load_linked_names(&mut self) {
+        let Some(space) = self.space.as_ref().and_then(|id| self.summary(id)) else {
+            return;
+        };
+        if !space
+            .children
+            .iter()
+            .any(|id| id != &space.id && self.summary(id).is_none_or(|room| room.invite))
+        {
+            return;
+        }
+        if self
+            .linked_name_requests
+            .get(&space.id)
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(300))
+        {
+            return;
+        }
+        let id = space.id.clone();
+        self.linked_name_requests.insert(id.clone(), Instant::now());
+        self.command(Command::LoadSpaceNames(id));
+    }
+
     fn enter_space(&mut self, id: OwnedRoomId, nested: bool, cx: &mut Context<Self>) {
         if !self
             .summary(&id)
@@ -4598,6 +4647,7 @@ impl MatrixClient {
         self.space_trail
             .enter(&self.rooms, self.space.as_ref(), &id, nested);
         self.space = Some(id);
+        self.load_linked_names();
         cx.notify();
     }
 
@@ -4714,13 +4764,14 @@ impl MatrixClient {
                 list = list.child(self.section("NOT JOINED", None, cx)).children(
                     unjoined.into_iter().map(|id| {
                         let address = id.to_string();
+                        let name = spaces::linked_name(&self.rooms, &self.linked_names, &id);
                         Button::new(SharedString::from(format!("join-space-child-{id}")))
                             .ghost()
                             .small()
                             .w_full()
-                            .label(address.clone())
+                            .label(name.clone())
                             .icon("icons/plus.svg")
-                            .tooltip("Join linked room or space")
+                            .tooltip(name)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.command(Command::Join(address.clone()));
                                 this.notify("Joining…", false, cx);
@@ -4789,6 +4840,7 @@ impl MatrixClient {
                                             this.space_trail.back(&this.rooms, current)
                                     {
                                         this.space = Some(parent);
+                                        this.load_linked_names();
                                         cx.notify();
                                     }
                                 })),

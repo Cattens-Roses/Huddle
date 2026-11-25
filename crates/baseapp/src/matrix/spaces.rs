@@ -2,6 +2,21 @@
 use super::backend::{RoomKind, RoomSummary};
 use matrix_sdk::ruma::OwnedRoomId;
 
+pub(super) fn linked_name(
+    rooms: &[RoomSummary],
+    names: &std::collections::HashMap<OwnedRoomId, String>,
+    id: &OwnedRoomId,
+) -> String {
+    rooms
+        .iter()
+        .find(|room| &room.id == id)
+        .map(|room| &room.name)
+        .filter(|name| !name.trim().is_empty() && name.as_str() != id.as_str())
+        .or_else(|| names.get(id))
+        .cloned()
+        .unwrap_or_else(|| id.to_string())
+}
+
 pub(super) fn children<'a>(rooms: &'a [RoomSummary], parent: &RoomSummary) -> Vec<&'a RoomSummary> {
     rooms
         .iter()
@@ -124,6 +139,19 @@ mod tests {
             encrypted: false,
             members: 2,
         }
+    }
+
+    #[test]
+    fn linked_names_use_known_names_then_discovery_then_ids() {
+        let id = id("child");
+        let mut known = room("child", RoomKind::Room, &[]);
+        known.invite = true;
+        known.name = "Invite name".into();
+        let names = std::collections::HashMap::from([(id.clone(), "Discovered name".into())]);
+        assert_eq!(linked_name(&[known.clone()], &names, &id), "Invite name");
+        known.name = id.to_string();
+        assert_eq!(linked_name(&[known], &names, &id), "Discovered name");
+        assert_eq!(linked_name(&[], &Default::default(), &id), id.to_string());
     }
 
     #[test]

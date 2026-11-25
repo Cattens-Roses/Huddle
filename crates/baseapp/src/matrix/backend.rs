@@ -209,6 +209,7 @@ pub enum Answer {
 }
 
 pub enum Command {
+    LoadSpaceNames(OwnedRoomId),
     LoadProfile {
         room: Option<OwnedRoomId>,
         ticket: u64,
@@ -336,6 +337,10 @@ pub enum Command {
 }
 
 pub enum Update {
+    SpaceNames {
+        user: OwnedUserId,
+        names: Vec<(OwnedRoomId, String)>,
+    },
     ProfileDetails {
         user: OwnedUserId,
         ticket: u64,
@@ -1195,6 +1200,12 @@ async fn handle(
     command: Command,
 ) -> Result<()> {
     match command {
+        Command::LoadSpaceNames(room) => {
+            if let Some(user) = client.user_id().map(ToOwned::to_owned) {
+                let names = space_names(client, &room).await;
+                post(outbox, Update::SpaceNames { user, names });
+            }
+        }
         Command::LoadProfile { room, ticket } => {
             let user = client
                 .user_id()
@@ -2118,6 +2129,55 @@ async fn space_children(space: &Room) -> Vec<OwnedRoomId> {
             RawSyncOrStrippedState::Stripped(_) => None,
         })
         .collect()
+}
+
+/// Space discovery includes metadata for children without joining them. Keep
+/// earlier pages usable if a later page is unavailable or access is restricted.
+async fn space_names(client: &Client, room: &OwnedRoomId) -> Vec<(OwnedRoomId, String)> {
+    use matrix_sdk::ruma::api::client::space::get_hierarchy;
+    let mut names = Vec::new();
+    let mut from = None;
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        let mut request = get_hierarchy::v1::Request::new(room.clone());
+        request.max_depth = Some(1u32.into());
+        request.limit = Some(100u32.into());
+        request.from = from;
+        let response = match client
+            .send(request)
+            .with_request_config(
+                matrix_sdk::config::RequestConfig::short_retry().timeout(Duration::from_secs(10)),
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                log::debug!("Space names unavailable for {room}: {error}");
+                break;
+            }
+        };
+        for chunk in response.rooms {
+            let summary = chunk.summary;
+            if summary.room_id == *room {
+                continue;
+            }
+            let label = summary
+                .name
+                .filter(|name| !name.trim().is_empty())
+                .or_else(|| summary.canonical_alias.map(|alias| alias.to_string()));
+            if let Some(label) = label {
+                names.push((summary.room_id, label));
+            }
+        }
+        from = response.next_batch;
+        let Some(token) = &from else {
+            break;
+        };
+        if !seen.insert(token.clone()) {
+            break;
+        }
+    }
+    names
 }
 
 fn millis(timestamp: MilliSecondsSinceUnixEpoch) -> i64 {
