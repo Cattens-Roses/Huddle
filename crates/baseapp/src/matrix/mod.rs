@@ -1,4 +1,5 @@
 mod backend;
+mod media_ui;
 mod photo;
 mod playback;
 mod profile;
@@ -460,6 +461,7 @@ pub struct MatrixClient {
     player_image: Option<Arc<gpui::RenderImage>>,
     painted_player_image: Option<Arc<gpui::RenderImage>>,
     player_timeline: ScrubberState,
+    player_volume: ScrubberState,
     player_scrub: Option<Duration>,
     pending_play: Option<Picture>,
     saving: Option<Task<()>>,
@@ -608,6 +610,7 @@ impl MatrixClient {
             player_image: None,
             painted_player_image: None,
             player_timeline: ScrubberState::new("media-timeline"),
+            player_volume: ScrubberState::new("media-volume"),
             player_scrub: None,
             pending_play: None,
             saving: None,
@@ -3244,19 +3247,6 @@ fn fit(width: u32, height: u32) -> (f32, f32) {
     ((width * scale).max(48.), (height * scale).max(48.))
 }
 
-fn fit_stage(width: u32, height: u32, max_w: f32, max_h: f32) -> (f32, f32) {
-    let max_w = max_w.max(160.);
-    let max_h = max_h.max(120.);
-    if width == 0 || height == 0 {
-        return (max_w.min(960.), max_h.min(720.));
-    }
-    let scale = (max_w / width as f32).min(max_h / height as f32);
-    (
-        (width as f32 * scale).max(48.),
-        (height as f32 * scale).max(48.),
-    )
-}
-
 fn save_name(name: &str, bytes: &[u8]) -> String {
     let cleaned = name
         .trim()
@@ -5723,21 +5713,28 @@ impl MatrixClient {
             (320., 180.)
         };
         let open = video.clone();
-        div()
-            .flex()
-            .flex_col()
-            .gap_1()
+        let loading = self
+            .pending_play
+            .as_ref()
+            .is_some_and(|pending| pending.key == video.key);
+        media_ui::card(cx)
+            .mt_1()
+            .w(px(width))
+            .max_w_full()
             .child(
                 div()
                     .id(SharedString::from(format!("video-{}", video.key)))
                     .relative()
-                    .w(px(width))
-                    .h(px(height))
-                    .rounded(theme.radius)
+                    .w_full()
+                    .aspect_ratio(width / height)
                     .overflow_hidden()
-                    .bg(theme.secondary)
+                    .bg(media_ui::opaque(theme.background))
                     .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| this.open_media(open.clone(), cx)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !loading {
+                            this.open_media(open.clone(), cx);
+                        }
+                    }))
                     .when_some(
                         match state {
                             Media::Ready(image) => Some(image),
@@ -5756,40 +5753,42 @@ impl MatrixClient {
                             .justify_center()
                             .child(
                                 div()
-                                    .px_3()
-                                    .py_2()
-                                    .rounded(theme.radius)
-                                    .bg(theme.background.opacity(0.85))
-                                    .text_color(theme.foreground)
-                                    .child("Play video"),
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .size(px(48.))
+                                    .rounded_full()
+                                    .bg(media_ui::opaque(theme.popover))
+                                    .shadow_md()
+                                    .child(icon(
+                                        "icons/play-filled.svg",
+                                        px(20.),
+                                        theme.popover_foreground,
+                                    )),
                             ),
                     )
-                    .when_some(video.duration, |body, duration| {
+                    .when(loading, |body| {
                         body.child(
                             div()
                                 .absolute()
                                 .bottom_2()
+                                .left_2()
                                 .right_2()
                                 .px_2()
                                 .py_1()
                                 .rounded(theme.radius)
-                                .bg(theme.background.opacity(0.85))
-                                .text_color(theme.foreground)
+                                .bg(media_ui::opaque(theme.popover))
                                 .text_size(theme.text(Text::Small))
-                                .child(format!(
-                                    "{}:{:02}",
-                                    duration.as_secs() / 60,
-                                    duration.as_secs() % 60
-                                )),
+                                .child("Loading video…"),
                         )
                     }),
             )
-            .child(
-                div()
-                    .text_size(theme.text(Text::Small))
-                    .text_color(theme.muted_foreground)
-                    .child(video.name.clone()),
-            )
+            .child(media_ui::caption(
+                &video.name,
+                "Video",
+                video.duration.map(playback::time_label).unwrap_or_default(),
+                cx,
+            ))
             .into_any_element()
     }
 
@@ -5872,56 +5871,61 @@ impl MatrixClient {
                 .child(div().w_full().h(px(3.)).rounded_full().bg(theme.border))
                 .into_any_element()
         };
-        div()
+        let status = if loading {
+            "Loading…"
+        } else if failed {
+            "Couldn't play"
+        } else if state.as_ref().is_some_and(|state| state.seeking) {
+            "Seeking…"
+        } else if playing {
+            "Playing"
+        } else if finished {
+            "Finished"
+        } else if player.is_some() {
+            "Paused"
+        } else {
+            ""
+        };
+        media_ui::card(cx)
             .mt_1()
             .w(px(340.))
             .max_w_full()
-            .p_3()
-            .rounded(px(16.))
-            .border_1()
-            .border_color(if playing {
-                theme.primary.opacity(0.35)
-            } else {
-                theme.border
-            })
-            .bg(theme.secondary)
-            .flex()
-            .flex_col()
-            .gap_2()
+            .child(media_ui::caption(&media.name, "Audio", status.into(), cx).border_t_0())
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_3()
+                    .px_3()
+                    .pb_3()
                     .child(
-                        Button::new(SharedString::from(format!("{key}-audio-play")))
-                            .primary()
-                            .size(px(44.))
-                            .p_0()
-                            .flex_none()
-                            .rounded_full()
-                            .icon(if playing {
+                        media_ui::play(
+                            SharedString::from(format!("{key}-audio-play")),
+                            if playing {
                                 "icons/pause-filled.svg"
+                            } else if finished {
+                                "icons/rotate-ccw-clock.svg"
                             } else {
                                 "icons/play-filled.svg"
-                            })
-                            .tooltip(action)
-                            .disabled(loading)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if !failed
-                                    && this.player_audio.as_ref() == Some(&open.key)
-                                    && let Some(player) = &this.player
-                                {
-                                    if finished {
-                                        player.restart();
-                                    } else {
-                                        player.toggle();
-                                    }
+                            },
+                            action,
+                        )
+                        .disabled(loading)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if !failed
+                                && this.player_audio.as_ref() == Some(&open.key)
+                                && let Some(player) = &this.player
+                            {
+                                if finished {
+                                    player.restart();
                                 } else {
-                                    this.open_media(open.clone(), cx);
+                                    player.toggle();
                                 }
-                                cx.notify();
-                            })),
+                            } else {
+                                this.open_media(open.clone(), cx);
+                            }
+                            cx.notify();
+                        })),
                     )
                     .child(
                         div()
@@ -5929,37 +5933,6 @@ impl MatrixClient {
                             .min_w_0()
                             .flex()
                             .flex_col()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .text_size(theme.text(Text::Small))
-                                    .child(
-                                        div()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(theme.foreground)
-                                            .child("Audio message"),
-                                    )
-                                    .child(div().text_color(theme.muted_foreground).child(
-                                        if loading {
-                                            "Loading…"
-                                        } else if failed {
-                                            "Couldn't play"
-                                        } else if state.as_ref().is_some_and(|state| state.seeking)
-                                        {
-                                            "Seeking…"
-                                        } else if playing {
-                                            "Playing"
-                                        } else if finished {
-                                            "Finished"
-                                        } else if player.is_some() && !failed {
-                                            "Paused"
-                                        } else {
-                                            ""
-                                        },
-                                    )),
-                            )
                             .child(track)
                             .child(
                                 div()
@@ -5976,30 +5949,15 @@ impl MatrixClient {
                             ),
                     ),
             )
-            .child(
-                div()
-                    .min_w_0()
-                    .text_size(px(11.))
-                    .text_color(theme.muted_foreground)
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .child(media.name.clone()),
-            )
             .when_some(
-                state.as_ref().and_then(|state| state.error.as_ref()),
-                |card, error| {
-                    card.child(
-                        div()
-                            .text_size(theme.text(Text::Small))
-                            .text_color(theme.muted_foreground)
-                            .child(error.clone()),
-                    )
-                },
+                state.as_ref().and_then(|state| state.error.clone()),
+                |body, error| body.child(div().px_3().pb_3().child(media_ui::error(error, cx))),
             )
             .into_any_element()
     }
 
     fn open_media(&mut self, media: Picture, cx: &mut Context<Self>) {
+        self.viewing = None;
         self.player = None;
         self.player_audio = None;
         self.player_image = None;
@@ -6079,6 +6037,15 @@ impl MatrixClient {
         cx.notify();
     }
 
+    fn close_media(&mut self, cx: &mut Context<Self>) {
+        self.player = None;
+        self.player_audio = None;
+        self.player_image = None;
+        self.player_scrub = None;
+        self.pending_play = None;
+        cx.notify();
+    }
+
     fn render_player(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         if self.player_audio.is_some() {
             return div().into_any_element();
@@ -6087,25 +6054,250 @@ impl MatrixClient {
             return div().into_any_element();
         };
         let theme = *cx.theme();
-        let state = player.state.lock().unwrap_or_else(|e| e.into_inner());
-        let status = state.error.clone().unwrap_or_else(|| {
-            if state.seeking {
-                "Seeking…".into()
-            } else if state.finished {
-                "Playback finished.".into()
-            } else if player.is_paused() {
-                "Paused".into()
-            } else {
-                "Playing".into()
-            }
-        });
+        let state = player
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let failed = state.error.is_some();
         let finished = state.finished;
+        let paused = player.is_paused();
+        let status = if failed {
+            "Couldn't play"
+        } else if state.seeking {
+            "Seeking…"
+        } else if finished {
+            "Finished"
+        } else if paused {
+            "Paused"
+        } else if self.player_image.is_none() {
+            "Loading video…"
+        } else {
+            "Playing"
+        };
         let viewport = window.viewport_size();
         let position = self.player_scrub.unwrap_or(state.position);
         let duration = state.duration.filter(|duration| !duration.is_zero());
         let fraction = duration.map_or(0., |duration| {
             (position.as_secs_f64() / duration.as_secs_f64()).clamp(0., 1.) as f32
         });
+        let stage_height = (viewport.height - px(240.)).max(px(80.)).min(px(600.));
+        let panel_width = (viewport.width - px(48.)).max(px(0.)).min(px(960.));
+        let close = media_ui::tool("media-close", "icons/x.svg", "Close (Esc)")
+            .on_click(cx.listener(|this, _, _, cx| this.close_media(cx)));
+        let stage = div()
+            .w_full()
+            .h(stage_height)
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(media_ui::opaque(theme.background))
+            .when_else(
+                self.player_image.is_some(),
+                |stage| {
+                    stage.child(
+                        img(self.player_image.clone().unwrap())
+                            .size_full()
+                            .object_fit(ObjectFit::Contain),
+                    )
+                },
+                |stage| {
+                    stage.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap_3()
+                            .text_size(theme.text(Text::Small))
+                            .text_color(theme.muted_foreground)
+                            .child(icon("icons/video.svg", px(32.), theme.muted_foreground))
+                            .child(status),
+                    )
+                },
+            );
+        let timeline = Scrubber::new(&self.player_timeline, fraction)
+            .colors(theme.primary, theme.border, theme.primary)
+            .enabled(duration.is_some() && !failed)
+            .when_some(self.player_scrub, |bar, time| {
+                bar.bubble(fraction, playback::time_label(time))
+            })
+            .on_move(cx.listener(move |this, fraction: &f32, _, cx| {
+                if let Some(duration) = duration {
+                    this.player_scrub = Some(duration.mul_f64((*fraction as f64).clamp(0., 1.)));
+                    cx.notify();
+                }
+            }))
+            .on_release(cx.listener(|this, _, _, cx| {
+                if let Some(position) = this.player_scrub.take() {
+                    if let Some(player) = &this.player {
+                        player.seek_to(position);
+                    }
+                    cx.notify();
+                }
+            }));
+        let play = media_ui::play(
+            "media-toggle",
+            if finished {
+                "icons/rotate-ccw-clock.svg"
+            } else if paused {
+                "icons/play-filled.svg"
+            } else {
+                "icons/pause-filled.svg"
+            },
+            if finished {
+                "Replay"
+            } else if paused {
+                "Play"
+            } else {
+                "Pause"
+            },
+        )
+        .disabled(failed)
+        .on_click(cx.listener(move |this, _, _, cx| {
+            if let Some(player) = &this.player {
+                if finished {
+                    player.restart();
+                } else {
+                    player.toggle();
+                }
+            }
+            cx.notify();
+        }));
+        let muted = player.is_muted();
+        let volume = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                media_ui::tool(
+                    "media-mute",
+                    if muted {
+                        "icons/volume-x.svg"
+                    } else {
+                        "icons/volume-2.svg"
+                    },
+                    if muted { "Unmute" } else { "Mute" },
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if let Some(player) = &this.player {
+                        player.mute();
+                    }
+                    cx.notify();
+                })),
+            )
+            .child(
+                div().w(px(88.)).child(
+                    Scrubber::new(&self.player_volume, player.volume() as f32 / 100.)
+                        .colors(theme.primary, theme.border, theme.primary)
+                        .on_move(cx.listener(|this, fraction: &f32, _, cx| {
+                            if let Some(player) = &this.player {
+                                let target = (fraction.clamp(0., 1.) * 100.).round() as i32;
+                                player.change_volume(target - player.volume() as i32);
+                            }
+                            cx.notify();
+                        })),
+                ),
+            )
+            .child(
+                div()
+                    .w(px(32.))
+                    .text_size(px(11.))
+                    .text_color(theme.muted_foreground)
+                    .child(format!("{}%", player.volume())),
+            );
+        let controls = div()
+            .px_4()
+            .pt_2()
+            .pb_4()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .border_t_1()
+            .border_color(theme.border)
+            .child(timeline)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .flex_wrap()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                Button::new("media-back")
+                                    .ghost()
+                                    .small()
+                                    .label("−10s")
+                                    .tooltip("Back 10 seconds")
+                                    .disabled(failed)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(player) = &this.player {
+                                            player.skip(-10);
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(play)
+                            .child(
+                                Button::new("media-forward")
+                                    .ghost()
+                                    .small()
+                                    .label("+10s")
+                                    .tooltip("Forward 10 seconds")
+                                    .disabled(failed)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(player) = &this.player {
+                                            player.skip(10);
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(80.))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_size(theme.text(Text::Small)).child(format!(
+                                    "{} / {}",
+                                    playback::time_label(position),
+                                    duration
+                                        .map(playback::time_label)
+                                        .unwrap_or_else(|| "—".into())
+                                )))
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme.muted_foreground)
+                                    .child(status),
+                            ),
+                    )
+                    .child(volume),
+            )
+            .when_some(state.error.clone(), |body, error| {
+                body.child(media_ui::error(error, cx))
+            });
+        let panel = media_ui::card(cx)
+            .id("video-viewer-panel")
+            .w(panel_width)
+            .max_h((viewport.height - px(32.)).max(px(0.)))
+            .overflow_y_scroll()
+            .shadow_lg()
+            .occlude()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(media_ui::header(
+                &player.name,
+                "Video",
+                vec![close.into_any_element()],
+                cx,
+            ))
+            .child(stage)
+            .child(controls);
         deferred(
             anchored().position(point(px(0.), px(0.))).child(
                 div()
@@ -6114,186 +6306,26 @@ impl MatrixClient {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(theme.background.opacity(0.94))
-                    .on_action(cx.listener(|this, _: &Dismiss, _, cx| {
-                        this.player = None;
-                        this.player_audio = None;
-                        this.player_image = None;
-                        this.player_scrub = None;
-                        cx.notify();
-                    }))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_3()
-                            .p_4()
-                            .w((viewport.width - px(64.)).min(px(960.)))
-                            .text_color(theme.foreground)
-                            .child(player.name.clone())
-                            .when_some(self.player_image.clone(), |body, image| {
-                                body.child(
-                                    img(image)
-                                        .w_full()
-                                        .h((viewport.height - px(360.)).max(px(80.)))
-                                        .object_fit(ObjectFit::Contain),
-                                )
-                            })
-                            .child(status)
-                            .child(
-                                Scrubber::new(&self.player_timeline, fraction)
-                                    .colors(theme.primary, theme.border, theme.foreground)
-                                    .enabled(duration.is_some() && state.error.is_none())
-                                    .when_some(self.player_scrub, |bar, time| {
-                                        bar.bubble(fraction, playback::time_label(time))
-                                    })
-                                    .on_move(cx.listener(move |this, fraction: &f32, _, cx| {
-                                        if let Some(duration) = duration {
-                                            this.player_scrub = Some(
-                                                duration.mul_f64((*fraction as f64).clamp(0., 1.)),
-                                            );
-                                            cx.notify();
-                                        }
-                                    }))
-                                    .on_release(cx.listener(|this, _, _, cx| {
-                                        if let Some(position) = this.player_scrub.take() {
-                                            if let Some(player) = &this.player {
-                                                player.seek_to(position);
-                                            }
-                                            cx.notify();
-                                        }
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .justify_between()
-                                    .text_size(theme.text(Text::Small))
-                                    .text_color(theme.muted_foreground)
-                                    .child(playback::time_label(position))
-                                    .child(
-                                        duration
-                                            .map(playback::time_label)
-                                            .unwrap_or_else(|| "—".into()),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_2()
-                                    .flex_wrap()
-                                    .child(
-                                        Button::new("media-back")
-                                            .secondary()
-                                            .label("−10s")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                if let Some(player) = &this.player {
-                                                    player.skip(-10);
-                                                }
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .when(finished && state.error.is_none(), |row| {
-                                        row.child(
-                                            Button::new("media-replay")
-                                                .secondary()
-                                                .label("Replay")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    if let Some(player) = &this.player {
-                                                        player.restart();
-                                                    }
-                                                    cx.notify();
-                                                })),
-                                        )
-                                    })
-                                    .when(!finished, |row| {
-                                        row.child(
-                                            Button::new("media-pause")
-                                                .secondary()
-                                                .label(if player.is_paused() {
-                                                    "Resume"
-                                                } else {
-                                                    "Pause"
-                                                })
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    if let Some(player) = &this.player {
-                                                        player.toggle();
-                                                    }
-                                                    cx.notify();
-                                                })),
-                                        )
-                                    })
-                                    .child(
-                                        Button::new("media-forward")
-                                            .secondary()
-                                            .label("+10s")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                if let Some(player) = &this.player {
-                                                    player.skip(10);
-                                                }
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("media-volume-down")
-                                            .secondary()
-                                            .label("Volume −")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                if let Some(player) = &this.player {
-                                                    player.change_volume(-10);
-                                                }
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        div().px_2().py_2().child(format!("{}%", player.volume())),
-                                    )
-                                    .child(
-                                        Button::new("media-volume-up")
-                                            .secondary()
-                                            .label("Volume +")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                if let Some(player) = &this.player {
-                                                    player.change_volume(10);
-                                                }
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("media-mute")
-                                            .secondary()
-                                            .label(if player.is_muted() {
-                                                "Unmute"
-                                            } else {
-                                                "Mute"
-                                            })
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                if let Some(player) = &this.player {
-                                                    player.mute();
-                                                }
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("media-close")
-                                            .secondary()
-                                            .label("Close")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.player = None;
-                                                this.player_audio = None;
-                                                this.player_image = None;
-                                                this.player_scrub = None;
-                                                cx.notify();
-                                            })),
-                                    ),
-                            ),
-                    ),
+                    .bg(media_ui::opaque(theme.overlay).opacity(0.8))
+                    .on_action(cx.listener(|this, _: &Dismiss, _, cx| this.close_media(cx)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.close_media(cx);
+                        }),
+                    )
+                    .child(panel)
+                    .fading("video-inspect"),
             ),
         )
         .into_any_element()
     }
 
     fn open_picture(&mut self, picture: Picture, cx: &mut Context<Self>) {
+        if self.player_audio.is_none() {
+            self.close_media(cx);
+        }
         self.viewing = Some(View {
             name: picture.name.clone(),
             picture,
@@ -6346,12 +6378,10 @@ impl MatrixClient {
             .flex()
             .items_center()
             .justify_center()
-            .w(px(width))
-            .h(px(height))
-            .mt_1()
-            .rounded(theme.radius)
+            .w_full()
+            .aspect_ratio(width / height)
             .overflow_hidden()
-            .bg(theme.secondary)
+            .bg(media_ui::opaque(theme.background))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| this.open_picture(open.clone(), cx)));
         frame = match self.want(&picture.key, picture.source.clone(), size) {
@@ -6367,7 +6397,18 @@ impl MatrixClient {
                 .child(icon("icons/image.svg", px(28.), theme.muted_foreground))
                 .child("This image couldn't load."),
         };
-        frame.into_any_element()
+        let detail = if picture.width > 0 && picture.height > 0 {
+            format!("{} × {}", picture.width, picture.height)
+        } else {
+            String::new()
+        };
+        media_ui::card(cx)
+            .mt_1()
+            .w(px(width))
+            .max_w_full()
+            .child(frame)
+            .child(media_ui::caption(&picture.name, "Image", detail, cx))
+            .into_any_element()
     }
 
     fn render_viewer(
@@ -6398,28 +6439,60 @@ impl MatrixClient {
             },
         };
         let failed = matches!(full, Some(Media::Failed)) && !matches!(image, Some(_));
-        let (width, height) = fit_stage(
-            view.picture.width,
-            view.picture.height,
-            (viewport.width - px(96.)).as_f32(),
-            (viewport.height - px(140.)).as_f32(),
-        );
-        let stage = match image {
-            Some(image) => img(image)
-                .w(px(width))
-                .h(px(height))
-                .object_fit(ObjectFit::Contain)
+        let panel_width = (viewport.width - px(48.)).max(px(0.)).min(px(960.));
+        let stage_height = (viewport.height - px(144.)).max(px(80.)).min(px(640.));
+        let stage = div()
+            .w_full()
+            .h(stage_height)
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(media_ui::opaque(theme.background))
+            .when_else(
+                image.is_some(),
+                |stage| {
+                    stage.child(
+                        img(image.clone().unwrap())
+                            .size_full()
+                            .object_fit(ObjectFit::Contain),
+                    )
+                },
+                |stage| {
+                    stage.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap_3()
+                            .text_color(theme.muted_foreground)
+                            .child(icon("icons/image.svg", px(32.), theme.muted_foreground))
+                            .child(if failed {
+                                "This image couldn't load."
+                            } else {
+                                "Loading image…"
+                            }),
+                    )
+                },
+            );
+        let actions = vec![
+            media_ui::tool("image-download", "icons/download.svg", "Download image")
+                .on_click(cx.listener(|this, _, _, cx| this.download_picture(cx)))
                 .into_any_element(),
-            None if failed => div()
-                .text_color(theme.foreground)
-                .child("This image couldn't load.")
+            media_ui::tool("image-close", "icons/x.svg", "Close (Esc)")
+                .on_click(cx.listener(|this, _, _, cx| this.close_picture(cx)))
                 .into_any_element(),
-            None => div()
-                .text_color(theme.foreground)
-                .child("Loading…")
-                .into_any_element(),
-        };
-
+        ];
+        let panel = media_ui::card(cx)
+            .id("image-viewer-panel")
+            .w(panel_width)
+            .max_h((viewport.height - px(32.)).max(px(0.)))
+            .overflow_y_scroll()
+            .shadow_lg()
+            .occlude()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(media_ui::header(&view.name, "Image", actions, cx))
+            .child(stage);
         deferred(
             anchored().position(point(px(0.), px(0.))).child(
                 div()
@@ -6428,7 +6501,7 @@ impl MatrixClient {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(theme.background.opacity(0.86))
+                    .bg(media_ui::opaque(theme.overlay).opacity(0.8))
                     .on_action(cx.listener(|this, _: &Dismiss, _, cx| this.close_picture(cx)))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -6437,37 +6510,7 @@ impl MatrixClient {
                             this.close_picture(cx);
                         }),
                     )
-                    .child(
-                        div()
-                            .rounded(theme.radius)
-                            .overflow_hidden()
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .child(stage),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .top(px(16.))
-                            .right(px(16.))
-                            .flex()
-                            .gap_2()
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .child(
-                                Button::new("image-download")
-                                    .primary()
-                                    .icon("icons/download.svg")
-                                    .label("Download")
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.download_picture(cx)),
-                                    ),
-                            )
-                            .child(
-                                Button::new("image-close")
-                                    .secondary()
-                                    .label("Close")
-                                    .on_click(cx.listener(|this, _, _, cx| this.close_picture(cx))),
-                            ),
-                    )
+                    .child(panel)
                     .fading("image-inspect"),
             ),
         )
