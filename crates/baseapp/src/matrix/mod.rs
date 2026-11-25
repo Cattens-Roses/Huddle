@@ -2,6 +2,8 @@ mod backend;
 mod download_ui;
 mod media_ui;
 mod media_zoom;
+mod mention_ui;
+mod mentions;
 mod photo;
 mod playback;
 mod profile;
@@ -458,6 +460,7 @@ pub struct MatrixClient {
     cache_status: Option<String>,
     viewing: Option<View>,
     media_zoom: media_zoom::Zoom,
+    mention_drafts: [mentions::Draft; 2],
     download_jobs: Vec<download_ui::Job>,
     download_ticket: u64,
     media_menu: Option<(Picture, gpui::Point<Pixels>)>,
@@ -611,6 +614,7 @@ impl MatrixClient {
             cache_status: None,
             viewing: None,
             media_zoom: media_zoom::Zoom::default(),
+            mention_drafts: Default::default(),
             download_jobs: Vec::new(),
             download_ticket: 0,
             media_menu: None,
@@ -1984,7 +1988,10 @@ impl MatrixClient {
             Spot::Main => self.draft.clone(),
             Spot::Thread => self.thread_draft.clone(),
         };
-        let body = input.read(cx).text().trim().to_owned();
+        let body = self.mention_drafts[mention_ui::index(spot)]
+            .markdown(input.read(cx).text())
+            .trim()
+            .to_owned();
         if self.compressing == Some(spot) {
             self.notify("Still preparing that file.", false, cx);
             return;
@@ -2002,6 +2009,11 @@ impl MatrixClient {
             && at == spot
         {
             self.editing = None;
+            let previous_mentions = self
+                .timelines
+                .get(&room)
+                .and_then(|timeline| timeline.find(&event))
+                .and_then(|message| mentions::content(&message.body).mentions);
             let me = me.id.clone();
             let rich = rich::markdown(&body);
             self.live(
@@ -2013,7 +2025,12 @@ impl MatrixClient {
                     rich,
                 },
             );
-            self.command(Command::Edit { room, event, body });
+            self.command(Command::Edit {
+                room,
+                event,
+                body,
+                previous_mentions,
+            });
             input.update(cx, |input, cx| input.set_text("", cx));
             focus(&input, window, cx);
             cx.notify();
@@ -2696,6 +2713,8 @@ impl MatrixClient {
     }
 
     fn composer_typed(&mut self, spot: Spot, text: &str, cx: &mut Context<Self>) {
+        self.mention_drafts[mention_ui::index(spot)].edit(text);
+        cx.notify();
         if !self.focused || self.in_tray || text.trim().is_empty() {
             self.stop_typing();
             return;
@@ -2728,6 +2747,11 @@ impl MatrixClient {
             (self.draft.clone(), Spot::Main),
             (self.thread_draft.clone(), Spot::Thread),
         ] {
+            cx.observe(&input, move |this, input, cx| {
+                this.mention_drafts[mention_ui::index(spot)].edit(input.read(cx).text());
+                cx.notify();
+            })
+            .detach();
             let pasted = this.clone();
             let active = this.clone();
             let edited = this.clone();
@@ -7099,7 +7123,7 @@ impl MatrixClient {
             }))
     }
 
-    fn render_composer(&self, spot: Spot, cx: &mut Context<Self>) -> AnyElement {
+    fn render_composer(&self, spot: Spot, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = *cx.theme();
         let input = match spot {
             Spot::Main => self.draft.clone(),
@@ -7244,6 +7268,12 @@ impl MatrixClient {
             .flex_none()
             .px_4()
             .pb_5()
+            .capture_key_down(
+                cx.listener(move |this, event: &gpui::KeyDownEvent, window, cx| {
+                    this.mention_key(spot, event, window, cx);
+                }),
+            )
+            .children(self.render_mentions(spot, window, cx))
             .when(spot == Spot::Main, |composer| {
                 let label = self
                     .room
@@ -7373,7 +7403,12 @@ impl MatrixClient {
         )
     }
 
-    fn render_chat(&self, room: &RoomSummary, cx: &mut Context<Self>) -> AnyElement {
+    fn render_chat(
+        &self,
+        room: &RoomSummary,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = *cx.theme();
         let timeline = self.timelines.get(&room.id);
         let loaded = timeline.is_some_and(|timeline| timeline.loaded);
@@ -7638,7 +7673,7 @@ impl MatrixClient {
                             .flatten(),
                     ),
             )
-            .child(self.render_composer(Spot::Main, cx));
+            .child(self.render_composer(Spot::Main, window, cx));
 
         let members_open = self.thread.is_none() && self.show_members;
         div()
@@ -7656,7 +7691,7 @@ impl MatrixClient {
             ))
             .when(self.thread.is_some(), |row| {
                 row.child(slide(
-                    self.render_thread_panel(cx).into_any_element(),
+                    self.render_thread_panel(window, cx).into_any_element(),
                     "thread",
                     true,
                     THREAD_PANEL,
@@ -7667,7 +7702,7 @@ impl MatrixClient {
             .into_any_element()
     }
 
-    fn render_thread_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_thread_panel(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.theme();
         self.media_drop_zone(Spot::Thread, cx)
             .flex()
@@ -7734,7 +7769,7 @@ impl MatrixClient {
                     )
                     .children(self.render_jump_to_bottom(Spot::Thread, cx)),
             )
-            .child(self.render_composer(Spot::Thread, cx))
+            .child(self.render_composer(Spot::Thread, window, cx))
     }
 
     fn render_members(&self, room: &RoomSummary, cx: &mut Context<Self>) -> impl IntoElement {
@@ -7747,6 +7782,7 @@ impl MatrixClient {
         let mut group = |title: &str, range: std::ops::RangeInclusive<i64>| {
             let people = members
                 .iter()
+                .take(300)
                 .filter(|member| range.contains(&member.power))
                 .collect::<Vec<_>>();
             (!people.is_empty()).then(|| {
@@ -8474,7 +8510,7 @@ impl Render for MatrixClient {
                                 false,
                             ))
                             .child(match room {
-                                Some(room) => self.render_chat(&room, cx),
+                                Some(room) => self.render_chat(&room, window, cx),
                                 None => self.render_welcome(cx),
                             })
                             .when_some(self.dialog, |layout, dialog| {

@@ -72,7 +72,6 @@ pub mod admin;
 const DEVICE_NAME: &str = "Huddle";
 const HISTORY: u32 = 60;
 const PAGE: usize = 20;
-const MEMBERS: usize = 300;
 const THREAD: u32 = 100;
 pub const SIGN_UP: &str = "https://app.element.io/#/register";
 const NO_IDENTITY: &str =
@@ -294,6 +293,7 @@ pub enum Command {
         room: OwnedRoomId,
         event: OwnedEventId,
         body: String,
+        previous_mentions: Option<matrix_sdk::ruma::events::Mentions>,
     },
     React {
         room: OwnedRoomId,
@@ -1368,7 +1368,7 @@ async fn handle(
             }
 
             let mut members = Vec::new();
-            for member in room.members_no_sync(RoomMemberships::JOIN).await? {
+            for member in room.members(RoomMemberships::JOIN).await? {
                 members.push(Member {
                     id: member.user_id().to_owned(),
                     name: member.name().to_owned(),
@@ -1389,7 +1389,6 @@ async fn handle(
                     .cmp(&a.power)
                     .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
             });
-            members.truncate(MEMBERS);
             post(outbox, Update::Members { room: id, members });
         }
         Command::Older { room: id, from } => {
@@ -1451,7 +1450,7 @@ async fn handle(
             thread,
         } => {
             let room = joined(client, &id)?;
-            let mut content = RoomMessageEventContent::text_markdown(&body);
+            let mut content = super::mentions::content(&body);
             if let Some((event, sender)) = &reply
                 && thread.is_none()
             {
@@ -1539,6 +1538,7 @@ async fn handle(
                         }),
                     );
             if !caption.is_empty() {
+                config = config.mentions(super::mentions::content(&caption).mentions);
                 config = config.caption(Some(TextMessageEventContent::markdown(caption)));
             }
             if let Some((_, latest)) = thread {
@@ -1592,10 +1592,11 @@ async fn handle(
             room: id,
             event,
             body,
+            previous_mentions,
         } => {
             let room = joined(client, &id)?;
-            let content = RoomMessageEventContent::text_markdown(&body)
-                .make_replacement(ReplacementMetadata::new(event, None));
+            let content = super::mentions::content(&body)
+                .make_replacement(ReplacementMetadata::new(event, previous_mentions));
             room.send(content).await?;
         }
         Command::React {

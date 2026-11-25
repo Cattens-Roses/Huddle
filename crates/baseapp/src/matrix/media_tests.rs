@@ -1082,6 +1082,108 @@ async fn child_previews_recover_names_when_space_hierarchy_is_unavailable() {
 }
 
 #[tokio::test]
+async fn mentions_survive_message_thread_edit_and_attachment_sending() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (server, client, room) = room_admin_tests::setup(false).await;
+        let (outbox, _updates) = ui::unbounded();
+        let shared = Arc::new(Shared::default());
+        let body = "Hej [@Member](https://matrix.to/#/@member:example.org)".to_owned();
+        handle(
+            &client,
+            &outbox,
+            &shared,
+            Command::Send {
+                room: room.clone(),
+                body: body.clone(),
+                local: 1,
+                reply: Some((
+                    "$original".parse().unwrap(),
+                    "@author:example.org".parse().unwrap(),
+                )),
+                thread: None,
+            },
+        )
+        .await
+        .unwrap();
+        handle(
+            &client,
+            &outbox,
+            &shared,
+            Command::Send {
+                room: room.clone(),
+                body: body.clone(),
+                local: 2,
+                reply: None,
+                thread: Some(("$root".parse().unwrap(), "$latest".parse().unwrap())),
+            },
+        )
+        .await
+        .unwrap();
+        handle(
+            &client,
+            &outbox,
+            &shared,
+            Command::Edit {
+                room: room.clone(),
+                event: "$edit".parse().unwrap(),
+                body: body.clone(),
+                previous_mentions: super::super::mentions::content(&body).mentions,
+            },
+        )
+        .await
+        .unwrap();
+        handle(
+            &client,
+            &outbox,
+            &shared,
+            Command::Picture {
+                room,
+                name: "clip.mp4".into(),
+                mime: "video/mp4".into(),
+                bytes: include_bytes!("../../tests/media/clip.mp4").to_vec(),
+                width: 64,
+                height: 48,
+                caption: body,
+                duration: None,
+                thumbnail: None,
+                local: 3,
+                reply: None,
+                thread: None,
+            },
+        )
+        .await
+        .unwrap();
+        let traffic = server.traffic.lock().unwrap();
+        assert_eq!(traffic.sent.len(), 4);
+        let reply_mentions = traffic.sent[0]["m.mentions"]["user_ids"]
+            .as_array()
+            .unwrap();
+        assert!(reply_mentions.contains(&serde_json::json!("@member:example.org")));
+        assert!(reply_mentions.contains(&serde_json::json!("@author:example.org")));
+        assert_eq!(traffic.sent[1]["m.relates_to"]["rel_type"], "m.thread");
+        assert_eq!(
+            traffic.sent[1]["m.mentions"]["user_ids"],
+            serde_json::json!(["@member:example.org"])
+        );
+        assert_eq!(
+            traffic.sent[2]["m.new_content"]["m.mentions"]["user_ids"],
+            serde_json::json!(["@member:example.org"])
+        );
+        assert!(
+            traffic.sent[2]["m.mentions"]["user_ids"]
+                .as_array()
+                .is_none_or(|users| users.is_empty())
+        );
+        assert_eq!(
+            traffic.sent[3]["m.mentions"]["user_ids"],
+            serde_json::json!(["@member:example.org"])
+        );
+    })
+    .await
+    .expect("Mention sending test timed out");
+}
+
+#[tokio::test]
 async fn file_downloads_report_progress_eta_and_clean_up_after_cancellation() {
     tokio::time::timeout(Duration::from_secs(15), async {
         let (server, client, _) = room_admin_tests::setup(false).await;

@@ -345,6 +345,24 @@ impl Input {
         &self.content
     }
 
+    /// Selection in UTF-8 bytes, for composer completions.
+    pub fn selection(&self) -> Range<usize> {
+        clamp_range(&self.content, &self.selected_range)
+    }
+
+    /// Replaces a completion range and keeps the caret immediately after it.
+    pub fn insert_completion(&mut self, range: Range<usize>, text: &str, cx: &mut Context<Self>) {
+        let range = clamp_range(&self.content, &range);
+        self.splice(&range, text);
+        let caret = range.start + text.len();
+        self.selected_range = caret..caret;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        self.preferred_x = None;
+        self.note_growth();
+        cx.notify();
+    }
+
     pub fn set_hint(&mut self, hint: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.hint = hint.into();
         cx.notify();
