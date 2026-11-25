@@ -63,6 +63,9 @@ mod media_tests;
 #[path = "call.rs"]
 mod call;
 
+#[path = "space_name_cache.rs"]
+mod name_cache;
+
 #[path = "room_admin.rs"]
 pub mod admin;
 
@@ -1061,6 +1064,16 @@ impl Worker {
                 );
             }
         }));
+        let names = name_cache::restore(&client).await;
+        if let Some(user) = client.user_id() {
+            post(
+                &self.outbox,
+                Update::SpaceNames {
+                    user: user.to_owned(),
+                    names,
+                },
+            );
+        }
         post(&self.outbox, Update::Rooms(summaries(&client).await));
 
         let outbox = self.outbox.clone();
@@ -1242,7 +1255,7 @@ async fn handle(
         }
         Command::LoadSpaceNames(room) => {
             if let Some(user) = client.user_id().map(ToOwned::to_owned) {
-                let names = space_names(client, &room, Some(outbox)).await;
+                let names = cached_space_names(client, &room, Some(outbox)).await;
                 post(outbox, Update::SpaceNames { user, names });
             }
         }
@@ -2183,6 +2196,47 @@ async fn space_child_routes(
 
 /// Space discovery includes metadata for children without joining them. Keep
 /// earlier pages usable if a later page is unavailable or access is restricted.
+async fn cached_space_names(
+    client: &Client,
+    room: &OwnedRoomId,
+    publish: Option<&Outbox>,
+) -> Vec<(OwnedRoomId, String)> {
+    let mut children = match client.get_room(room) {
+        Some(parent) => space_children(&parent).await,
+        None => Vec::new(),
+    };
+    children.sort();
+    children.dedup();
+    let cached = name_cache::get(client, room, &children).await;
+    if cached.fresh {
+        return cached.names;
+    }
+    if !cached.names.is_empty() {
+        if let (Some(outbox), Some(user)) = (publish, client.user_id()) {
+            post(
+                outbox,
+                Update::SpaceNames {
+                    user: user.to_owned(),
+                    names: cached.names.clone(),
+                },
+            );
+        }
+    }
+    let fetched = space_names(client, room, publish).await;
+    let mut names = cached.names;
+    for (id, name) in &fetched {
+        if let Some((_, old)) = names.iter_mut().find(|(known, _)| known == id) {
+            old.clone_from(name);
+        } else {
+            names.push((id.clone(), name.clone()));
+        }
+    }
+    if !fetched.is_empty() {
+        name_cache::save(client, room, children, names.clone()).await;
+    }
+    names
+}
+
 async fn space_names(
     client: &Client,
     room: &OwnedRoomId,
