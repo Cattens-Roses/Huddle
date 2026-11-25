@@ -346,7 +346,7 @@ impl MatrixClient {
             (Tab::Addresses, "Addresses"),
             (Tab::Permissions, "Permissions"),
             (Tab::Members, "Members"),
-            (Tab::Rooms, "Rooms"),
+            (Tab::Rooms, "Rooms & spaces"),
         ];
         body = body.child(
             div().flex().flex_wrap().gap_1().children(
@@ -631,6 +631,49 @@ impl MatrixClient {
                         );
                 }
                 Tab::Rooms => {
+                    let available_spaces = self
+                        .rooms
+                        .iter()
+                        .filter(|candidate| {
+                            candidate.kind == RoomKind::Space
+                                && !candidate.invite
+                                && self.settings_room.as_ref() != Some(&candidate.id)
+                                && !s.children.iter().any(|child| child.id == candidate.id)
+                        })
+                        .collect::<Vec<_>>();
+                    if !available_spaces.is_empty() {
+                        body = body.child(
+                            section(
+                                "Add an existing space",
+                                "Select a space to nest inside this one.",
+                                cx,
+                            )
+                            .children(
+                                available_spaces.into_iter().map(|space| {
+                                    let id = space.id.clone();
+                                    let name = space.name.clone();
+                                    Button::new(SharedString::from(format!("admin-add-space-{id}")))
+                                        .ghost()
+                                        .w_full()
+                                        .icon("icons/folder-plus.svg")
+                                        .label(name.clone())
+                                        .disabled(busy || !p.children)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.admin.confirm = Some((
+                                                Action::Child {
+                                                    id: id.clone(),
+                                                    order: String::new(),
+                                                    suggested: false,
+                                                    remove: false,
+                                                },
+                                                format!("Add '{name}' as a nested space?"),
+                                            ));
+                                            cx.notify();
+                                        }))
+                                }),
+                            ),
+                        );
+                    }
                     body = body.child(
                         section("Create a room", "Create a new room inside this space.", cx)
                             .child(field("Name", &self.admin.new_room, p.children && !busy, cx))
@@ -656,21 +699,21 @@ impl MatrixClient {
                                     })),
                             ),
                     );
-                    body = body.child(section("Rooms in this space", "Adding or removing a link does not join, delete or leave the linked room. Sort order is optional; suggested rooms are highlighted by Matrix clients.", cx)
+                    body = body.child(section("Rooms and spaces", "Add a room or nest another space using its Matrix ID. Removing a link keeps its membership unchanged.", cx)
                         .children(s.children.iter().map(|child| {
                             let id = child.id.clone(); let order = child.order.clone(); let suggested = child.suggested;
                             Button::new(SharedString::from(format!("admin-child-{id}"))).ghost().w_full().label(format!("{} · {}{}", self.summary(&id).map(|r| r.name.as_str()).unwrap_or(id.as_str()), order, if suggested { " · suggested" } else { "" })).disabled(busy)
                                 .on_click(cx.listener(move |this, _, _, cx| { this.admin.child.update(cx, |input, cx| input.set_text(id.to_string(), cx)); this.admin.order.update(cx, |input, cx| input.set_text(order.clone(), cx)); this.admin.suggested = suggested; cx.notify(); }))
                         }))
-                        .child(field("Room ID", &self.admin.child, p.children && !busy, cx))
+                        .child(field("Room or space ID", &self.admin.child, p.children && !busy, cx))
                         .child(field("Sort order", &self.admin.order, p.children && !busy, cx))
-                        .child(Button::new("admin-child-suggested").ghost().label("Suggested room").selected(self.admin.suggested).disabled(busy || !p.children)
+                        .child(Button::new("admin-child-suggested").ghost().label("Suggested").selected(self.admin.suggested).disabled(busy || !p.children)
                             .on_click(cx.listener(|this, _, _, cx| { this.admin.suggested = !this.admin.suggested; cx.notify(); })))
-                        .child(div().flex().gap_2().children([(false, "Add or update room"), (true, "Remove link")].into_iter().map(|(remove, label)| {
+                        .child(div().flex().gap_2().children([(false, "Add or update link"), (true, "Remove link")].into_iter().map(|(remove, label)| {
                             Button::new(SharedString::from(format!("admin-child-action-{remove}"))).label(label).disabled(busy || !p.children)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     let target = this.admin.child.read(cx).text().trim().to_owned();
-                                    let Ok(id) = OwnedRoomId::try_from(target.as_str()) else { this.admin.status = Some("Enter a full room ID (!room:server).".into()); cx.notify(); return; };
+                                    let Ok(id) = OwnedRoomId::try_from(target.as_str()) else { this.admin.status = Some("Enter a full room or space ID (!id:server).".into()); cx.notify(); return; };
                                     let order = this.admin.order.read(cx).text().to_owned();
                                     this.admin.confirm = Some((Action::Child { id, order, suggested: this.admin.suggested, remove }, format!("{label}? Membership of the linked room will not change."))); cx.notify();
                                 }))

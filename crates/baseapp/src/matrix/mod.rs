@@ -6,6 +6,7 @@ mod rail_groups;
 mod receipts;
 mod rich;
 mod room_settings;
+mod spaces;
 mod text_selection;
 mod typing;
 mod unread;
@@ -414,6 +415,7 @@ pub struct MatrixClient {
     me: Option<Me>,
     rooms: Vec<RoomSummary>,
     space: Option<OwnedRoomId>,
+    space_trail: spaces::Trail,
     removing_space: Option<(OwnedRoomId, String)>,
     room: Option<OwnedRoomId>,
     rail_groups: rail_groups::Layout,
@@ -538,6 +540,7 @@ impl MatrixClient {
             me: None,
             rooms: Vec::new(),
             space: None,
+            space_trail: spaces::Trail::default(),
             removing_space: None,
             room: None,
             rail_groups: rail_groups::Layout::default(),
@@ -878,6 +881,7 @@ impl MatrixClient {
                 self.members.clear();
                 self.room = None;
                 self.space = None;
+                self.space_trail.clear();
                 self.removing_space = None;
                 self.thread = None;
                 self.dialog = None;
@@ -1052,10 +1056,13 @@ impl MatrixClient {
                     self.thread = None;
                 }
                 if let Some(space) = &self.space
-                    && !self.rooms.iter().any(|known| &known.id == space)
+                    && !self.rooms.iter().any(|known| {
+                        &known.id == space && known.kind == RoomKind::Space && !known.invite
+                    })
                 {
                     self.space = None;
                 }
+                self.space_trail.reconcile(&self.rooms, self.space.as_ref());
             }
             Update::Unread(counts) => {
                 for (id, unread) in counts {
@@ -1089,8 +1096,13 @@ impl MatrixClient {
             Update::Sent { room, local, event } => self.sent(room, local, event),
             Update::Opened(room) => {
                 self.dialog = None;
-                self.reveal(room, None, cx);
-                self.pending_focus = Some(Focus::Draft);
+                self.reveal(room.clone(), None, cx);
+                if !self
+                    .summary(&room)
+                    .is_some_and(|room| room.kind == RoomKind::Space)
+                {
+                    self.pending_focus = Some(Focus::Draft);
+                }
             }
             Update::CacheCleared { error } => {
                 self.cache_clearing = false;
@@ -1723,9 +1735,12 @@ impl MatrixClient {
     }
 
     fn space_of(&self, id: &OwnedRoomId) -> Option<&RoomSummary> {
-        self.rooms
-            .iter()
-            .find(|room| room.kind == RoomKind::Space && !room.invite && room.children.contains(id))
+        self.rooms.iter().find(|room| {
+            room.kind == RoomKind::Space
+                && !room.invite
+                && &room.id != id
+                && room.children.contains(id)
+        })
     }
 
     /// A room shown on the far-left rail: joined, not a direct message, and not inside a space.
@@ -1833,6 +1848,13 @@ impl MatrixClient {
     }
 
     fn reveal(&mut self, id: OwnedRoomId, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        if self
+            .summary(&id)
+            .is_some_and(|room| room.kind == RoomKind::Space)
+        {
+            self.enter_space(id, true, cx);
+            return;
+        }
         let direct = self
             .summary(&id)
             .is_some_and(|room| room.kind == RoomKind::Direct);
@@ -1843,6 +1865,7 @@ impl MatrixClient {
             None => direct || self.space_of(&id).is_none(),
         };
         if !in_view {
+            self.space_trail.clear();
             self.space = (!direct)
                 .then(|| self.space_of(&id).map(|space| space.id.clone()))
                 .flatten();
@@ -4216,6 +4239,7 @@ impl MatrixClient {
             Box::new(cx.listener(|this, _, _, cx| {
                 let leave = this.room.as_ref().is_some_and(|id| this.loose(id));
                 this.space = None;
+                this.space_trail.clear();
                 if leave {
                     this.stop_typing();
                     this.room = None;
@@ -4255,6 +4279,7 @@ impl MatrixClient {
                     },
                     Box::new(cx.listener(move |this, _, window, cx| {
                         this.space = None;
+                        this.space_trail.clear();
                         this.open(open.clone(), window, cx);
                     })),
                 );
@@ -4295,8 +4320,7 @@ impl MatrixClient {
                         None => div().child(initials(&space.name)).into_any_element(),
                     },
                     Box::new(cx.listener(move |this, _, _, cx| {
-                        this.space = Some(id.clone());
-                        cx.notify();
+                        this.enter_space(id.clone(), false, cx);
                     })),
                 );
                 (space.id.clone(), element.into_any_element())
@@ -4564,22 +4588,59 @@ impl MatrixClient {
             })
     }
 
+    fn enter_space(&mut self, id: OwnedRoomId, nested: bool, cx: &mut Context<Self>) {
+        if !self
+            .summary(&id)
+            .is_some_and(|room| room.kind == RoomKind::Space && !room.invite)
+        {
+            return;
+        }
+        self.space_trail
+            .enter(&self.rooms, self.space.as_ref(), &id, nested);
+        self.space = Some(id);
+        cx.notify();
+    }
+
+    fn render_subspace(&self, space: &RoomSummary, cx: &mut Context<Self>) -> AnyElement {
+        let theme = *cx.theme();
+        let id = space.id.clone();
+        let unread = unread::space(&self.rooms, &id);
+        div()
+            .id(SharedString::from(format!("subspace-{id}")))
+            .flex()
+            .items_center()
+            .gap_2()
+            .h(px(40.))
+            .px_2()
+            .rounded(theme.radius)
+            .cursor_pointer()
+            .text_color(theme.foreground)
+            .tip_label(space.name.clone(), Perch::Right)
+            .hover(|style| style.bg(theme.secondary_hover))
+            .child(self.face(id.as_str(), &space.name, space.avatar.as_ref(), px(26.)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(space.name.clone()),
+            )
+            .when(unread > 0, |row| row.child(unread::badge(unread, cx)))
+            .child(icon(
+                "icons/chevron-right.svg",
+                px(14.),
+                theme.muted_foreground,
+            ))
+            .on_click(cx.listener(move |this, _, _, cx| this.enter_space(id.clone(), true, cx)))
+            .into_any_element()
+    }
+
     fn render_channels(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.theme();
         let space = self.space.as_ref().and_then(|space| self.summary(space));
         let (invites, rooms, directs): (Vec<_>, Vec<_>, Vec<_>) = match space {
-            Some(space) => (
-                Vec::new(),
-                self.rooms
-                    .iter()
-                    .filter(|room| {
-                        room.kind != RoomKind::Space
-                            && !room.invite
-                            && space.children.contains(&room.id)
-                    })
-                    .collect(),
-                Vec::new(),
-            ),
+            Some(space) => (Vec::new(), spaces::children(&self.rooms, space), Vec::new()),
             None => (
                 self.rooms.iter().filter(|room| room.invite).collect(),
                 self.rooms
@@ -4597,8 +4658,21 @@ impl MatrixClient {
             ),
         };
         let title = space.map_or_else(|| "Home".to_owned(), |space| space.name.clone());
+        let parent = space.and_then(|space| self.space_trail.parent(&self.rooms, &space.id));
+        let unjoined = space
+            .map(|space| {
+                space
+                    .children
+                    .iter()
+                    .filter(|id| {
+                        *id != &space.id && self.summary(id).is_none_or(|room| room.invite)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let empty = match space {
-            Some(_) => rooms.is_empty(),
+            Some(_) => rooms.is_empty() && unjoined.is_empty(),
             None => invites.is_empty() && directs.is_empty(),
         };
 
@@ -4620,10 +4694,40 @@ impl MatrixClient {
                     .children(invites.into_iter().map(|room| self.render_invite(room, cx))),
             );
         }
-        if space.is_some() && !rooms.is_empty() {
-            list = list
-                .child(self.section("ROOMS", Some(Dialog::Join), cx))
-                .children(rooms.into_iter().map(|room| self.render_room_row(room, cx)));
+        if space.is_some() {
+            let (subspaces, rooms): (Vec<_>, Vec<_>) = rooms
+                .into_iter()
+                .partition(|room| room.kind == RoomKind::Space);
+            if !subspaces.is_empty() {
+                list = list.child(self.section("SPACES", None, cx)).children(
+                    subspaces
+                        .into_iter()
+                        .map(|space| self.render_subspace(space, cx)),
+                );
+            }
+            if !rooms.is_empty() {
+                list = list
+                    .child(self.section("ROOMS", Some(Dialog::Join), cx))
+                    .children(rooms.into_iter().map(|room| self.render_room_row(room, cx)));
+            }
+            if !unjoined.is_empty() {
+                list = list.child(self.section("NOT JOINED", None, cx)).children(
+                    unjoined.into_iter().map(|id| {
+                        let address = id.to_string();
+                        Button::new(SharedString::from(format!("join-space-child-{id}")))
+                            .ghost()
+                            .small()
+                            .w_full()
+                            .label(address.clone())
+                            .icon("icons/plus.svg")
+                            .tooltip("Join linked room or space")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.command(Command::Join(address.clone()));
+                                this.notify("Joining…", false, cx);
+                            }))
+                    }),
+                );
+            }
         }
         if space.is_none() {
             list = list
@@ -4642,7 +4746,7 @@ impl MatrixClient {
                     .text_size(theme.text(Text::Small))
                     .text_color(theme.muted_foreground)
                     .child(match space {
-                        Some(_) => "There are no rooms you've joined in this space yet.",
+                        Some(_) => "There are no rooms or spaces here yet.",
                         None => "Nothing here yet. Use the + buttons to join a room or message a friend.",
                     }),
             );
@@ -4669,7 +4773,28 @@ impl MatrixClient {
                     .border_color(theme.border)
                     .font_weight(FontWeight::BOLD)
                     .text_color(theme.foreground)
-                    .child(div().truncate().child(title)),
+                    .gap_2()
+                    .when_some(parent, |header, parent| {
+                        header.child(
+                            Button::new("space-back")
+                                .ghost()
+                                .small()
+                                .p_0()
+                                .size(px(28.))
+                                .icon("icons/chevron-left.svg")
+                                .tooltip(format!("Back to {}", parent.name))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(current) = &this.space
+                                        && let Some(parent) =
+                                            this.space_trail.back(&this.rooms, current)
+                                    {
+                                        this.space = Some(parent);
+                                        cx.notify();
+                                    }
+                                })),
+                        )
+                    })
+                    .child(div().flex_1().min_w_0().truncate().child(title)),
             )
             .when_some(space, |sidebar, space| {
                 let id = space.id.clone();
