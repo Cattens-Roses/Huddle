@@ -422,6 +422,7 @@ pub struct MatrixClient {
     removing_space: Option<(OwnedRoomId, String)>,
     room: Option<OwnedRoomId>,
     rail_groups: rail_groups::Layout,
+    rail_hover: Option<String>,
     focused: bool,
     in_tray: bool,
     typing: typing::Remote,
@@ -544,6 +545,7 @@ impl MatrixClient {
             removing_space: None,
             room: None,
             rail_groups: rail_groups::Layout::default(),
+            rail_hover: None,
             focused: true,
             in_tray: false,
             typing: typing::Remote::default(),
@@ -864,6 +866,7 @@ impl MatrixClient {
                 self.phase = Phase::SignedOut;
                 self.me = None;
                 self.rail_groups = rail_groups::Layout::default();
+                self.rail_hover = None;
                 self.rooms.clear();
                 self.timelines.clear();
                 self.members.clear();
@@ -3736,6 +3739,20 @@ impl MatrixClient {
             .into_any_element()
     }
 
+    fn rail_hover(&mut self, key: &str, hovered: bool, cx: &mut Context<Self>) {
+        if hovered {
+            if self.rail_hover.as_deref() == Some(key) {
+                return;
+            }
+            self.rail_hover = Some(key.to_owned());
+        } else if self.rail_hover.as_deref() == Some(key) {
+            self.rail_hover = None;
+        } else {
+            return;
+        }
+        cx.notify();
+    }
+
     fn save_rail_groups(&mut self, cx: &mut Context<Self>) {
         if let Some(me) = &self.me
             && let Err(error) = self.rail_groups.save(me.id.as_str())
@@ -3756,6 +3773,8 @@ impl MatrixClient {
         let theme = *cx.theme();
         let id = group.id;
         let expanded = group.expanded;
+        let hover_key = format!("rail-group-{id}");
+        let hovered = self.rail_hover.as_deref() == Some(&hover_key);
         let names = members
             .iter()
             .map(|room| room.name.as_str())
@@ -3766,125 +3785,192 @@ impl MatrixClient {
             self.space.as_ref() == Some(&room.id)
                 || (self.space.is_none() && self.room.as_ref() == Some(&room.id))
         });
+        // Keep the body mounted in both states so closing can finish, and rapid
+        // reversals preserve the spring's current height and velocity.
+        let body_height =
+            56. * children.len() as f32 + 8. + theme.metrics.control_small.as_f32() + 2.;
+        let open = if expanded { 1. } else { 0. };
+        let header = div()
+            .id(SharedString::from(hover_key.clone()))
+            .relative()
+            .size(px(48.))
+            .flex_none()
+            .rounded(px(16.))
+            .cursor_pointer()
+            .tip_label(
+                format!(
+                    "{names} · {}",
+                    if expanded {
+                        "Collapse group"
+                    } else {
+                        "Expand group"
+                    }
+                ),
+                Perch::Right,
+            )
+            .on_hover(cx.listener({
+                let key = hover_key.clone();
+                move |this, hovered: &bool, _, cx| this.rail_hover(&key, *hovered, cx)
+            }))
+            .on_drag_move(cx.listener({
+                let key = hover_key.clone();
+                move |this, event: &gpui::DragMoveEvent<rail_groups::DraggedRoom>, _, cx| {
+                    this.rail_hover(&key, event.bounds.contains(&event.event.position), cx);
+                }
+            }))
+            .on_drop(
+                cx.listener(move |this, dragged: &rail_groups::DraggedRoom, _, cx| {
+                    if this.rail_groups.move_into(dragged.room.clone(), id) {
+                        this.save_rail_groups(cx);
+                    }
+                }),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if let Some(group) = this
+                    .rail_groups
+                    .groups
+                    .iter_mut()
+                    .find(|group| group.id == id)
+                {
+                    group.expanded = !group.expanded;
+                    this.save_rail_groups(cx);
+                }
+            }))
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(icon("icons/folder-plus.svg", px(24.), theme.primary))
+                    .with_spring(
+                        SharedString::from(format!("folder-art-{id}")),
+                        SpringAnimation::new(ui::Springs::RESPONSIVE).to(open),
+                        |art, amount| {
+                            art.opacity(amount.clamp(0., 1.))
+                                .layer_scale(0.9 + 0.1 * amount.clamp(0., 1.))
+                        },
+                    ),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .p_1()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(2.))
+                    .overflow_hidden()
+                    .children(members.iter().take(4).map(|room| {
+                        self.face(room.id.as_str(), &room.name, room.avatar.as_ref(), px(18.))
+                    }))
+                    .with_spring(
+                        SharedString::from(format!("folder-preview-{id}")),
+                        SpringAnimation::new(ui::Springs::RESPONSIVE).to(open),
+                        |preview, amount| {
+                            preview
+                                .opacity(1. - amount.clamp(0., 1.))
+                                .layer_scale(1. - 0.08 * amount.clamp(0., 1.))
+                        },
+                    ),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .right(px(-3.))
+                    .top(px(-3.))
+                    .rounded_full()
+                    .bg(theme.sidebar)
+                    .child(
+                        svg()
+                            .path(icons::path("icons/chevron-right.svg"))
+                            .size(px(12.))
+                            .text_color(theme.primary)
+                            .with_spring(
+                                SharedString::from(format!("folder-chevron-{id}")),
+                                SpringAnimation::new(ui::Springs::RESPONSIVE).to(open),
+                                |chevron, amount| {
+                                    chevron.with_transformation(gpui::Transformation::rotate(
+                                        gpui::radians(std::f32::consts::FRAC_PI_2 * amount),
+                                    ))
+                                },
+                            ),
+                    ),
+            )
+            .when(!expanded && unread > 0, |header| {
+                header.child(
+                    unread::badge(unread, cx)
+                        .absolute()
+                        .right(px(-5.))
+                        .bottom(px(-3.))
+                        .border_2()
+                        .border_color(theme.sidebar),
+                )
+            })
+            .with_spring(
+                SharedString::from(format!("folder-hover-{id}")),
+                SpringAnimation::new(ui::Springs::RESPONSIVE).to(if hovered { 1. } else { 0. }),
+                move |header, amount| {
+                    header
+                        .bg(theme.primary.opacity(0.15 + 0.2 * amount.clamp(0., 1.)))
+                        .layer_scale(1. + 0.04 * amount.clamp(0., 1.))
+                },
+            );
+        let body = div()
+            .w_full()
+            .flex_none()
+            .min_h(px(0.))
+            .overflow_hidden()
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_2()
+                    .pt_2()
+                    .children(children)
+                    .child(
+                        Button::new(SharedString::from(format!("rail-group-remove-{id}")))
+                            .ghost()
+                            .small()
+                            .icon("icons/x.svg")
+                            .tooltip("Ungroup rooms and spaces")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.rail_groups.groups.retain(|group| group.id != id);
+                                this.save_rail_groups(cx);
+                            })),
+                    ),
+            )
+            .with_spring(
+                SharedString::from(format!("folder-body-{id}")),
+                SpringAnimation::new(ui::Springs::RESPONSIVE).to(if expanded {
+                    body_height
+                } else {
+                    0.
+                }),
+                move |body, height| {
+                    body.h(px(height.max(0.)))
+                        .opacity((height / body_height).clamp(0., 1.))
+                },
+            );
         div()
             .w_full()
             .flex_none()
             .flex()
             .flex_col()
             .items_center()
-            .gap_2()
             .py_1()
             .rounded(px(18.))
             .bg(theme.primary.opacity(if active { 0.14 } else { 0.06 }))
-            .child(
-                div()
-                    .id(SharedString::from(format!("rail-group-{id}")))
-                    .relative()
-                    .size(px(48.))
-                    .rounded(px(16.))
-                    .bg(theme.primary.opacity(0.15))
-                    .cursor_pointer()
-                    .tip_label(
-                        format!(
-                            "{names} · {}",
-                            if expanded {
-                                "Collapse group"
-                            } else {
-                                "Expand group"
-                            }
-                        ),
-                        Perch::Right,
-                    )
-                    .hover(|style| style.bg(theme.primary.opacity(0.25)))
-                    .drag_over::<rail_groups::DraggedRoom>(move |style, _, _, _| {
-                        style.bg(theme.primary.opacity(0.4))
-                    })
-                    .on_drop(
-                        cx.listener(move |this, dragged: &rail_groups::DraggedRoom, _, cx| {
-                            if this.rail_groups.move_into(dragged.room.clone(), id) {
-                                this.save_rail_groups(cx);
-                            }
-                        }),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(group) = this
-                            .rail_groups
-                            .groups
-                            .iter_mut()
-                            .find(|group| group.id == id)
-                        {
-                            group.expanded = !group.expanded;
-                            this.save_rail_groups(cx);
-                        }
-                    }))
-                    .child(if expanded {
-                        div()
-                            .size_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(icon("icons/folder-plus.svg", px(24.), theme.primary))
-                            .into_any_element()
-                    } else {
-                        div()
-                            .size_full()
-                            .p_1()
-                            .flex()
-                            .flex_wrap()
-                            .gap(px(2.))
-                            .overflow_hidden()
-                            .children(members.iter().take(4).map(|room| {
-                                self.face(
-                                    room.id.as_str(),
-                                    &room.name,
-                                    room.avatar.as_ref(),
-                                    px(18.),
-                                )
-                            }))
-                            .into_any_element()
-                    })
-                    .child(
-                        div()
-                            .absolute()
-                            .right(px(-3.))
-                            .top(px(-3.))
-                            .rounded_full()
-                            .bg(theme.sidebar)
-                            .child(icon(
-                                if expanded {
-                                    "icons/chevron-down.svg"
-                                } else {
-                                    "icons/chevron-right.svg"
-                                },
-                                px(12.),
-                                theme.primary,
-                            )),
-                    )
-                    .when(!expanded && unread > 0, |header| {
-                        header.child(
-                            unread::badge(unread, cx)
-                                .absolute()
-                                .right(px(-5.))
-                                .bottom(px(-3.))
-                                .border_2()
-                                .border_color(theme.sidebar),
-                        )
-                    }),
+            .child(header)
+            .child(body)
+            .motion(
+                SharedString::from(format!("folder-enter-{id}")),
+                ui::motion::Motion::Quick,
+                |folder, amount| folder.opacity(amount).layer_scale(0.96 + 0.04 * amount),
             )
-            .children(children)
-            .when(expanded, |folder| {
-                folder.child(
-                    Button::new(SharedString::from(format!("rail-group-remove-{id}")))
-                        .ghost()
-                        .small()
-                        .icon("icons/x.svg")
-                        .tooltip("Ungroup rooms and spaces")
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.rail_groups.groups.retain(|group| group.id != id);
-                            this.save_rail_groups(cx);
-                        })),
-                )
-            })
             .into_any_element()
     }
 
@@ -3901,6 +3987,25 @@ impl MatrixClient {
                     count: u64,
                     content: AnyElement,
                     press: Press| {
+            let hover_key = id.to_string();
+            // Closing folders keep their children mounted for the exit animation;
+            // those clipped icons must not react to a drag over the rows below.
+            let drag_visible = room
+                .as_ref()
+                .and_then(|room| self.rail_groups.group_of(room))
+                .and_then(|id| self.rail_groups.groups.iter().find(|group| group.id == id))
+                .is_none_or(|group| group.expanded);
+            let hovered = self.rail_hover.as_deref() == Some(&hover_key);
+            let background = if active {
+                theme.primary
+            } else {
+                theme.secondary
+            };
+            let foreground = if active {
+                theme.primary_foreground
+            } else {
+                theme.foreground
+            };
             div()
                 .relative()
                 .flex_none()
@@ -3942,7 +4047,11 @@ impl MatrixClient {
                 })
                 .child(
                     div()
-                        .id(id)
+                        .id(id.clone())
+                        .on_hover(cx.listener({
+                            let key = hover_key.clone();
+                            move |this, hovered: &bool, _, cx| this.rail_hover(&key, *hovered, cx)
+                        }))
                         .tip_label(name.clone(), Perch::Right)
                         .relative()
                         .flex()
@@ -3962,7 +4071,6 @@ impl MatrixClient {
                         })
                         .font_weight(FontWeight::SEMIBOLD)
                         .cursor_pointer()
-                        .hover(|style| style.bg(theme.primary).text_color(theme.primary_foreground))
                         .child(
                             div()
                                 .flex()
@@ -3993,16 +4101,18 @@ impl MatrixClient {
                                 },
                                 |dragged, _, _, cx| cx.new(|_| dragged.clone()),
                             )
-                            .drag_over::<rail_groups::DraggedRoom>(move |style, dragged, _, _| {
-                                if dragged.room == hover_target {
-                                    style
-                                } else {
-                                    style
-                                        .bg(theme.primary)
-                                        .text_color(theme.primary_foreground)
-                                        .rounded(px(16.))
+                            .on_drag_move(cx.listener({
+                                let key = hover_key.clone();
+                                move |this,
+                                      event: &gpui::DragMoveEvent<rail_groups::DraggedRoom>,
+                                      _,
+                                      cx| {
+                                    let over = drag_visible
+                                        && event.bounds.contains(&event.event.position)
+                                        && event.drag(cx).room != hover_target;
+                                    this.rail_hover(&key, over, cx);
                                 }
-                            })
+                            }))
                             .on_drop(cx.listener({
                                 let target = target.clone();
                                 move |this, dragged: &rail_groups::DraggedRoom, _, cx| {
@@ -4015,7 +4125,26 @@ impl MatrixClient {
                                 }
                             }))
                         })
-                        .on_click(press),
+                        .on_click(press)
+                        .with_spring(
+                            SharedString::from(format!("{id}-hover")),
+                            SpringAnimation::new(ui::Springs::RESPONSIVE).to(if hovered {
+                                1.
+                            } else {
+                                0.
+                            }),
+                            move |icon, amount| {
+                                let amount = amount.clamp(0., 1.);
+                                icon.rounded(px(24. - 8. * amount))
+                                    .bg(ui::motion::mix(background, theme.primary, amount))
+                                    .text_color(ui::motion::mix(
+                                        foreground,
+                                        theme.primary_foreground,
+                                        amount,
+                                    ))
+                                    .layer_scale(1. + 0.04 * amount)
+                            },
+                        ),
                 )
         };
 
@@ -4181,15 +4310,11 @@ impl MatrixClient {
                     .iter()
                     .filter_map(|id| self.summary(id).filter(|room| !room.invite))
                     .collect::<Vec<_>>();
-                let children = if group.expanded {
-                    group
-                        .rooms
-                        .iter()
-                        .filter_map(|id| icons.remove(id))
-                        .collect()
-                } else {
-                    Vec::new()
-                };
+                let children = group
+                    .rooms
+                    .iter()
+                    .filter_map(|id| icons.remove(id))
+                    .collect();
                 entries.push(self.render_rail_group(group, &members, children, cx));
             } else if let Some(icon) = icons.remove(&id) {
                 entries.push(icon);
