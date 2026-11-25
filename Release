@@ -1,24 +1,24 @@
 Architectures: amd64
 Codename: stable
 Components: main
-Date: Wed, 25 Nov 2026 12:34:16 +0000
+Date: Wed, 25 Nov 2026 19:39:13 +0000
 Description: Huddle apt repository
 Label: huddle
 Origin: huddle
 Suite: stable
 MD5Sum:
- 90bb3d805b9127ae5dfbd8a58cb6d790             3670 Packages
- fbbca64353539b67997fa165af4acd3c              943 Packages.gz
- e8660f21cb32f01e1588b3e6f83f6d8e              171 Release
+ e772f3de9e5032dce10fe7ae6d305059             3670 Packages
+ 7a7ae570b0b3cbfdb48522388f6ae473              940 Packages.gz
+ dbce32bdb43b76c0ec41959826971711              171 Release
 SHA1:
- 47e3086fdb47ad2c846b008a8525fbae5ce360d4             3670 Packages
- 2fdb05e56687ad0084debe199a095c146eb49a54              943 Packages.gz
- e603415eb9c0fae8d21464643f815759e10c7d62              171 Release
+ 4984bf8cca9ffd6cba905985bc14e9b56f3749db             3670 Packages
+ 292d74994491a061a9dadfe425ebb6f63e7a1e73              940 Packages.gz
+ 70b3daad0342e6012c2b53b4e4a45e707fe3b4fb              171 Release
 SHA256:
- 67719d0497188274a90e94d1a37b9f58a205753941399b0e74ca2b6a23eb3f65             3670 Packages
- 86e1ffbae3dce20611e9e9f5afc6f9698a42872b35a12e38ea3a05c6146709df              943 Packages.gz
- e6dfb1bb5e2fbfa0445e86996261c3810748baa442bd432b7f59cfc09502acc7              171 Release
+ c562e0521b000d15fef9e7aaa9f93e8d3aade294c32f51048537fa0c4f30d876             3670 Packages
+ ac3f60f98a511829d1dc7a801aaca506e915f92e2714e1452de78c73c7b14a42              940 Packages.gz
+ 790a1a58bcb264da4a3e7c4f3715ed9219f50c398f92be4d555b5f074caf994a              171 Release
 SHA512:
- 96fcdc8e1f6fbf41bfb99f9d2d86892d421fc470443e6533c8bf79266169536e223e8a15746099fd0a2b816fdfd8b5ac2dcccd51324c2d9c558c157fba156ec3             3670 Packages
- 376b2cd674a1bc54e080af27c961adb1bc5c1deb5857de154a50d5e0dc9fb836e4a2ed92d283d61c39cbc426a2930c63364d25132cd2ff6d86f3921b422d7460              943 Packages.gz
- d197a05b840a77f2e0a75e94d80dc8b8941843f4a22ffe3f25f1065d95f7fc21d4107996a1797f71b4a4088fe716a638be3aa09659b7525d50efb9d54a61ae68              171 Release
+ cb4664ebb8a6f7bec119493b8c7e6c2ce214dc0a5b7880b58be8bb942527191d7df223a21401827372610156ba6b3cd00af16935c223d424d274432825f4500b             3670 Packages
+ 2cdfc133ca6150733016bbe041d36e30c635cb3cacac26f8b8a0a3589ff87563b2a1b7b38f522614e17dacd76739cd496165cf1f6ccabb278030908d3e504d4b              940 Packages.gz
+ 78a86c4224c74ee1f66741e66a5eb4344133dfd3631f2341e12dc8b12152729cd259dc3092c482141b287d5b9fdeb02e73f519ee954119262cc7f4e474441db1              171 Release
