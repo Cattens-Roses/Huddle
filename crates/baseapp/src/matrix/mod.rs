@@ -6865,6 +6865,47 @@ impl MatrixClient {
             .into_any_element()
     }
 
+    fn render_jump_to_bottom(&self, spot: Spot, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let list = match spot {
+            Spot::Main => &self.list,
+            Spot::Thread => &self.thread_list,
+        };
+        let remaining = list.max_offset_for_scrollbar().y + list.scroll_px_offset_for_scrollbar().y;
+        if list.item_count() == 0 || remaining <= px(48.) {
+            return None;
+        }
+        let id = if spot == Spot::Main {
+            "chat-jump-bottom"
+        } else {
+            "thread-jump-bottom"
+        };
+        Some(
+            ui::perched(
+                Button::new(id)
+                    .icon("icons/chevron-down.svg")
+                    .label("Latest messages")
+                    .tooltip("Jump to bottom")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        ui::cancel_middle_scroll(cx);
+                        let (list, bar) = match spot {
+                            Spot::Main => {
+                                this.history_anchor = None;
+                                (&this.list, &this.chat_scroll)
+                            }
+                            Spot::Thread => (&this.thread_list, &this.thread_scroll),
+                        };
+                        list.scroll_to_end();
+                        // An in-flight wheel animation must not pull the list back up.
+                        bar.update(cx, |bar, _| bar.rebase());
+                        cx.notify();
+                    })),
+                cx,
+            )
+            .fading(id)
+            .into_any_element(),
+        )
+    }
+
     fn render_chat(&self, room: &RoomSummary, cx: &mut Context<Self>) -> AnyElement {
         let theme = *cx.theme();
         let timeline = self.timelines.get(&room.id);
@@ -7116,7 +7157,20 @@ impl MatrixClient {
                     .then(|| self.render_security_banner(cx))
                     .flatten(),
             )
-            .child(div().flex().flex_col().flex_1().min_h_0().child(body))
+            .child(
+                div()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .child(body)
+                    .children(
+                        (!empty)
+                            .then(|| self.render_jump_to_bottom(Spot::Main, cx))
+                            .flatten(),
+                    ),
+            )
             .child(self.render_composer(Spot::Main, cx));
 
         let members_open = self.thread.is_none() && self.show_members;
@@ -7196,17 +7250,22 @@ impl MatrixClient {
                     ),
             )
             .child(
-                div().flex_1().min_h_0().child(
-                    Scroller::listing("thread-messages", &self.thread_scroll).child(
-                        list(
-                            self.thread_list.clone(),
-                            cx.processor(|this, index: usize, _, cx| {
-                                this.render_thread_item(index, cx)
-                            }),
-                        )
-                        .size_full(),
-                    ),
-                ),
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        Scroller::listing("thread-messages", &self.thread_scroll).child(
+                            list(
+                                self.thread_list.clone(),
+                                cx.processor(|this, index: usize, _, cx| {
+                                    this.render_thread_item(index, cx)
+                                }),
+                            )
+                            .size_full(),
+                        ),
+                    )
+                    .children(self.render_jump_to_bottom(Spot::Thread, cx)),
             )
             .child(self.render_composer(Spot::Thread, cx))
     }
