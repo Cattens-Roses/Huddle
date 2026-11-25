@@ -1,5 +1,6 @@
 mod backend;
 mod media_ui;
+mod media_zoom;
 mod photo;
 mod playback;
 mod profile;
@@ -455,6 +456,7 @@ pub struct MatrixClient {
     cache_clearing: bool,
     cache_status: Option<String>,
     viewing: Option<View>,
+    media_zoom: media_zoom::Zoom,
     player: Option<playback::Player>,
     player_audio: Option<String>,
     audio_thread_timeline: ScrubberState,
@@ -604,6 +606,7 @@ impl MatrixClient {
             cache_clearing: false,
             cache_status: None,
             viewing: None,
+            media_zoom: media_zoom::Zoom::default(),
             player: None,
             player_audio: None,
             audio_thread_timeline: ScrubberState::new("audio-thread-timeline"),
@@ -5957,6 +5960,7 @@ impl MatrixClient {
     }
 
     fn open_media(&mut self, media: Picture, cx: &mut Context<Self>) {
+        self.media_zoom.reset();
         self.viewing = None;
         self.player = None;
         self.player_audio = None;
@@ -6046,6 +6050,164 @@ impl MatrixClient {
         cx.notify();
     }
 
+    fn render_zoom_controls(&self, enabled: bool, cx: &mut Context<Self>) -> AnyElement {
+        let factor = self.media_zoom.factor;
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(
+                Button::new("media-zoom-out")
+                    .ghost()
+                    .size(px(32.))
+                    .p_0()
+                    .label("−")
+                    .tooltip("Zoom out")
+                    .disabled(!enabled || factor <= 1.)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let center = this.media_zoom.center();
+                        this.media_zoom.at(this.media_zoom.factor / 1.25, center);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("media-zoom-reset")
+                    .ghost()
+                    .small()
+                    .label(format!("{:.0}%", factor * 100.))
+                    .tooltip("Fit to window")
+                    .disabled(!enabled)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.media_zoom.reset();
+                        cx.notify();
+                    })),
+            )
+            .child(
+                media_ui::tool("media-zoom-in", "icons/plus.svg", "Zoom in")
+                    .disabled(!enabled || factor >= media_zoom::MAX)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let center = this.media_zoom.center();
+                        this.media_zoom.at(this.media_zoom.factor * 1.25, center);
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+
+    fn render_zoom_stage(
+        &self,
+        content: AnyElement,
+        height: Pixels,
+        aspect: f32,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = *cx.theme();
+        let factor = if enabled { self.media_zoom.factor } else { 1. };
+        let offset = if enabled {
+            self.media_zoom.offset()
+        } else {
+            gpui::Point::default()
+        };
+        let geometry = self.media_zoom.geometry.clone();
+        div()
+            .id("media-zoom-stage")
+            .relative()
+            .w_full()
+            .h(height)
+            .flex_none()
+            .overflow_hidden()
+            .bg(media_ui::opaque(theme.background))
+            .when(factor > 1., |stage| {
+                stage.cursor(if self.media_zoom.dragging() {
+                    gpui::CursorStyle::ClosedHand
+                } else {
+                    gpui::CursorStyle::OpenHand
+                })
+            })
+            .on_scroll_wheel(
+                cx.listener(move |this, event: &gpui::ScrollWheelEvent, _, cx| {
+                    cx.stop_propagation();
+                    if enabled {
+                        let delta = event
+                            .delta
+                            .pixel_delta(px(24.))
+                            .y
+                            .as_f32()
+                            .clamp(-120., 120.);
+                        this.media_zoom.at(
+                            this.media_zoom.factor * (delta * 0.006).exp(),
+                            event.position,
+                        );
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    if enabled {
+                        if event.click_count == 2 {
+                            let factor = if this.media_zoom.factor > 1. { 1. } else { 2. };
+                            this.media_zoom.at(factor, event.position);
+                        } else {
+                            this.media_zoom.begin_drag(event.position);
+                        }
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                if event.dragging() && this.media_zoom.drag_to(event.position) {
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.media_zoom.end_drag() {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.media_zoom.end_drag() {
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(
+                gpui::canvas(
+                    move |bounds, window, _| {
+                        let old = geometry.get();
+                        geometry.set(media_zoom::Geometry { bounds, aspect });
+                        if old.bounds != bounds || old.aspect != aspect {
+                            window.request_animation_frame();
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .w(gpui::relative(factor))
+                    .h(gpui::relative(factor))
+                    .left(gpui::relative((1. - factor) / 2.))
+                    .top(gpui::relative((1. - factor) / 2.))
+                    .ml(offset.x)
+                    .mt(offset.y)
+                    .child(content),
+            )
+            .into_any_element()
+    }
+
     fn render_player(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         if self.player_audio.is_some() {
             return div().into_any_element();
@@ -6084,10 +6246,8 @@ impl MatrixClient {
         let panel_width = (viewport.width - px(48.)).max(px(0.)).min(px(960.));
         let close = media_ui::tool("media-close", "icons/x.svg", "Close (Esc)")
             .on_click(cx.listener(|this, _, _, cx| this.close_media(cx)));
-        let stage = div()
-            .w_full()
-            .h(stage_height)
-            .flex_none()
+        let content = div()
+            .size_full()
             .flex()
             .items_center()
             .justify_center()
@@ -6115,6 +6275,21 @@ impl MatrixClient {
                     )
                 },
             );
+        let aspect = self.player_image.as_ref().map_or(0., |image| {
+            let size = image.size(0);
+            if size.height.0 > 0 {
+                size.width.0 as f32 / size.height.0 as f32
+            } else {
+                0.
+            }
+        });
+        let stage = self.render_zoom_stage(
+            content.into_any_element(),
+            stage_height,
+            aspect,
+            self.player_image.is_some(),
+            cx,
+        );
         let timeline = Scrubber::new(&self.player_timeline, fraction)
             .colors(theme.primary, theme.border, theme.primary)
             .enabled(duration.is_some() && !failed)
@@ -6293,7 +6468,10 @@ impl MatrixClient {
             .child(media_ui::header(
                 &player.name,
                 "Video",
-                vec![close.into_any_element()],
+                vec![
+                    self.render_zoom_controls(self.player_image.is_some(), cx),
+                    close.into_any_element(),
+                ],
                 cx,
             ))
             .child(stage)
@@ -6323,6 +6501,7 @@ impl MatrixClient {
     }
 
     fn open_picture(&mut self, picture: Picture, cx: &mut Context<Self>) {
+        self.media_zoom.reset();
         if self.player_audio.is_none() {
             self.close_media(cx);
         }
@@ -6441,10 +6620,8 @@ impl MatrixClient {
         let failed = matches!(full, Some(Media::Failed)) && !matches!(image, Some(_));
         let panel_width = (viewport.width - px(48.)).max(px(0.)).min(px(960.));
         let stage_height = (viewport.height - px(144.)).max(px(80.)).min(px(640.));
-        let stage = div()
-            .w_full()
-            .h(stage_height)
-            .flex_none()
+        let content = div()
+            .size_full()
             .flex()
             .items_center()
             .justify_center()
@@ -6475,7 +6652,20 @@ impl MatrixClient {
                     )
                 },
             );
+        let aspect = if view.picture.height > 0 {
+            view.picture.width as f32 / view.picture.height as f32
+        } else {
+            0.
+        };
+        let stage = self.render_zoom_stage(
+            content.into_any_element(),
+            stage_height,
+            aspect,
+            image.is_some(),
+            cx,
+        );
         let actions = vec![
+            self.render_zoom_controls(image.is_some(), cx),
             media_ui::tool("image-download", "icons/download.svg", "Download image")
                 .on_click(cx.listener(|this, _, _, cx| this.download_picture(cx)))
                 .into_any_element(),
