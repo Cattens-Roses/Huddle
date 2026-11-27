@@ -194,6 +194,8 @@ struct Timeline {
     messages: Vec<Message>,
     threads: HashMap<OwnedEventId, Vec<Message>>,
     orphans: Vec<Event>,
+    pending_live: Vec<Event>,
+    history_error: bool,
     loaded: bool,
     token: Option<String>,
     loading: bool,
@@ -380,6 +382,22 @@ fn insert(messages: &mut Vec<Message>, message: Message, mine: bool) -> Insert {
             Insert::Appended(messages.len() - 1)
         }
     }
+}
+
+/// A history request is a snapshot: events already received through sync must
+/// survive a response that was assembled before they arrived.
+fn merge_history(existing: Vec<Message>, mut fetched: Vec<Message>) -> Vec<Message> {
+    let mut ids = fetched
+        .iter()
+        .filter_map(|message| message.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    fetched.extend(
+        existing
+            .into_iter()
+            .filter(|message| message.id.as_ref().is_none_or(|id| ids.insert(id.clone()))),
+    );
+    fetched.sort_by_key(|message| (message.id.is_none(), message.timestamp));
+    fetched
 }
 
 #[derive(Clone)]
@@ -1176,6 +1194,20 @@ impl MatrixClient {
                 token,
                 older,
             } => self.history(room, events, token, older, cx),
+            Update::HistoryFailed { room } => {
+                let queued = if let Some(timeline) = self.timelines.get_mut(&room) {
+                    timeline.loading = false;
+                    timeline.history_error = true;
+                    // History being unavailable must not block live delivery.
+                    timeline.loaded = true;
+                    std::mem::take(&mut timeline.pending_live)
+                } else {
+                    Vec::new()
+                };
+                for event in queued {
+                    self.live(room.clone(), event);
+                }
+            }
             Update::Thread { room, root, events } => self.thread_loaded(room, root, events),
             Update::Members { room, members } => {
                 self.members.insert(room, members);
@@ -1403,6 +1435,7 @@ impl MatrixClient {
             (offset, height)
         });
         let anchor_room = room.clone();
+        let live_room = room.clone();
         let timeline = self.timelines.entry(room).or_default();
         let mut fresh = Vec::new();
         let mut relations = Vec::new();
@@ -1415,6 +1448,7 @@ impl MatrixClient {
         }
         timeline.token = token;
         timeline.loading = false;
+        timeline.history_error = false;
         if older {
             let before = timeline.messages.len();
             timeline.messages.splice(0..0, fresh);
@@ -1443,13 +1477,7 @@ impl MatrixClient {
                 self.chat_scroll.update(cx, |bar, _| bar.rebase());
             }
         } else {
-            let pending = timeline
-                .messages
-                .drain(..)
-                .filter(|message| message.id.is_none())
-                .collect::<Vec<_>>();
-            timeline.messages = fresh;
-            timeline.messages.extend(pending);
+            timeline.messages = merge_history(std::mem::take(&mut timeline.messages), fresh);
             timeline.orphans.clear();
             timeline.loaded = true;
             for event in relations {
@@ -1461,17 +1489,16 @@ impl MatrixClient {
                 self.list.reset(timeline.messages.len());
             }
         }
+        let queued = std::mem::take(&mut timeline.pending_live);
+        for event in queued {
+            self.live(live_room.clone(), event);
+        }
     }
 
     fn thread_loaded(&mut self, room: OwnedRoomId, root: OwnedEventId, events: Vec<Event>) {
         let current = self.room.as_ref() == Some(&room);
         let timeline = self.timelines.entry(room).or_default();
-        let pending = timeline
-            .threads
-            .remove(&root)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|message| message.id.is_none());
+        let pending = timeline.threads.remove(&root).unwrap_or_default();
         let mut replies = Vec::new();
         let mut relations = Vec::new();
         for event in events {
@@ -1483,7 +1510,7 @@ impl MatrixClient {
                 other => relations.push(other),
             }
         }
-        replies.extend(pending);
+        let replies = merge_history(pending, replies);
         let count = replies.len();
         timeline.threads.insert(root.clone(), replies);
         for event in relations {
@@ -1520,11 +1547,19 @@ impl MatrixClient {
         let current = self.room.as_ref() == Some(&room);
         let me = self.my_id();
         let open_thread = self.thread.clone();
-        let Some(timeline) = self.timelines.get_mut(&room).filter(|t| t.loaded) else {
+        let Some(timeline) = self.timelines.get_mut(&room) else {
             return preview.and_then(|(text, thread)| {
                 self.wants_alert(&room, thread.as_ref()).then_some(text)
             });
         };
+        if !timeline.loaded {
+            if timeline.loading || current {
+                timeline.pending_live.push(event);
+            }
+            return preview.and_then(|(text, thread)| {
+                self.wants_alert(&room, thread.as_ref()).then_some(text)
+            });
+        }
         let mut changes = Vec::new();
         let mut read = None;
         let mut fresh = false;
@@ -1960,6 +1995,17 @@ impl MatrixClient {
         self.reveal(id, Some(window), cx);
     }
 
+    fn reload_history(&mut self, id: OwnedRoomId, cx: &mut Context<Self>) {
+        let timeline = self.timelines.entry(id.clone()).or_default();
+        timeline.history_error = false;
+        timeline.loading = true;
+        self.command(Command::Open {
+            room: id,
+            history: true,
+        });
+        cx.notify();
+    }
+
     fn reveal(&mut self, id: OwnedRoomId, window: Option<&mut Window>, cx: &mut Context<Self>) {
         if self
             .summary(&id)
@@ -1993,11 +2039,13 @@ impl MatrixClient {
             self.picker = None;
         }
         self.room = Some(id.clone());
-        let timeline = self.timelines.get(&id);
-        let loaded = timeline.is_some_and(|timeline| timeline.loaded);
-        let count = timeline.map_or(0, |timeline| timeline.messages.len());
-        let latest =
-            timeline.and_then(|timeline| timeline.messages.iter().rev().find_map(|m| m.id.clone()));
+        let timeline = self.timelines.entry(id.clone()).or_default();
+        let loaded = timeline.loaded;
+        let count = timeline.messages.len();
+        let latest = timeline.messages.iter().rev().find_map(|m| m.id.clone());
+        if !loaded {
+            timeline.loading = true;
+        }
         self.list.reset(count);
         self.command(Command::Open {
             room: id.clone(),
@@ -2021,6 +2069,12 @@ impl MatrixClient {
             .get(&room)
             .and_then(|timeline| timeline.threads.get(&root))
             .map_or(0, Vec::len);
+        self.timelines
+            .entry(room.clone())
+            .or_default()
+            .threads
+            .entry(root.clone())
+            .or_default();
         self.thread = Some(root.clone());
         self.picker = None;
         if matches!(self.editing, Some((_, Spot::Thread))) {
@@ -7656,14 +7710,33 @@ impl MatrixClient {
                     })),
             );
 
-        let body = if !loaded && empty {
+        let body = if (!loaded || timeline.is_some_and(|timeline| timeline.history_error)) && empty
+        {
+            let failed = timeline.is_some_and(|timeline| timeline.history_error);
+            let id = room.id.clone();
             div()
                 .flex()
+                .flex_col()
+                .gap_3()
                 .flex_1()
                 .items_center()
                 .justify_center()
                 .text_color(theme.muted_foreground)
-                .child("Loading messages…")
+                .child(if failed {
+                    "Could not load messages."
+                } else {
+                    "Loading messages…"
+                })
+                .when(failed, |body| {
+                    body.child(
+                        Button::new("retry-history")
+                            .primary()
+                            .label("Try again")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.reload_history(id.clone(), cx);
+                            })),
+                    )
+                })
                 .into_any_element()
         } else if empty {
             div()
@@ -7730,6 +7803,31 @@ impl MatrixClient {
             .min_w_0()
             .min_h_0()
             .child(header)
+            .when(
+                !empty && timeline.is_some_and(|timeline| timeline.history_error),
+                |chat| {
+                    let id = room.id.clone();
+                    chat.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_4()
+                            .py_2()
+                            .text_color(theme.muted_foreground)
+                            .child("Earlier messages could not be loaded.")
+                            .child(
+                                Button::new("retry-history-banner")
+                                    .ghost()
+                                    .small()
+                                    .label("Try again")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.reload_history(id.clone(), cx)
+                                    })),
+                            ),
+                    )
+                },
+            )
             .children(
                 room.encrypted
                     .then(|| self.render_security_banner(cx))
@@ -8743,6 +8841,54 @@ mod tests {
             reactions: Vec::new(),
             mentioned: false,
         }
+    }
+
+    #[test]
+    fn history_snapshot_does_not_erase_messages_received_while_it_was_loading() {
+        let mut old = message("$old", "encrypted");
+        old.timestamp = 10;
+        let mut live = message("$live", "Arrived during the history request");
+        live.timestamp = 20;
+        let mut decrypted = message("$old", "decrypted");
+        decrypted.timestamp = 10;
+        let merged = merge_history(vec![old, live], vec![decrypted]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].body, "decrypted");
+        assert_eq!(
+            merged[1].id.as_deref(),
+            Some(owned_event_id!("$live").as_ref())
+        );
+        // A second response can contain that same live message; keep one copy.
+        let merged = merge_history(
+            merged,
+            vec![message("$live", "Arrived during the history request")],
+        );
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn thread_history_preserves_live_replies_and_pending_sends() {
+        let mut reply = message("$reply", "New reply");
+        reply.thread = Some(owned_event_id!("$root"));
+        reply.timestamp = 20;
+        let mut pending = message("$local", "Sending");
+        pending.id = None;
+        pending.local = Some(1);
+        let mut fetched = message("$first", "Earlier reply");
+        fetched.timestamp = 10;
+        let merged = merge_history(vec![reply, pending], vec![fetched]);
+        assert_eq!(
+            merged
+                .iter()
+                .map(|message| message.body.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Earlier reply", "New reply", "Sending"]
+        );
+        assert_eq!(
+            merged[1].thread.as_deref(),
+            Some(owned_event_id!("$root").as_ref())
+        );
+        assert!(merged[2].id.is_none());
     }
 
     #[test]

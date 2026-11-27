@@ -417,6 +417,9 @@ pub enum Update {
         token: Option<String>,
         older: bool,
     },
+    HistoryFailed {
+        room: OwnedRoomId,
+    },
     Thread {
         room: OwnedRoomId,
         root: OwnedEventId,
@@ -1092,17 +1095,7 @@ impl Worker {
         let outbox = self.outbox.clone();
         let syncing = client.clone();
         self.tasks.push(tokio::spawn(async move {
-            let settings = SyncSettings::default().timeout(Duration::from_secs(30));
-            let result = syncing
-                .sync_with_callback(settings, |_| {
-                    let client = syncing.clone();
-                    let outbox = outbox.clone();
-                    async move {
-                        post(&outbox, Update::Rooms(summaries(&client).await));
-                        LoopCtrl::Continue
-                    }
-                })
-                .await;
+            let result = sync_updates(&syncing, &outbox).await;
             if let Err(error) = result {
                 log::warn!("matrix: sync stopped: {error}");
                 if matches!(
@@ -1114,16 +1107,53 @@ impl Worker {
                 } else {
                     post(
                         &outbox,
-                        Update::Failed(
-                            "Lost the connection to your server. Restart Huddle to reconnect."
-                                .into(),
-                        ),
+                        Update::Failed("Could not synchronize messages.".into()),
                     );
                 }
             }
         }));
         self.client = Some(client);
     }
+}
+
+fn sync_retry_delay(attempt: u32) -> Duration {
+    Duration::from_secs(1u64 << attempt.min(5))
+}
+
+async fn sync_updates(client: &Client, outbox: &Outbox) -> matrix_sdk::Result<()> {
+    let failures = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    client
+        .sync_with_result_callback(
+            SyncSettings::default().timeout(Duration::from_secs(30)),
+            |response| {
+                let failures = failures.clone();
+                async move {
+                    match response {
+                        Ok(_) => {
+                            failures.store(0, std::sync::atomic::Ordering::Relaxed);
+                            post(outbox, Update::Rooms(summaries(client).await));
+                        }
+                        Err(error)
+                            if matches!(
+                                error.client_api_error_kind(),
+                                Some(ErrorKind::UnknownToken(_))
+                            ) =>
+                        {
+                            return Err(error);
+                        }
+                        Err(error) => {
+                            let attempt =
+                                failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let delay = sync_retry_delay(attempt);
+                            log::warn!("matrix: sync interrupted, retrying in {delay:?}: {error}");
+                            tokio::time::sleep(delay).await;
+                        }
+                    }
+                    Ok(LoopCtrl::Continue)
+                }
+            },
+        )
+        .await
 }
 
 fn security(client: &Client, outbox: &Outbox) {
@@ -1364,7 +1394,13 @@ async fn handle(
         Command::Open { room: id, history } => {
             let room = joined(client, &id)?;
             if history {
-                let (events, token) = page(&room, None).await?;
+                let (events, token) = match page(&room, None).await {
+                    Ok(history) => history,
+                    Err(error) => {
+                        post(outbox, Update::HistoryFailed { room: id });
+                        return Err(error);
+                    }
+                };
                 let readers = receipts::snapshot(&room, &events, None).await;
                 let latest = events.iter().rev().find_map(|event| match event {
                     Event::Message(message) => message.id.clone(),

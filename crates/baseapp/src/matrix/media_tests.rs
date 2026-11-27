@@ -22,6 +22,9 @@ mod unread_tests;
 #[path = "mute_tests.rs"]
 mod mute_tests;
 
+#[path = "sync_tests.rs"]
+mod sync_tests;
+
 fn decode_component(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut result = Vec::new();
@@ -43,6 +46,9 @@ fn decode_component(value: &str) -> String {
 
 #[derive(Default)]
 struct Traffic {
+    sync_failures: usize,
+    sync_unknown_token: bool,
+    sync_paths: Vec<String>,
     push_requests: Vec<(String, String, serde_json::Value)>,
     reject_push: bool,
     room_previews: HashMap<String, serde_json::Value>,
@@ -492,7 +498,20 @@ impl Server {
                     } else {
                         b"{}".to_vec()
                     }
+                } else if path.contains("/sync")
+                    && (traffic.sync_failures > 0 || traffic.sync_unknown_token)
+                {
+                    traffic.sync_paths.push(path.to_owned());
+                    if traffic.sync_unknown_token {
+                        status = "401 Unauthorized";
+                        br#"{"errcode":"M_UNKNOWN_TOKEN","error":"Session expired"}"#.to_vec()
+                    } else {
+                        traffic.sync_failures -= 1;
+                        status = "503 Service Unavailable";
+                        br#"{"errcode":"M_UNKNOWN","error":"Temporary outage"}"#.to_vec()
+                    }
                 } else if path.contains("/sync") {
+                    traffic.sync_paths.push(path.to_owned());
                     let sync = traffic
                         .sync
                         .take()
