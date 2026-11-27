@@ -130,6 +130,7 @@ mod tests {
             children: children.iter().map(|name| id(name)).collect(),
             invite: false,
             unread: 0,
+            muted: false,
             can_manage: false,
             explicit_name: None,
             can_edit_name: false,

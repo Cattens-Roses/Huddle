@@ -378,6 +378,14 @@ impl MatrixClient {
             );
         }
         if self.admin.tab == Tab::General {
+            if let Some(room) = room {
+                let id = room.id.clone();
+                body = body.child(section("Notifications", "Mute message notifications for your account, including mentions. Unread counts remain visible.", cx)
+                    .child(Checkbox::new("room-mute-notifications", room.muted)
+                        .label("Mute channel")
+                        .disabled(self.mute_pending.contains(&room.id))
+                        .on_click(cx.listener(move |this, _, _, cx| this.toggle_room_mute(id.clone(), cx)))));
+            }
             let can_name = room.is_some_and(|room| room.can_edit_name);
             let can_topic = room.is_some_and(|room| room.can_edit_topic);
             body = body.child(

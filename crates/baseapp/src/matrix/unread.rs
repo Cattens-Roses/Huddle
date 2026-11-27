@@ -62,6 +62,7 @@ mod tests {
             name: name.into(),
             kind,
             unread,
+            muted: false,
             children: children
                 .iter()
                 .map(|name| format!("!{name}:example.org").parse().unwrap())

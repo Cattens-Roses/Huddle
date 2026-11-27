@@ -99,6 +99,7 @@ pub struct RoomSummary {
     pub invite: bool,
     pub encrypted: bool,
     pub unread: u64,
+    pub muted: bool,
     pub members: u64,
     pub children: Vec<OwnedRoomId>,
 }
@@ -219,6 +220,10 @@ pub enum Command {
         cancel: Arc<crate::downloads::Cancel>,
     },
     LoadSpaceNames(OwnedRoomId),
+    MuteRoom {
+        room: OwnedRoomId,
+        muted: bool,
+    },
     LoadProfile {
         room: Option<OwnedRoomId>,
         ticket: u64,
@@ -367,6 +372,11 @@ pub enum Update {
         details: profile::Public,
     },
     Unread(Vec<(OwnedRoomId, u64)>),
+    RoomMuted {
+        user: OwnedUserId,
+        room: OwnedRoomId,
+        result: std::result::Result<bool, String>,
+    },
     Receipts {
         room: OwnedRoomId,
         readers: Vec<receipts::Reader>,
@@ -419,6 +429,7 @@ pub enum Update {
     Live {
         room: OwnedRoomId,
         event: Event,
+        muted: bool,
     },
     Sent {
         room: OwnedRoomId,
@@ -971,8 +982,10 @@ impl Worker {
                     );
                 }
                 if let Some(event) = parse(&room, &raw).await {
+                    let muted = room.notification_mode().await
+                        == Some(matrix_sdk::notification_settings::RoomNotificationMode::Mute);
                     let room = room.room_id().to_owned();
-                    post(&outbox, Update::Live { room, event });
+                    post(&outbox, Update::Live { room, event, muted });
                 }
             }
         });
@@ -1258,6 +1271,17 @@ async fn handle(
                 let names = cached_space_names(client, &room, Some(outbox)).await;
                 post(outbox, Update::SpaceNames { user, names });
             }
+        }
+        Command::MuteRoom { room, muted } => {
+            let user = client
+                .user_id()
+                .ok_or_else(|| anyhow!("not signed in"))?
+                .to_owned();
+            let result = set_room_muted(client, &room, muted)
+                .await
+                .map(|_| muted)
+                .map_err(|error| error.to_string());
+            post(outbox, Update::RoomMuted { user, room, result });
         }
         Command::LoadProfile { room, ticket } => {
             let user = client
@@ -2156,12 +2180,38 @@ async fn summaries(client: &Client) -> Vec<RoomSummary> {
             invite: state == RoomState::Invited,
             encrypted: room.encryption_state().is_encrypted(),
             unread: room.num_unread_messages(),
+            muted: room.notification_mode().await
+                == Some(matrix_sdk::notification_settings::RoomNotificationMode::Mute),
             members: room.joined_members_count(),
             children,
         });
     }
     rooms.sort_by_key(|room| room.name.to_lowercase());
     rooms
+}
+
+async fn set_room_muted(client: &Client, id: &OwnedRoomId, muted: bool) -> Result<()> {
+    use matrix_sdk::notification_settings::{IsEncrypted, IsOneToOne, RoomNotificationMode};
+    let room = joined(client, id)?;
+    anyhow::ensure!(
+        room.state() == RoomState::Joined,
+        "Join this room before changing notifications."
+    );
+    let settings = client.notification_settings().await;
+    if muted {
+        settings
+            .set_room_notification_mode(id, RoomNotificationMode::Mute)
+            .await?;
+    } else {
+        settings
+            .unmute_room(
+                id,
+                IsEncrypted::from(room.encryption_state().is_encrypted()),
+                IsOneToOne::from(room.active_members_count() == 2),
+            )
+            .await?;
+    }
+    Ok(())
 }
 
 async fn space_children(space: &Room) -> Vec<OwnedRoomId> {

@@ -19,6 +19,9 @@ mod profile_tests;
 #[path = "unread_tests.rs"]
 mod unread_tests;
 
+#[path = "mute_tests.rs"]
+mod mute_tests;
+
 fn decode_component(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut result = Vec::new();
@@ -40,6 +43,8 @@ fn decode_component(value: &str) -> String {
 
 #[derive(Default)]
 struct Traffic {
+    push_requests: Vec<(String, String, serde_json::Value)>,
+    reject_push: bool,
     room_previews: HashMap<String, serde_json::Value>,
     preview_requests: Vec<String>,
     public_room_previews: Vec<serde_json::Value>,
@@ -341,7 +346,18 @@ impl Server {
                 let mut traffic = captured.lock().unwrap();
                 let mut status = "200 OK";
                 let mut content_type = "application/json";
-                let response = if path.contains("/hierarchy") {
+                let response = if path.contains("/pushrules/") {
+                    let method = header.split_whitespace().next().unwrap().to_owned();
+                    let body = serde_json::from_slice(&request[header_end..header_end + length])
+                        .unwrap_or(serde_json::Value::Null);
+                    traffic.push_requests.push((method, path.to_owned(), body));
+                    if traffic.reject_push {
+                        status = "403 Forbidden";
+                        br#"{"errcode":"M_FORBIDDEN","error":"Notifications rejected"}"#.to_vec()
+                    } else {
+                        b"{}".to_vec()
+                    }
+                } else if path.contains("/hierarchy") {
                     traffic.hierarchy_requests.push(path.to_owned());
                     let token = path
                         .split_once('?')

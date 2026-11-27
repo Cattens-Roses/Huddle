@@ -436,6 +436,8 @@ pub struct MatrixClient {
     typing_idle: Option<Task<()>>,
     typing_expiry: Option<Task<()>>,
     notifications: NotificationPreferences,
+    mute_pending: std::collections::HashSet<OwnedRoomId>,
+    mute_overrides: HashMap<OwnedRoomId, bool>,
     timelines: HashMap<OwnedRoomId, Timeline>,
     members: HashMap<OwnedRoomId, Vec<Member>>,
     show_members: bool,
@@ -571,6 +573,8 @@ impl MatrixClient {
             typing_idle: None,
             typing_expiry: None,
             notifications: NotificationPreferences::default(),
+            mute_pending: Default::default(),
+            mute_overrides: HashMap::new(),
             timelines: HashMap::new(),
             members: HashMap::new(),
             show_members: true,
@@ -907,6 +911,8 @@ impl MatrixClient {
                 self.rail_groups = rail_groups::Layout::default();
                 self.rail_hover = None;
                 self.rooms.clear();
+                self.mute_pending.clear();
+                self.mute_overrides.clear();
                 self.timelines.clear();
                 self.members.clear();
                 self.room = None;
@@ -1088,7 +1094,40 @@ impl MatrixClient {
                     self.linked_names.extend(names);
                 }
             }
-            Update::Rooms(rooms) => {
+            Update::RoomMuted { user, room, result } => {
+                if !self.me.as_ref().is_some_and(|me| me.id == user) {
+                    return;
+                }
+                self.mute_pending.remove(&room);
+                match result {
+                    Ok(muted) => {
+                        self.mute_overrides.insert(room.clone(), muted);
+                        if let Some(summary) = self.rooms.iter_mut().find(|known| known.id == room)
+                        {
+                            summary.muted = muted;
+                        }
+                        if muted {
+                            cx.dismiss_system_notification(room.as_str());
+                        }
+                    }
+                    Err(error) => self.notify(
+                        &format!("Could not change notifications: {error}"),
+                        true,
+                        cx,
+                    ),
+                }
+            }
+            Update::Rooms(mut rooms) => {
+                self.mute_overrides.retain(|id, desired| {
+                    if let Some(room) = rooms.iter_mut().find(|room| &room.id == id) {
+                        if room.muted == *desired {
+                            return false;
+                        }
+                        room.muted = *desired;
+                        return true;
+                    }
+                    false
+                });
                 // A new child link should be discoverable without waiting for cache expiry.
                 self.linked_name_requests.retain(|id, _| {
                     self.rooms
@@ -1141,9 +1180,9 @@ impl MatrixClient {
             Update::Members { room, members } => {
                 self.members.insert(room, members);
             }
-            Update::Live { room, event } => {
+            Update::Live { room, event, muted } => {
                 let tag = room.to_string();
-                if let Some((title, body)) = self.live(room, event) {
+                if let Some((title, body)) = self.live(room, event).filter(|_| !muted) {
                     crate::presence::announce(
                         cx,
                         &title,
@@ -1466,6 +1505,7 @@ impl MatrixClient {
         let preview = match &event {
             Event::Message(message)
                 if self.my_id().as_ref() != Some(&message.sender)
+                    && !self.summary(&room).is_some_and(|room| room.muted)
                     && self.notifications.allows_message(
                         self.summary(&room)
                             .is_some_and(|room| room.kind == RoomKind::Direct),
@@ -1584,6 +1624,19 @@ impl MatrixClient {
 
     pub fn set_notifications(&mut self, preferences: NotificationPreferences) {
         self.notifications = preferences;
+    }
+
+    fn toggle_room_mute(&mut self, id: OwnedRoomId, cx: &mut Context<Self>) {
+        if self.mute_pending.contains(&id) {
+            return;
+        }
+        let Some(room) = self.summary(&id).filter(|room| !room.invite) else {
+            return;
+        };
+        let muted = !room.muted;
+        self.mute_pending.insert(id.clone());
+        self.command(Command::MuteRoom { room: id, muted });
+        cx.notify();
     }
 
     pub fn set_focused(&mut self, focused: bool) {
@@ -4528,6 +4581,9 @@ impl MatrixClient {
             )
             .when(room.encrypted && room.kind != RoomKind::Direct, |row| {
                 row.child(icon("icons/lock.svg", px(12.), theme.muted_foreground))
+            })
+            .when(room.muted, |row| {
+                row.child(icon("icons/volume-x.svg", px(14.), theme.muted_foreground))
             })
             .when(unread, |row| row.child(unread::badge(room.unread, cx)))
             .on_click(cx.listener(move |this, _, window, cx| this.open(id.clone(), window, cx)))
@@ -7495,6 +7551,26 @@ impl MatrixClient {
                     )
             })
             .child(div().flex_1())
+            .child({
+                let id = room.id.clone();
+                Button::new("room-mute")
+                    .ghost()
+                    .small()
+                    .icon(if room.muted {
+                        "icons/volume-x.svg"
+                    } else {
+                        "icons/volume-2.svg"
+                    })
+                    .tooltip(if room.muted {
+                        "Unmute channel"
+                    } else {
+                        "Mute channel"
+                    })
+                    .disabled(self.mute_pending.contains(&room.id))
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.toggle_room_mute(id.clone(), cx)),
+                    )
+            })
             .when(room.can_manage, |header| {
                 header.child(
                     Button::new("room-settings")
